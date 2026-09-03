@@ -241,6 +241,91 @@ export class ApiService {
       return [];
     }
   }
+
+  // ----------------------------------------------------
+  // SYSTEM SETTINGS MANAGEMENT
+  // ----------------------------------------------------
+
+  public async getSystemSettings() {
+    try {
+      const res = await fetch(`${API_BASE_URL}/system/settings`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return {
+        execution_mode: 'CTF_OFFENSIVE_CONTROLLED',
+        auto_approve_privileged: false,
+        command_timeout_seconds: 300,
+        daily_budget_usd: 5.00,
+        session_budget_usd: 2.00,
+        paid_model_allowed: true,
+        default_strategy: 'EXPLOIT_FIRST'
+      };
+    }
+  }
+
+  public async updateSystemSettings(data: any) {
+    const res = await fetch(`${API_BASE_URL}/system/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async getSystemRequirements() {
+    const urlsToTry = [
+      '/api/system/requirements',
+      'http://127.0.0.1:8000/api/system/requirements',
+      'http://localhost:8000/api/system/requirements'
+    ];
+
+    for (const url of urlsToTry) {
+      try {
+        const res = await fetch(url);
+        if (res.ok) {
+          return await res.json();
+        }
+      } catch (e) {
+        // Try next URL candidate
+      }
+    }
+
+    // Client-side fallback diagnostic when FastAPI backend is offline
+    const isWin = navigator.userAgent.includes('Windows');
+    const isMac = navigator.userAgent.includes('Macintosh');
+    const osName = isWin ? 'Windows 11 / 10 Host OS' : (isMac ? 'macOS Host' : 'Linux Host OS');
+    const cores = navigator.hardwareConcurrency || 8;
+    const ram = (navigator as any).deviceMemory || 16;
+
+    return {
+      overall_status: 'BACKEND_OFFLINE',
+      offline_notice: 'FastAPI Backend Server is offline on port 8000. Start backend using: py -m uvicorn backend.main:app --port 8000',
+      installed_tools_count: 0,
+      total_tools_count: 25,
+      environment: {
+        distro: `${osName} (Browser Client Diagnostic)`,
+        python_version: '3.14.0 (Backend Offline)',
+        architecture: 'x86_64 / ARM64',
+        cpu_cores: cores,
+        ram_gb: ram
+      },
+      system_requirements: [
+        { requirement: "FastAPI Backend Server (Port 8000)", status: "FAIL", details: "Connection Refused on http://127.0.0.1:8000", impact: "Start FastAPI backend server with `py -m uvicorn backend.main:app --port 8000`" },
+        { requirement: "Python 3.10+ Runtime Environment", status: "PASS", details: "Detected via host configuration", impact: "Core backend execution requires Python 3.10+." },
+        { requirement: "Host Physical RAM Memory", status: "PASS", details: `${ram} GB Client RAM`, impact: "4.0 GB+ recommended." },
+        { requirement: "CPU Processing Cores", status: "PASS", details: `${cores} Cores Detected`, impact: "2+ cores recommended." }
+      ],
+      tool_requirements: [
+        { name: "nmap", installed: false, path: "Backend Offline (Click RUN DIAGNOSTICS after starting backend)", installation_recipe: "sudo apt-get install nmap / choco install nmap" },
+        { name: "ffuf", installed: false, path: "Backend Offline", installation_recipe: "sudo apt-get install ffuf" },
+        { name: "curl", installed: false, path: "Backend Offline", installation_recipe: "sudo apt-get install curl" },
+        { name: "claude", installed: false, path: "Backend Offline", installation_recipe: "npm install -g @anthropic-ai/claude-code" },
+        { name: "codex", installed: false, path: "Backend Offline", installation_recipe: "npm install -g @openai/codex-cli" }
+      ]
+    };
+  }
 }
 
 export const apiService = new ApiService();

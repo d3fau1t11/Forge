@@ -57,6 +57,15 @@ class PrivilegeDecisionRequest(BaseModel):
     audit_id: str
     approved: bool
 
+class UpdateSystemSettingsRequest(BaseModel):
+    execution_mode: str = "CTF_OFFENSIVE_CONTROLLED"
+    auto_approve_privileged: bool = False
+    command_timeout_seconds: int = 300
+    daily_budget_usd: float = 5.00
+    session_budget_usd: float = 2.00
+    paid_model_allowed: bool = True
+    default_strategy: str = "EXPLOIT_FIRST"
+
 # ----------------------------------------------------
 # SYSTEM & ENVIRONMENT
 # ----------------------------------------------------
@@ -413,6 +422,39 @@ def list_knowledge(db: Session = Depends(get_db)):
 @router.get("/audit-logs")
 def list_audit_logs(db: Session = Depends(get_db)):
     return db.query(AuditLogModel).order_by(AuditLogModel.timestamp.desc()).all()
+
+@router.get("/system/requirements")
+def check_system_requirements():
+    return environment_detector.perform_requirements_audit()
+
+@router.get("/system/settings")
+def get_system_settings():
+    from backend.config import settings
+    return {
+        "execution_mode": getattr(settings, "EXECUTION_MODE", "CTF_OFFENSIVE_CONTROLLED"),
+        "auto_approve_privileged": getattr(settings, "AUTO_APPROVE_PRIVILEGED", False),
+        "command_timeout_seconds": getattr(settings, "COMMAND_TIMEOUT_SECONDS", 300),
+        "daily_budget_usd": settings.DAILY_BUDGET_USD,
+        "session_budget_usd": settings.SESSION_BUDGET_USD,
+        "paid_model_allowed": settings.PAID_MODEL_ALLOWED,
+        "default_strategy": getattr(settings, "DEFAULT_STRATEGY", "EXPLOIT_FIRST")
+    }
+
+@router.post("/system/settings")
+def update_system_settings(req: UpdateSystemSettingsRequest):
+    from backend.config import settings
+    settings.PAID_MODEL_ALLOWED = req.paid_model_allowed
+    settings.DAILY_BUDGET_USD = req.daily_budget_usd
+    settings.SESSION_BUDGET_USD = req.session_budget_usd
+    setattr(settings, "EXECUTION_MODE", req.execution_mode)
+    setattr(settings, "AUTO_APPROVE_PRIVILEGED", req.auto_approve_privileged)
+    setattr(settings, "COMMAND_TIMEOUT_SECONDS", req.command_timeout_seconds)
+    setattr(settings, "DEFAULT_STRATEGY", req.default_strategy)
+    return {
+        "status": "SUCCESS",
+        "message": "System Settings updated successfully across backend framework.",
+        "settings": get_system_settings()
+    }
 
 # ----------------------------------------------------
 # EMERGENCY KILL SWITCH

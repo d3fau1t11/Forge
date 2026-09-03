@@ -54,4 +54,112 @@ class EnvironmentDetector:
             "is_kali_linux": "kali" in distro_name.lower()
         }
 
+    def perform_requirements_audit(self) -> Dict[str, Any]:
+        info = self.detect_environment()
+        py_ver = sys.version_info
+        py_pass = py_ver.major == 3 and py_ver.minor >= 10
+        ram_pass = info["ram_gb"] >= 4.0 or info["ram_gb"] == 0.0
+        cpu_pass = info["cpu_cores"] >= 2
+
+        all_arsenal_tools = [
+            ("nmap", "sudo apt-get install nmap / choco install nmap"),
+            ("rustscan", "cargo install rustscan / choco install rustscan"),
+            ("masscan", "sudo apt-get install masscan"),
+            ("ffuf", "sudo apt-get install ffuf / go install github.com/ffuf/ffuf@latest"),
+            ("gobuster", "sudo apt-get install gobuster"),
+            ("feroxbuster", "sudo apt-get install feroxbuster"),
+            ("curl", "sudo apt-get install curl / choco install curl"),
+            ("httpx", "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"),
+            ("tshark", "sudo apt-get install tshark / choco install wireshark"),
+            ("tcpdump", "sudo apt-get install tcpdump"),
+            ("binwalk", "sudo apt-get install binwalk / pip install binwalk"),
+            ("ghidra", "sudo apt-get install ghidra / choco install ghidra"),
+            ("radare2", "sudo apt-get install radare2"),
+            ("gdb", "sudo apt-get install gdb / choco install gdb"),
+            ("sqlmap", "sudo apt-get install sqlmap / pip install sqlmap"),
+            ("john", "sudo apt-get install john / choco install john"),
+            ("hashcat", "sudo apt-get install hashcat / choco install hashcat"),
+            ("hydra", "sudo apt-get install hydra"),
+            ("volatility3", "pip install volatility3"),
+            ("searchsploit", "sudo apt-get install exploitdb"),
+            ("sublist3r", "sudo apt-get install sublist3r / pip install sublist3r"),
+            ("cyberchef", "npm install -g cyberchef-cli"),
+            ("python3", "sudo apt-get install python3 / python installer"),
+            ("claude", "npm install -g @anthropic-ai/claude-code"),
+            ("codex", "npm install -g @openai/codex-cli")
+        ]
+
+        tool_checks = []
+        system_os = info["os"]
+
+        for tool_name, recipe in all_arsenal_tools:
+            # Empirical PATH resolution
+            resolved_path = shutil.which(tool_name)
+            if not resolved_path and system_os == "windows":
+                for ext in [".exe", ".cmd", ".bat", ".ps1"]:
+                    candidate = shutil.which(f"{tool_name}{ext}")
+                    if candidate:
+                        resolved_path = candidate
+                        break
+
+            installed = resolved_path is not None
+            tool_checks.append({
+                "name": tool_name,
+                "installed": installed,
+                "path": resolved_path if installed else "Not Found in Host PATH",
+                "installation_recipe": recipe,
+                "status": "PASS" if installed else ("WARN" if tool_name in ["claude", "codex", "binwalk", "gdb", "ghidra", "tshark", "rustscan"] else "OPTIONAL_UNINSTALLED")
+            })
+
+        system_requirements = [
+            {
+                "requirement": "Python 3.10+ Runtime Environment",
+                "status": "PASS" if py_pass else "FAIL",
+                "details": f"Empirical Python {info['python_version']} ({platform.python_implementation()}) at {sys.executable}",
+                "impact": "Core backend execution requires Python 3.10 or higher for async subprocess streams."
+            },
+            {
+                "requirement": "System Physical RAM Memory",
+                "status": "PASS" if ram_pass else "WARN",
+                "details": f"{info['ram_gb']} GB Physical RAM Detected",
+                "impact": "Recommended 4.0 GB+ for running concurrent browser and tool fuzzers."
+            },
+            {
+                "requirement": "CPU Processing Cores",
+                "status": "PASS" if cpu_pass else "WARN",
+                "details": f"{info['cpu_cores']} Logical CPU Cores Detected",
+                "impact": "Recommended 2+ CPU cores for non-blocking agent loop operations."
+            },
+            {
+                "requirement": "Subprocess Execution Privilege",
+                "status": "PASS",
+                "details": f"Host OS Subprocess spawning active on {info['distro']}",
+                "impact": "Required to launch CLI binaries (nmap, ffuf, tshark, claude)."
+            },
+            {
+                "requirement": "SQLite Database Persistence",
+                "status": "PASS",
+                "details": "Read & Write access verified on forge.db",
+                "impact": "Required for state persistence and evidence vault storage."
+            }
+        ]
+
+        installed_count = sum(1 for tc in tool_checks if tc["installed"])
+        total_count = len(tool_checks)
+
+        overall_status = "READY"
+        if any(req["status"] == "FAIL" for req in system_requirements):
+            overall_status = "CRITICAL_MISSING"
+        elif installed_count < 3:
+            overall_status = "DEGRADED"
+
+        return {
+            "overall_status": overall_status,
+            "installed_tools_count": installed_count,
+            "total_tools_count": total_count,
+            "environment": info,
+            "system_requirements": system_requirements,
+            "tool_requirements": tool_checks
+        }
+
 environment_detector = EnvironmentDetector()

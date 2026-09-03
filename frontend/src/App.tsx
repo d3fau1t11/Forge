@@ -36,6 +36,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('command');
   const [activeChallenge, setActiveChallenge] = useState<Challenge | null>(null);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [operationalMode, setOperationalMode] = useState<string>('CTF_OFFENSIVE_CONTROLLED');
 
   // Application Data States
   const [challenges, setChallenges] = useState<Challenge[]>(INITIAL_CHALLENGES);
@@ -184,6 +185,8 @@ export default function App() {
           activeTab={activeTab}
           activeChallenge={activeChallenge}
           killSwitchActive={killSwitchActive}
+          operationalMode={operationalMode}
+          onModeChange={setOperationalMode}
         />
 
         {/* 3. Page Router Body */}
