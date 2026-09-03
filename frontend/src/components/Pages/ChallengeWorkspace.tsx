@@ -6,9 +6,17 @@ import {
   Copy, 
   Check, 
   Sparkles,
-  ArrowRight
+  ArrowRight,
+  Shield,
+  Layers,
+  Terminal,
+  Cpu,
+  FileText,
+  AlertTriangle,
+  FileCode
 } from 'lucide-react';
 import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode } from '../../types';
+import { soundEngine } from '../../utils/soundEngine';
 
 interface ChallengeWorkspaceProps {
   challenge: Challenge;
@@ -72,42 +80,50 @@ Root flag obtained from target filesystem.
 Parameterize all SQL database queries and enforce strict input validation schemas.
 `);
 
+  const handleTabChange = (tabKey: any) => {
+    soundEngine.playClick();
+    setActiveTab(tabKey);
+  };
+
   const handleCopyWriteup = () => {
+    soundEngine.playSuccess();
     navigator.clipboard.writeText(writeupText);
     setCopiedReadme(true);
     setTimeout(() => setCopiedReadme(false), 2000);
   };
 
   const handleCopyText = (id: string, text: string) => {
+    soundEngine.playClick();
     navigator.clipboard.writeText(text);
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 2000);
   };
 
   const handleGenerateWriteup = () => {
+    soundEngine.playSuccess();
     setWriteupText(`[+] AUTOMATICALLY GENERATED CTF WRITEUP FOR ${challenge.name}\n\n# Target: ${target.currentIp}\n# Exploited Endpoint: /api/v1/auth\n# Findings: ${findings.map(f => f.title).join(', ')}\n# Verified Flag: ${challenge.flag || 'HTB{sql_1nj3ct10n_byp4ss_m4st3r}'}`);
   };
 
   return (
-    <div className="space-y-4 font-mono text-slate-100 pb-8">
+    <div className="space-y-5 font-mono text-slate-100 pb-10">
       {/* Workspace Top Header Bar */}
-      <div className="bg-[#0b1019] border border-cyan-500/40 rounded-lg p-4 space-y-3 shadow-[0_0_20px_rgba(6,182,212,0.1)]">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-800 pb-3">
-          <div className="flex items-center space-x-3">
+      <div className="glass-panel border-2 border-cyber-cyan/40 rounded-xl p-5 space-y-4 shadow-[0_0_30px_rgba(0,240,255,0.15)] cyber-corner">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-4">
+          <div className="flex items-center space-x-4">
             <button
-              onClick={onBackToChallenges}
-              className="p-1.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 transition-colors"
+              onClick={() => { soundEngine.playClick(); onBackToChallenges(); }}
+              className="p-2 rounded-lg bg-obsidian-900 hover:bg-slate-800 border border-slate-700 text-slate-300 transition-all hover:scale-105"
             >
-              <ChevronLeft className="w-4 h-4" />
+              <ChevronLeft className="w-5 h-5" />
             </button>
 
             <div>
-              <div className="flex items-center space-x-2">
-                <h1 className="text-xl font-bold tracking-wider text-slate-100">{challenge.name}</h1>
-                <span className="px-2 py-0.5 rounded bg-cyan-950 border border-cyan-800 text-cyan-400 text-xs font-bold uppercase">
+              <div className="flex items-center space-x-3 flex-wrap">
+                <h1 className="text-2xl font-display font-bold tracking-wider text-slate-100 neon-text-cyan">{challenge.name}</h1>
+                <span className="px-2.5 py-1 rounded bg-cyan-950/80 border border-cyber-cyan/60 text-cyber-cyan text-xs font-bold uppercase">
                   {challenge.category} CTF
                 </span>
-                <span className="text-xs text-slate-400">• TARGET: <span className="text-cyan-300 font-bold">{target.currentIp}</span></span>
+                <span className="text-xs text-slate-400">• TARGET: <span className="text-cyber-cyan font-bold">{target.currentIp}</span></span>
               </div>
             </div>
           </div>
@@ -115,26 +131,26 @@ Parameterize all SQL database queries and enforce strict input validation schema
           {/* Action Controls & Progress */}
           <div className="flex items-center space-x-4">
             <div className="flex items-center space-x-2 text-xs">
-              <span className={`w-2.5 h-2.5 rounded-full ${challenge.status === 'RUNNING' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></span>
-              <span className="font-bold text-emerald-400">● {challenge.status}</span>
+              <span className={`w-3 h-3 rounded-full ${challenge.status === 'RUNNING' ? 'bg-cyber-emerald animate-ping' : 'bg-cyber-amber'}`}></span>
+              <span className="font-bold text-cyber-emerald tracking-wider">● {challenge.status}</span>
             </div>
 
             <button
-              onClick={() => onToggleStatus(challenge.id)}
-              className={`px-3 py-1.5 rounded text-xs font-bold flex items-center space-x-1.5 border ${
+              onClick={() => { soundEngine.playClick(); onToggleStatus(challenge.id); }}
+              className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center space-x-2 border transition-all ${
                 challenge.status === 'RUNNING'
-                  ? 'bg-amber-950/80 border-amber-700 text-amber-300 hover:bg-amber-900'
-                  : 'bg-emerald-950/80 border-emerald-700 text-emerald-300 hover:bg-emerald-900'
+                  ? 'bg-amber-950/80 border-amber-700 text-cyber-amber hover:bg-amber-900'
+                  : 'bg-emerald-950/80 border-emerald-700 text-cyber-emerald hover:bg-emerald-900'
               }`}
             >
               {challenge.status === 'RUNNING' ? (
                 <>
-                  <Pause className="w-3.5 h-3.5" />
+                  <Pause className="w-4 h-4" />
                   <span>PAUSE OPERATION</span>
                 </>
               ) : (
                 <>
-                  <Play className="w-3.5 h-3.5" />
+                  <Play className="w-4 h-4" />
                   <span>RESUME RUN</span>
                 </>
               )}
@@ -143,103 +159,113 @@ Parameterize all SQL database queries and enforce strict input validation schema
         </div>
 
         {/* Progress Bar Row */}
-        <div className="flex items-center space-x-3 text-xs">
-          <span className="text-slate-400 shrink-0">CHALLENGE COMPLETION:</span>
-          <div className="flex-1 h-2 bg-slate-900 rounded-full overflow-hidden border border-slate-800">
+        <div className="flex items-center space-x-4 text-xs">
+          <span className="text-slate-400 font-bold shrink-0">CHALLENGE COMPLETION:</span>
+          <div className="flex-1 h-2.5 bg-obsidian-950 rounded-full overflow-hidden border border-slate-800">
             <div
-              className="h-full bg-cyan-400 transition-all duration-300 shadow-[0_0_8px_rgba(6,182,212,0.6)]"
+              className="h-full bg-cyber-cyan transition-all duration-500 shadow-[0_0_12px_#00f0ff]"
               style={{ width: `${challenge.progress}%` }}
             ></div>
           </div>
-          <span className="text-cyan-400 font-bold shrink-0">{challenge.progress}%</span>
+          <span className="text-cyber-cyan font-bold text-sm shrink-0">{challenge.progress}%</span>
         </div>
       </div>
 
       {/* 7 Workspace Navigation Tabs */}
-      <div className="flex items-center space-x-1 border-b border-slate-800 pb-1 overflow-x-auto text-xs font-mono">
+      <div className="flex items-center space-x-2 border-b border-slate-800 pb-2 overflow-x-auto text-xs font-mono">
         {[
-          { key: 'overview', label: 'OVERVIEW' },
-          { key: 'workflow', label: 'WORKFLOW PIPELINE' },
-          { key: 'terminal', label: 'TERMINAL EXECUTION' },
-          { key: 'ai_decisions', label: 'AI DECISIONS' },
-          { key: 'evidence', label: 'EVIDENCE' },
-          { key: 'findings', label: 'FINDINGS' },
-          { key: 'readme', label: 'README / WRITEUP' }
-        ].map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setActiveTab(t.key as any)}
-            className={`px-3 py-1.5 rounded text-xs font-bold transition-all uppercase whitespace-nowrap ${
-              activeTab === t.key
-                ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/40 shadow-[0_0_10px_rgba(6,182,212,0.15)]'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            [ {t.label} ]
-          </button>
-        ))}
+          { key: 'overview', label: 'OVERVIEW', icon: Shield },
+          { key: 'workflow', label: 'PIPELINE GRAPH', icon: Layers },
+          { key: 'terminal', label: 'TERMINAL', icon: Terminal },
+          { key: 'ai_decisions', label: 'AI REASONING', icon: Cpu },
+          { key: 'evidence', label: 'EVIDENCE VAULT', icon: FileText },
+          { key: 'findings', label: 'FINDINGS', icon: AlertTriangle },
+          { key: 'readme', label: 'WRITEUP MD', icon: FileCode }
+        ].map((t) => {
+          const Icon = t.icon;
+          return (
+            <button
+              key={t.key}
+              onClick={() => handleTabChange(t.key)}
+              className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center space-x-2 whitespace-nowrap ${
+                activeTab === t.key
+                  ? 'bg-cyber-cyan text-obsidian-950 font-display shadow-[0_0_15px_rgba(0,240,255,0.4)]'
+                  : 'bg-obsidian-900/60 text-slate-400 hover:text-slate-200 border border-slate-800'
+              }`}
+            >
+              <Icon className="w-4 h-4" />
+              <span>{t.label}</span>
+            </button>
+          );
+        })}
       </div>
 
       {/* TAB 1: OVERVIEW */}
       {activeTab === 'overview' && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 font-mono text-xs">
-          <div className="lg:col-span-2 space-y-4">
-            <div className="bg-[#0b1019] border border-slate-800 p-4 rounded-lg space-y-3">
-              <h2 className="font-bold text-slate-100 uppercase border-b border-slate-800 pb-2">CHALLENGE OBJECTIVES & HYPOTHESES</h2>
-              <div className="space-y-2">
-                <div>
-                  <span className="text-slate-500 block text-[10px] uppercase">Current Objective:</span>
-                  <span className="text-cyan-300 font-bold">Enumerating HTTP attack surface & verifying SQL injection</span>
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 font-mono text-xs">
+          <div className="lg:col-span-2 space-y-5">
+            <div className="glass-panel border border-slate-800 p-5 rounded-xl space-y-4">
+              <h2 className="font-display font-bold text-slate-100 uppercase border-b border-slate-800 pb-2 text-sm neon-text-cyan">
+                CHALLENGE OBJECTIVES & HYPOTHESES
+              </h2>
+              <div className="space-y-3">
+                <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block text-[10px] uppercase font-bold mb-1">Current Primary Objective:</span>
+                  <span className="text-cyber-cyan font-bold text-sm">Enumerating HTTP attack surface & verifying SQL injection payload</span>
                 </div>
-                <div>
-                  <span className="text-slate-500 block text-[10px] uppercase">Active Hypothesis:</span>
-                  <span className="text-slate-200">The /api/v1/auth parameter 'username' lacks input sanitization allowing query injection.</span>
+                <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block text-[10px] uppercase font-bold mb-1">Active AI Hypothesis:</span>
+                  <span className="text-slate-200 leading-relaxed">The /api/v1/auth parameter 'username' lacks input sanitization allowing query injection.</span>
                 </div>
               </div>
             </div>
 
-            <div className="bg-[#0b1019] border border-slate-800 p-4 rounded-lg space-y-3">
-              <h2 className="font-bold text-slate-100 uppercase border-b border-slate-800 pb-2">TARGET DISCOVERY & SERVICES</h2>
-              <div className="grid grid-cols-2 gap-3 text-[11px]">
-                <div>
-                  <span className="text-slate-500 block">IP / Host:</span>
-                  <span className="text-cyan-300 font-bold">{target.currentIp} ({target.hostname})</span>
+            <div className="glass-panel border border-slate-800 p-5 rounded-xl space-y-4">
+              <h2 className="font-display font-bold text-slate-100 uppercase border-b border-slate-800 pb-2 text-sm neon-text-cyan">
+                TARGET DISCOVERY & SERVICES MATRIX
+              </h2>
+              <div className="grid grid-cols-2 gap-4 text-[11px]">
+                <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block font-bold mb-0.5">IP / Host:</span>
+                  <span className="text-cyber-cyan font-bold text-sm">{target.currentIp} ({target.hostname})</span>
                 </div>
-                <div>
-                  <span className="text-slate-500 block">Discovery Method:</span>
-                  <span className="text-slate-200">{target.discoveryMethod}</span>
+                <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block font-bold mb-0.5">Discovery Method:</span>
+                  <span className="text-slate-200 font-semibold">{target.discoveryMethod}</span>
                 </div>
               </div>
-              <div className="space-y-1 pt-2">
-                <span className="text-slate-500 text-[10px] uppercase block">Open Services:</span>
+              <div className="space-y-2 pt-2">
+                <span className="text-slate-400 text-[10px] font-bold uppercase block">Open Target Ports:</span>
                 {target.services.map((s) => (
-                  <div key={s.port} className="flex justify-between px-2 py-1 bg-[#070b12] border border-slate-800 rounded">
-                    <span className="text-cyan-400 font-bold">{s.port}/{s.proto}</span>
-                    <span className="text-slate-200">{s.service}</span>
-                    <span className="text-slate-400">{s.version}</span>
+                  <div key={s.port} className="flex justify-between items-center px-3 py-2 bg-obsidian-950 border border-slate-800 rounded-lg text-xs">
+                    <span className="text-cyber-cyan font-bold">{s.port}/{s.proto}</span>
+                    <span className="text-slate-200 font-semibold">{s.service}</span>
+                    <span className="text-slate-400 text-[11px]">{s.version}</span>
                   </div>
                 ))}
               </div>
             </div>
           </div>
 
-          <div className="bg-[#0b1019] border border-slate-800 p-4 rounded-lg space-y-3">
-            <h2 className="font-bold text-slate-100 uppercase border-b border-slate-800 pb-2">LIVE AGENT TELEMETRY</h2>
-            <div className="space-y-2">
-              <div className="p-2.5 rounded bg-[#070b12] border border-slate-800">
-                <div className="flex justify-between font-bold text-cyan-300">
+          <div className="glass-panel border border-slate-800 p-5 rounded-xl space-y-4">
+            <h2 className="font-display font-bold text-slate-100 uppercase border-b border-slate-800 pb-2 text-sm neon-text-cyan">
+              ASSIGNED AGENT TELEMETRY
+            </h2>
+            <div className="space-y-3">
+              <div className="p-3.5 rounded-lg bg-obsidian-950 border border-cyber-cyan/40">
+                <div className="flex justify-between font-bold text-cyber-cyan">
                   <span>ORCHESTRATOR</span>
-                  <span className="text-emerald-400">RUNNING</span>
+                  <span className="text-cyber-emerald">RUNNING</span>
                 </div>
-                <p className="text-[11px] text-slate-400 mt-1">Coordinating challenge workflow</p>
+                <p className="text-[11px] text-slate-400 mt-1">Coordinating challenge workflow execution</p>
               </div>
 
-              <div className="p-2.5 rounded bg-[#070b12] border border-slate-800">
-                <div className="flex justify-between font-bold text-cyan-300">
+              <div className="p-3.5 rounded-lg bg-obsidian-950 border border-cyber-cyan/40">
+                <div className="flex justify-between font-bold text-cyber-cyan">
                   <span>WEB AGENT</span>
-                  <span className="text-cyan-400">ANALYZING</span>
+                  <span className="text-cyber-cyan">ANALYZING</span>
                 </div>
-                <p className="text-[11px] text-slate-400 mt-1">Fuzzing authentication API</p>
+                <p className="text-[11px] text-slate-400 mt-1">Fuzzing authentication API endpoint</p>
               </div>
             </div>
           </div>
@@ -248,44 +274,46 @@ Parameterize all SQL database queries and enforce strict input validation schema
 
       {/* TAB 2: WORKFLOW PIPELINE */}
       {activeTab === 'workflow' && (
-        <div className="space-y-5 font-mono text-xs">
-          <div className="bg-[#0b1019] border border-slate-800 p-4 rounded-lg">
-            <h2 className="font-bold text-slate-100 uppercase tracking-wider mb-1">VISUAL INVESTIGATION PIPELINE</h2>
-            <p className="text-slate-400">Interactive CTF attack workflow diagram. Click a node to reveal findings & evidence.</p>
+        <div className="space-y-6 font-mono text-xs">
+          <div className="glass-panel border border-slate-800 p-5 rounded-xl">
+            <h2 className="font-display font-bold text-slate-100 uppercase tracking-wider mb-1 text-sm neon-text-cyan">
+              VISUAL INVESTIGATION PIPELINE
+            </h2>
+            <p className="text-slate-400">Interactive CTF attack workflow diagram. Click a node to inspect step telemetry.</p>
           </div>
 
           {/* Node Flow Horizontal Pipeline */}
-          <div className="bg-[#05080e] border border-slate-800 rounded-lg p-5 overflow-x-auto">
-            <div className="flex items-center space-x-2 min-w-max">
+          <div className="bg-obsidian-950 border border-slate-800 rounded-xl p-6 overflow-x-auto shadow-inner">
+            <div className="flex items-center space-x-3 min-w-max">
               {workflowNodes.map((node, idx) => (
                 <React.Fragment key={node.id}>
                   <div
-                    onClick={() => setSelectedWorkflowNode(node)}
-                    className={`p-3 rounded-lg border cursor-pointer transition-all ${
+                    onClick={() => { soundEngine.playClick(); setSelectedWorkflowNode(node); }}
+                    className={`p-4 rounded-xl border cursor-pointer transition-all hover:scale-105 ${
                       selectedWorkflowNode?.id === node.id
-                        ? 'bg-cyan-950/60 border-cyan-400 shadow-[0_0_15px_rgba(6,182,212,0.3)]'
+                        ? 'bg-cyber-cyan/20 border-cyber-cyan shadow-[0_0_20px_rgba(0,240,255,0.4)]'
                         : node.status === 'COMPLETED'
-                        ? 'bg-emerald-950/30 border-emerald-700/60 text-slate-200'
+                        ? 'bg-emerald-950/30 border-cyber-emerald/60 text-slate-200'
                         : node.status === 'ACTIVE'
-                        ? 'bg-cyan-950/30 border-cyan-500 text-cyan-300'
-                        : 'bg-slate-900/40 border-slate-800 text-slate-500'
+                        ? 'bg-cyan-950/30 border-cyber-cyan text-cyber-cyan'
+                        : 'bg-obsidian-900/40 border-slate-800 text-slate-500'
                     }`}
                   >
-                    <div className="flex items-center space-x-2 mb-1">
-                      <span className={`w-2 h-2 rounded-full ${
-                        node.status === 'COMPLETED' ? 'bg-emerald-400' :
-                        node.status === 'ACTIVE' ? 'bg-cyan-400 animate-pulse' :
+                    <div className="flex items-center space-x-2 mb-2">
+                      <span className={`w-2.5 h-2.5 rounded-full ${
+                        node.status === 'COMPLETED' ? 'bg-cyber-emerald' :
+                        node.status === 'ACTIVE' ? 'bg-cyber-cyan animate-ping' :
                         'bg-slate-600'
                       }`}></span>
-                      <span className="font-bold text-[11px]">{node.label}</span>
+                      <span className="font-bold text-xs font-display">{node.label}</span>
                     </div>
-                    <span className="text-[9px] px-1.5 py-0.2 rounded font-bold uppercase block text-center border border-slate-800">
+                    <span className="text-[9px] px-2 py-0.5 rounded font-bold uppercase block text-center border border-slate-800 bg-obsidian-950">
                       {node.status}
                     </span>
                   </div>
 
                   {idx < workflowNodes.length - 1 && (
-                    <ArrowRight className="w-4 h-4 text-slate-600 shrink-0" />
+                    <ArrowRight className="w-5 h-5 text-slate-600 shrink-0" />
                   )}
                 </React.Fragment>
               ))}
@@ -294,14 +322,14 @@ Parameterize all SQL database queries and enforce strict input validation schema
 
           {/* Node Drawer Detail */}
           {selectedWorkflowNode && (
-            <div className="bg-[#0b1019] border border-cyan-500/40 rounded-lg p-4 space-y-2">
-              <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                <span className="font-bold text-cyan-300 text-sm">{selectedWorkflowNode.label} NODE METADATA</span>
-                <span className="px-2 py-0.5 rounded bg-emerald-950 border border-emerald-800 text-emerald-400 text-[10px] font-bold">
+            <div className="glass-panel border-2 border-cyber-cyan/50 rounded-xl p-5 space-y-3 cyber-corner">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                <span className="font-display font-bold text-cyber-cyan text-sm">{selectedWorkflowNode.label} NODE TELEMETRY</span>
+                <span className="px-2.5 py-1 rounded bg-emerald-950 border border-emerald-800 text-cyber-emerald text-[10px] font-bold">
                   {selectedWorkflowNode.status}
                 </span>
               </div>
-              <p className="text-slate-300 text-xs">{selectedWorkflowNode.description}</p>
+              <p className="text-slate-300 text-xs leading-relaxed">{selectedWorkflowNode.description}</p>
             </div>
           )}
         </div>
@@ -309,21 +337,21 @@ Parameterize all SQL database queries and enforce strict input validation schema
 
       {/* TAB 3: TERMINAL */}
       {activeTab === 'terminal' && (
-        <div className="bg-[#05080e] border border-slate-800 rounded-lg p-4 font-mono text-xs space-y-3">
-          <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-            <span className="font-bold text-cyan-300">TERMINAL TELEMETRY FOR {challenge.name}</span>
-            <span className="text-[10px] text-slate-400">{logs.length} COMMAND EXECUTIONS</span>
+        <div className="bg-obsidian-950 border border-slate-800 rounded-xl p-5 font-mono text-xs space-y-4 shadow-inner">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+            <span className="font-display font-bold text-cyber-cyan text-sm">TERMINAL STREAM FOR {challenge.name}</span>
+            <span className="text-[10px] text-slate-400 font-bold">{logs.length} COMMANDS LOGGED</span>
           </div>
 
-          <div className="space-y-3">
+          <div className="space-y-3 max-h-96 overflow-y-auto">
             {logs.map((l) => (
-              <div key={l.id} className="p-3 bg-[#080d17] border border-slate-900 rounded space-y-1">
+              <div key={l.id} className="p-3.5 bg-obsidian-900 border border-slate-800/80 rounded-lg space-y-1.5 hover:border-cyber-cyan/30 transition-colors">
                 <div className="flex justify-between text-[10px] text-slate-400">
                   <span>[{l.timestamp}] {l.type}</span>
                   <span>EXIT: {l.exitCode} • DURATION: {l.duration}</span>
                 </div>
-                <div className="text-cyan-300 font-bold">forge@parrot:~$ {l.command}</div>
-                <pre className="text-slate-300 text-[11px] whitespace-pre-wrap">{l.output}</pre>
+                <div className="text-cyber-cyan font-bold font-mono">forge@parrot:~$ {l.command}</div>
+                <pre className="text-slate-300 text-[11px] whitespace-pre-wrap bg-obsidian-950 p-2.5 rounded border border-slate-900">{l.output}</pre>
               </div>
             ))}
           </div>
@@ -332,15 +360,15 @@ Parameterize all SQL database queries and enforce strict input validation schema
 
       {/* TAB 4: AI DECISIONS */}
       {activeTab === 'ai_decisions' && (
-        <div className="space-y-3 font-mono text-xs">
+        <div className="space-y-4 font-mono text-xs">
           {decisions.map((d) => (
-            <div key={d.id} className="bg-[#0b1019] border border-slate-800 rounded-lg p-4 space-y-2">
+            <div key={d.id} className="glass-panel border border-slate-800 rounded-xl p-5 space-y-3">
               <div className="flex justify-between border-b border-slate-800 pb-2">
-                <span className="font-bold text-cyan-300">{d.agent} • {d.goal}</span>
-                <span className="text-emerald-400 font-bold">{d.confidence}% CONFIDENCE</span>
+                <span className="font-bold text-cyber-cyan font-display text-sm">{d.agent} • {d.goal}</span>
+                <span className="text-cyber-emerald font-bold">{d.confidence}% CONFIDENCE</span>
               </div>
-              <p className="text-slate-300"><span className="text-slate-500">Capability:</span> {d.capability} → <code className="text-slate-100">{d.selectedTool}</code></p>
-              <p className="text-slate-300 bg-[#070b12] p-2 rounded border border-slate-900">{d.result}</p>
+              <p className="text-slate-300"><span className="text-slate-500 font-bold">Capability:</span> {d.capability} → <code className="text-cyber-cyan font-bold">{d.selectedTool}</code></p>
+              <p className="text-slate-300 bg-obsidian-950 p-3 rounded-lg border border-slate-900 leading-relaxed">{d.result}</p>
             </div>
           ))}
         </div>
@@ -348,16 +376,16 @@ Parameterize all SQL database queries and enforce strict input validation schema
 
       {/* TAB 5: EVIDENCE */}
       {activeTab === 'evidence' && (
-        <div className="space-y-3 font-mono text-xs">
+        <div className="space-y-4 font-mono text-xs">
           {evidenceList.map((e) => (
-            <div key={e.id} className="bg-[#0b1019] border border-slate-800 rounded-lg p-4 space-y-2">
+            <div key={e.id} className="glass-panel border border-slate-800 rounded-xl p-5 space-y-3">
               <div className="flex justify-between border-b border-slate-800 pb-2">
-                <span className="font-bold text-cyan-300">{e.type} • {e.description}</span>
+                <span className="font-bold text-cyber-cyan font-display text-sm">{e.type} • {e.description}</span>
                 <span className="text-slate-400">{e.timestamp}</span>
               </div>
-              <pre className="bg-[#05080e] p-3 rounded text-slate-300 overflow-x-auto whitespace-pre-wrap">{e.content}</pre>
+              <pre className="bg-obsidian-950 p-4 rounded-lg text-slate-300 overflow-x-auto whitespace-pre-wrap border border-slate-900">{e.content}</pre>
               <div className="flex justify-end space-x-2 pt-1">
-                <button onClick={() => handleCopyText(e.id, e.content)} className="px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-300 text-[10px] font-bold">
+                <button onClick={() => handleCopyText(e.id, e.content)} className="px-3 py-1.5 rounded-lg bg-obsidian-900 border border-slate-700 text-slate-300 hover:text-cyber-cyan text-xs font-bold transition-colors">
                   {copiedId === e.id ? 'COPIED' : 'COPY EVIDENCE'}
                 </button>
               </div>
@@ -368,15 +396,15 @@ Parameterize all SQL database queries and enforce strict input validation schema
 
       {/* TAB 6: FINDINGS */}
       {activeTab === 'findings' && (
-        <div className="space-y-3 font-mono text-xs">
+        <div className="space-y-4 font-mono text-xs">
           {findings.map((f) => (
-            <div key={f.id} className="bg-[#0b1019] border border-red-500/40 rounded-lg p-4 space-y-2 shadow-[0_0_12px_rgba(239,68,68,0.1)]">
+            <div key={f.id} className="glass-panel border-2 border-cyber-rose/50 rounded-xl p-5 space-y-3 shadow-[0_0_20px_rgba(255,42,109,0.15)] cyber-corner">
               <div className="flex justify-between border-b border-slate-800 pb-2">
-                <span className="font-bold text-red-400 text-sm">{f.severity}: {f.title}</span>
-                <span className="px-2 py-0.5 rounded bg-emerald-950 border border-emerald-800 text-emerald-400 font-bold">{f.status}</span>
+                <span className="font-bold text-cyber-rose text-sm font-display">{f.severity}: {f.title}</span>
+                <span className="px-2.5 py-1 rounded bg-emerald-950 border border-emerald-800 text-cyber-emerald font-bold">{f.status}</span>
               </div>
-              <p className="text-slate-300"><span className="text-slate-500">Endpoint:</span> <code className="text-cyan-300">{f.endpoint}</code></p>
-              <p className="text-slate-300 leading-relaxed">{f.description}</p>
+              <p className="text-slate-300"><span className="text-slate-500 font-bold">Endpoint:</span> <code className="text-cyber-cyan font-bold">{f.endpoint}</code></p>
+              <p className="text-slate-300 leading-relaxed bg-obsidian-950 p-3 rounded-lg border border-slate-900">{f.description}</p>
             </div>
           ))}
         </div>
@@ -384,22 +412,24 @@ Parameterize all SQL database queries and enforce strict input validation schema
 
       {/* TAB 7: README / WRITEUP */}
       {activeTab === 'readme' && (
-        <div className="bg-[#0b1019] border border-slate-800 rounded-lg p-5 space-y-4 font-mono text-xs">
+        <div className="glass-panel border border-slate-800 rounded-xl p-6 space-y-4 font-mono text-xs">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
-            <h2 className="font-bold text-slate-100 uppercase tracking-wider">CTF WRITEUP EDITOR & MARKDOWN GENERATOR</h2>
+            <h2 className="font-display font-bold text-slate-100 uppercase tracking-wider text-sm neon-text-cyan">
+              CTF WRITEUP EDITOR & MARKDOWN GENERATOR
+            </h2>
             <div className="flex items-center space-x-2">
               <button
                 onClick={handleGenerateWriteup}
-                className="px-3 py-1.5 rounded bg-cyan-950 hover:bg-cyan-900 border border-cyan-700 text-cyan-300 font-bold flex items-center space-x-1.5"
+                className="px-3.5 py-2 rounded-lg bg-cyber-cyan/15 hover:bg-cyber-cyan/30 border border-cyber-cyan/60 text-cyber-cyan font-bold flex items-center space-x-1.5 transition-colors"
               >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>GENERATE WRITEUP</span>
+                <Sparkles className="w-4 h-4 text-cyber-cyan" />
+                <span>AUTO WRITEUP</span>
               </button>
               <button
                 onClick={handleCopyWriteup}
-                className="px-3 py-1.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 font-bold flex items-center space-x-1.5"
+                className="px-3.5 py-2 rounded-lg bg-obsidian-900 hover:bg-slate-800 border border-slate-700 text-slate-200 font-bold flex items-center space-x-1.5 transition-colors"
               >
-                {copiedReadme ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                {copiedReadme ? <Check className="w-4 h-4 text-cyber-emerald" /> : <Copy className="w-4 h-4" />}
                 <span>{copiedReadme ? 'COPIED' : 'COPY MD'}</span>
               </button>
             </div>
@@ -409,10 +439,11 @@ Parameterize all SQL database queries and enforce strict input validation schema
             rows={16}
             value={writeupText}
             onChange={(e) => setWriteupText(e.target.value)}
-            className="w-full bg-[#05080e] border border-slate-800 rounded p-4 text-slate-200 font-mono text-xs focus:outline-none focus:border-cyan-500 leading-relaxed"
+            className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-4 text-slate-200 font-mono text-xs focus:outline-none focus:border-cyber-cyan leading-relaxed shadow-inner"
           ></textarea>
         </div>
       )}
     </div>
   );
 };
+

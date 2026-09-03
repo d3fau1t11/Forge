@@ -8,6 +8,7 @@ import {
   Check 
 } from 'lucide-react';
 import { TerminalLog } from '../../types';
+import { soundEngine } from '../../utils/soundEngine';
 
 interface TerminalViewProps {
   logs: TerminalLog[];
@@ -25,18 +26,22 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [searchTerm, setSearchTerm] = useState('');
 
   const handleCopy = (id: string, text: string) => {
+    soundEngine.playClick();
     navigator.clipboard.writeText(text);
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 2000);
   };
 
   const handleClear = () => {
+    soundEngine.playClick();
     setTerminalLogs([]);
   };
 
   const handleRun = (e: React.FormEvent) => {
     e.preventDefault();
     if (!commandInput.trim()) return;
+
+    soundEngine.playClick();
 
     const newLog: TerminalLog = {
       id: `log-${Date.now()}`,
@@ -63,22 +68,24 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   });
 
   return (
-    <div className="space-y-4 font-mono text-slate-100 pb-8">
+    <div className="space-y-5 font-mono text-slate-100 pb-10">
       {/* Distinction Header Banner */}
-      <div className="bg-[#0b1019] border border-slate-800 p-4 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="glass-panel border border-slate-800 p-5 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="flex items-center space-x-3">
-          <div className="w-9 h-9 rounded bg-cyan-950 border border-cyan-500 flex items-center justify-center text-cyan-400">
+          <div className="w-10 h-10 rounded-lg bg-obsidian-900 border border-cyber-cyan flex items-center justify-center text-cyber-cyan shadow-[0_0_15px_rgba(0,240,255,0.3)]">
             <TerminalIcon className="w-5 h-5" />
           </div>
           <div>
-            <h1 className="text-base font-bold text-slate-100 uppercase tracking-wider">INTEGRATED OPERATIONAL TERMINAL</h1>
-            <div className="flex items-center space-x-3 text-[11px] text-slate-400 mt-0.5">
+            <h1 className="text-lg font-display font-bold text-slate-100 uppercase tracking-wider neon-text-cyan">
+              INTEGRATED OPERATIONAL TERMINAL
+            </h1>
+            <div className="flex items-center space-x-3 text-[11px] text-slate-400 mt-1">
               <span>EXECUTION DISTINCTION:</span>
-              <span className="text-cyan-300 font-bold px-1.5 py-0.2 rounded bg-cyan-950 border border-cyan-800">
+              <span className="text-cyber-cyan font-bold px-2 py-0.5 rounded bg-cyan-950/80 border border-cyber-cyan/50">
                 FORGE TOOL EXECUTION
               </span>
               <span>vs</span>
-              <span className="text-emerald-300 font-bold px-1.5 py-0.2 rounded bg-emerald-950 border border-emerald-800">
+              <span className="text-cyber-emerald font-bold px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-800">
                 AI CLI PROVIDER (CLAUDE CODE / CODEX)
               </span>
             </div>
@@ -86,58 +93,58 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         </div>
 
         {/* Search & Clear Controls */}
-        <div className="flex items-center space-x-2">
+        <div className="flex items-center space-x-3">
           <div className="relative">
-            <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2" />
+            <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
             <input
               type="text"
-              placeholder="Search terminal..."
+              placeholder="Search stream..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className="bg-[#05080e] border border-slate-800 rounded pl-8 pr-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-cyan-500"
+              className="bg-obsidian-950 border border-slate-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-cyber-cyan transition-colors"
             />
           </div>
 
           <button
             onClick={handleClear}
-            className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-xs font-bold flex items-center space-x-1"
+            className="px-3 py-1.5 rounded-lg bg-obsidian-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-xs font-bold flex items-center space-x-1.5 transition-colors"
           >
-            <Trash2 className="w-3.5 h-3.5 text-red-400" />
+            <Trash2 className="w-3.5 h-3.5 text-cyber-rose" />
             <span>CLEAR</span>
           </button>
         </div>
       </div>
 
       {/* Terminal Tabs */}
-      <div className="flex items-center space-x-2 border-b border-slate-800 pb-1">
+      <div className="flex items-center space-x-2 border-b border-slate-800 pb-2">
         <button
-          onClick={() => setActiveTab('all')}
-          className={`px-3 py-1.5 rounded text-xs font-bold transition-all uppercase ${
+          onClick={() => { soundEngine.playClick(); setActiveTab('all'); }}
+          className={`px-4 py-2 rounded-lg text-xs font-bold transition-all uppercase ${
             activeTab === 'all'
-              ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/40'
-              : 'text-slate-400 hover:text-slate-200'
+              ? 'bg-cyber-cyan text-obsidian-950 font-display shadow-[0_0_15px_rgba(0,240,255,0.4)]'
+              : 'text-slate-400 hover:text-slate-200 bg-obsidian-900/60 border border-slate-800'
           }`}
         >
           [ ALL CONSOLES ]
         </button>
 
         <button
-          onClick={() => setActiveTab('forge_tools')}
-          className={`px-3 py-1.5 rounded text-xs font-bold transition-all uppercase ${
+          onClick={() => { soundEngine.playClick(); setActiveTab('forge_tools'); }}
+          className={`px-4 py-2 rounded-lg text-xs font-bold transition-all uppercase ${
             activeTab === 'forge_tools'
-              ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/40'
-              : 'text-slate-400 hover:text-slate-200'
+              ? 'bg-cyber-cyan text-obsidian-950 font-display shadow-[0_0_15px_rgba(0,240,255,0.4)]'
+              : 'text-slate-400 hover:text-slate-200 bg-obsidian-900/60 border border-slate-800'
           }`}
         >
           [ FORGE TOOL EXECUTION ]
         </button>
 
         <button
-          onClick={() => setActiveTab('ai_cli')}
-          className={`px-3 py-1.5 rounded text-xs font-bold transition-all uppercase ${
+          onClick={() => { soundEngine.playClick(); setActiveTab('ai_cli'); }}
+          className={`px-4 py-2 rounded-lg text-xs font-bold transition-all uppercase ${
             activeTab === 'ai_cli'
-              ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
-              : 'text-slate-400 hover:text-slate-200'
+              ? 'bg-cyber-emerald text-obsidian-950 font-display shadow-[0_0_15px_rgba(16,185,129,0.4)]'
+              : 'text-slate-400 hover:text-slate-200 bg-obsidian-900/60 border border-slate-800'
           }`}
         >
           [ AI CLI PROVIDERS: CLAUDE CODE / CODEX ]
@@ -145,47 +152,47 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       </div>
 
       {/* Terminal Output Window */}
-      <div className="bg-[#05080e] border border-slate-800 rounded-lg p-4 font-mono text-xs space-y-4 max-h-[500px] overflow-y-auto">
+      <div className="bg-obsidian-950 border border-slate-800 rounded-xl p-5 font-mono text-xs space-y-4 max-h-[520px] overflow-y-auto shadow-inner">
         {filteredLogs.map((log) => (
-          <div key={log.id} className="p-3 bg-[#080d17] border border-slate-900 rounded space-y-2">
+          <div key={log.id} className="p-4 bg-obsidian-900 border border-slate-800/90 rounded-lg space-y-2.5 hover:border-cyber-cyan/30 transition-colors">
             {/* Header Metadata Bar */}
-            <div className="flex items-center justify-between border-b border-slate-800/80 pb-2 text-[11px]">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-2 text-[11px]">
               <div className="flex items-center space-x-2">
-                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase border ${
+                <span className={`px-2.5 py-0.5 rounded text-[10px] font-bold uppercase border ${
                   log.type === 'FORGE TOOL EXECUTION'
-                    ? 'bg-cyan-950 text-cyan-400 border-cyan-800'
+                    ? 'bg-cyan-950 text-cyber-cyan border-cyber-cyan/50'
                     : log.type === 'SYSTEM'
                     ? 'bg-slate-900 text-slate-400 border-slate-800'
-                    : 'bg-emerald-950 text-emerald-400 border-emerald-800'
+                    : 'bg-emerald-950 text-cyber-emerald border-emerald-800'
                 }`}>
                   {log.type}
                 </span>
                 {log.agent && (
-                  <span className="text-slate-400">AGENT: <span className="text-slate-200 font-bold">{log.agent}</span></span>
+                  <span className="text-slate-400 font-bold">AGENT: <span className="text-slate-200">{log.agent}</span></span>
                 )}
                 <span className="text-slate-500">{log.timestamp}</span>
               </div>
 
               <div className="flex items-center space-x-3 text-[10px]">
-                <span>PRIVILEGE: <span className="text-emerald-400 font-bold">{log.privilege}</span></span>
-                <span>DURATION: <span className="text-cyan-300 font-bold">{log.duration}</span></span>
-                <span>EXIT: <span className={log.exitCode === 0 ? 'text-emerald-400 font-bold' : 'text-red-400 font-bold'}>{log.exitCode}</span></span>
+                <span>PRIVILEGE: <span className="text-cyber-emerald font-bold">{log.privilege}</span></span>
+                <span>DURATION: <span className="text-cyber-cyan font-bold">{log.duration}</span></span>
+                <span>EXIT: <span className={log.exitCode === 0 ? 'text-cyber-emerald font-bold' : 'text-cyber-rose font-bold'}>{log.exitCode}</span></span>
                 <button
                   onClick={() => handleCopy(log.id, `${log.command}\n${log.output}`)}
-                  className="text-slate-400 hover:text-slate-100"
+                  className="text-slate-400 hover:text-slate-100 transition-colors"
                 >
-                  {copiedId === log.id ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  {copiedId === log.id ? <Check className="w-4 h-4 text-cyber-emerald" /> : <Copy className="w-4 h-4" />}
                 </button>
               </div>
             </div>
 
             {/* Command & Output */}
             <div>
-              <div className="text-cyan-300 font-bold mb-1 flex items-center space-x-2">
-                <span className="text-slate-500">forge@parrot:~$</span>
+              <div className="text-cyber-cyan font-bold mb-1.5 flex items-center space-x-2">
+                <span className="text-slate-500 font-bold">forge@parrot:~$</span>
                 <span>{log.command}</span>
               </div>
-              <pre className="text-slate-300 text-[11px] leading-relaxed whitespace-pre-wrap font-mono pl-4 border-l-2 border-slate-800">
+              <pre className="text-slate-300 text-[11px] leading-relaxed whitespace-pre-wrap font-mono pl-4 border-l-2 border-cyber-cyan/40 bg-obsidian-950 p-3 rounded border border-slate-900">
                 {log.output}
               </pre>
             </div>
@@ -194,8 +201,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       </div>
 
       {/* Interactive Command Line Bar */}
-      <form onSubmit={handleRun} className="flex items-center space-x-2 bg-[#0b1019] border border-cyan-500/40 p-2 rounded-lg">
-        <span className="text-cyan-400 font-bold text-xs pl-2">forge@parrot:~$</span>
+      <form onSubmit={handleRun} className="flex items-center space-x-3 glass-panel border-2 border-cyber-cyan/40 p-2.5 rounded-xl shadow-[0_0_20px_rgba(0,240,255,0.15)] cyber-corner">
+        <span className="text-cyber-cyan font-bold text-xs pl-2 font-mono">forge@parrot:~$</span>
         <input
           type="text"
           placeholder="Execute controlled tool capability or CLI provider command (e.g. nmap -sV 10.10.14.23 or claude-code analyze)..."
@@ -205,7 +212,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         />
         <button
           type="submit"
-          className="px-4 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs uppercase flex items-center space-x-1 shadow-[0_0_10px_rgba(6,182,212,0.3)]"
+          className="px-5 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs uppercase flex items-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all"
         >
           <Play className="w-3.5 h-3.5 fill-current" />
           <span>EXECUTE</span>
@@ -214,3 +221,4 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     </div>
   );
 };
+

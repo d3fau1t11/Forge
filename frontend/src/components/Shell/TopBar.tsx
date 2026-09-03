@@ -1,13 +1,16 @@
 import React, { useState, useEffect } from 'react';
 import { 
-  Wifi, 
   Users, 
   Cpu, 
   Clock, 
   CheckCircle2, 
-  AlertTriangle 
+  AlertTriangle,
+  Zap,
+  SlidersHorizontal,
+  Radio
 } from 'lucide-react';
 import { NavTab, Challenge } from '../../types';
+import { soundEngine } from '../../utils/soundEngine';
 
 interface TopBarProps {
   activeTab: NavTab;
@@ -21,16 +24,22 @@ export const TopBar: React.FC<TopBarProps> = ({
   killSwitchActive
 }) => {
   const [timeStr, setTimeStr] = useState<string>('');
+  const [useLocalTime, setUseLocalTime] = useState<boolean>(false);
+  const [operationalMode, setOperationalMode] = useState<'stealth' | 'balanced' | 'aggressive'>('balanced');
 
   useEffect(() => {
     const updateTime = () => {
       const now = new Date();
-      setTimeStr(now.toISOString().substring(11, 19) + ' UTC');
+      if (useLocalTime) {
+        setTimeStr(now.toLocaleTimeString());
+      } else {
+        setTimeStr(now.toISOString().substring(11, 19) + ' UTC');
+      }
     };
     updateTime();
     const interval = setInterval(updateTime, 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [useLocalTime]);
 
   const getSectionTitle = (): string => {
     if (activeChallenge) {
@@ -51,67 +60,100 @@ export const TopBar: React.FC<TopBarProps> = ({
     }
   };
 
+  const handleModeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    soundEngine.playClick();
+    setOperationalMode(e.target.value as any);
+  };
+
   return (
-    <header className="h-13 border-b border-slate-800/80 bg-[#090d14]/90 backdrop-blur-md px-5 flex items-center justify-between font-mono z-10 select-none">
-      {/* Left: Current Section Title */}
-      <div className="flex items-center space-x-3">
-        <h2 className="text-xs font-bold tracking-wider text-slate-100 uppercase">
-          {getSectionTitle()}
-        </h2>
+    <header className="h-14 border-b border-cyber-cyan/20 bg-obsidian-950/90 backdrop-blur-md px-5 flex items-center justify-between font-mono z-10 select-none relative">
+      {/* Left: Section Header & Operational Mode Dropdown */}
+      <div className="flex items-center space-x-4">
+        <div className="flex items-center space-x-2">
+          <div className="w-2 h-2 rounded-full bg-cyber-cyan shadow-[0_0_8px_#00f0ff] animate-ping"></div>
+          <h2 className="text-sm font-display font-bold tracking-wider text-slate-100 uppercase neon-text-cyan">
+            {getSectionTitle()}
+          </h2>
+        </div>
+
+        {/* Operational Strategy Mode Selector */}
+        <div className="hidden xl:flex items-center space-x-2 bg-obsidian-900 border border-slate-800 rounded px-2 py-1 text-xs">
+          <SlidersHorizontal className="w-3.5 h-3.5 text-cyber-cyan" />
+          <span className="text-[10px] text-slate-400 font-bold uppercase">MODE:</span>
+          <select 
+            value={operationalMode}
+            onChange={handleModeChange}
+            className="bg-transparent text-slate-200 font-mono text-xs focus:outline-none cursor-pointer text-cyber-cyan font-bold"
+          >
+            <option value="stealth" className="bg-obsidian-950 text-slate-200">🛡️ STEALTH RECON</option>
+            <option value="balanced" className="bg-obsidian-950 text-cyber-cyan">⚡ BALANCED ATTACK</option>
+            <option value="aggressive" className="bg-obsidian-950 text-cyber-rose">🔥 AGGRESSIVE FLAG RUSH</option>
+          </select>
+        </div>
       </div>
 
-      {/* Center: Current Active Operation Context Banner */}
-      <div className="hidden md:flex items-center space-x-2 px-3 py-1 rounded bg-cyan-950/40 border border-cyan-500/30 text-cyan-300 text-xs font-semibold tracking-wider">
-        <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span>
-        <span>
-          {activeChallenge
-            ? `${activeChallenge.name} • ${activeChallenge.category} • ${activeChallenge.target}`
-            : 'VAULT • WEB • 10.10.14.23'}
-        </span>
+      {/* Center: Live Threat & Exploitation Stream Marquee Ticker */}
+      <div className="hidden lg:flex flex-1 max-w-xl mx-4 items-center bg-obsidian-900/80 border border-slate-800/80 rounded px-3 py-1 text-xs overflow-hidden relative">
+        <div className="flex items-center space-x-1.5 text-cyber-amber pr-2 border-r border-slate-800 whitespace-nowrap z-10 bg-obsidian-900 font-bold text-[10px]">
+          <Radio className="w-3 h-3 animate-pulse" />
+          <span>INTEL FEED:</span>
+        </div>
+        <div className="overflow-hidden whitespace-nowrap w-full pl-2">
+          <div className="inline-block animate-marquee text-[11px] text-slate-300 space-x-6">
+            <span className="text-cyber-emerald font-semibold">● [AUTONOMOUS SCAN] Active Nmap port probe on target 10.10.14.23:8080 (Apache HTTPd)</span>
+            <span className="text-cyber-cyan font-semibold">● [AI ROUTE] Gemini 1.5 Flash selected for web payload synthesis (confidence 98.4%)</span>
+            <span className="text-cyber-rose font-semibold">● [ALERT] SQL Injection endpoint identified at /api/v1/auth/login</span>
+            <span className="text-cyber-amber font-semibold">● [EVIDENCE] Encrypted JWT token captured and logged to vault</span>
+          </div>
+        </div>
       </div>
 
-      {/* Right: Operational Telemetry Pills */}
-      <div className="flex items-center space-x-3 text-[11px]">
-        {/* Network Status */}
-        <div className="hidden lg:flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-900/80 border border-slate-800 text-slate-300">
-          <Wifi className="w-3 h-3 text-cyan-400" />
-          <span className="text-slate-400">NET:</span>
-          <span className="text-slate-200">1 Gbps</span>
+      {/* Right: Telemetry Pills */}
+      <div className="flex items-center space-x-2 text-[11px]">
+        {/* Active Operation Badge */}
+        <div className="hidden sm:flex items-center space-x-1.5 px-2.5 py-1 rounded bg-obsidian-900 border border-cyber-cyan/30 text-cyber-cyan text-xs">
+          <Zap className="w-3 h-3 text-cyber-cyan animate-pulse" />
+          <span className="font-semibold truncate max-w-[120px]">
+            {activeChallenge ? activeChallenge.name : 'VAULT CTF'}
+          </span>
         </div>
 
         {/* Agent Count */}
-        <div className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-900/80 border border-slate-800 text-slate-300">
-          <Users className="w-3 h-3 text-emerald-400" />
-          <span className="text-slate-400">AGENTS:</span>
-          <span className="text-emerald-400 font-semibold">3 ACTIVE</span>
-          <span className="text-slate-400">/ 7</span>
+        <div className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-obsidian-900 border border-slate-800 text-slate-300">
+          <Users className="w-3 h-3 text-cyber-emerald" />
+          <span className="text-slate-400 hidden md:inline">AGENTS:</span>
+          <span className="text-cyber-emerald font-bold">3 ACTIVE</span>
         </div>
 
-        {/* Provider Status */}
-        <div className="hidden sm:flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-900/80 border border-slate-800 text-slate-300">
-          <Cpu className="w-3 h-3 text-cyan-400" />
+        {/* LLM Provider Status */}
+        <div className="hidden md:flex items-center space-x-1.5 px-2.5 py-1 rounded bg-obsidian-900 border border-slate-800 text-slate-300">
+          <Cpu className="w-3 h-3 text-cyber-cyan" />
           <span className="text-slate-400">LLM:</span>
-          <span className="text-cyan-300 font-semibold">GEMINI</span>
-          <span className="text-emerald-400 text-[9px] uppercase">● ONLINE</span>
+          <span className="text-cyber-cyan font-bold">GEMINI</span>
+          <span className="w-1.5 h-1.5 rounded-full bg-cyber-emerald animate-ping"></span>
         </div>
 
-        {/* UTC Live Clock */}
-        <div className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-900/80 border border-slate-800 text-slate-200">
+        {/* UTC/Local Toggle Cyber Clock */}
+        <button 
+          onClick={() => { soundEngine.playClick(); setUseLocalTime(!useLocalTime); }}
+          title="Click to toggle UTC / Local Time"
+          className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-obsidian-900 border border-slate-800 hover:border-cyber-cyan/50 text-slate-200 transition-colors"
+        >
           <Clock className="w-3 h-3 text-slate-400" />
-          <span className="text-cyan-400 font-bold">{timeStr || '18:42:05 UTC'}</span>
-        </div>
+          <span className="text-cyber-cyan font-bold font-mono">{timeStr || '18:42:05 UTC'}</span>
+        </button>
 
-        {/* System Status */}
-        <div className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-900/80 border border-slate-800">
+        {/* System Health Status */}
+        <div className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-obsidian-900 border border-slate-800">
           {killSwitchActive ? (
             <>
-              <AlertTriangle className="w-3 h-3 text-red-400" />
-              <span className="text-red-400 font-bold">HALTED</span>
+              <AlertTriangle className="w-3.5 h-3.5 text-cyber-rose animate-bounce" />
+              <span className="text-cyber-rose font-bold text-xs">LOCKDOWN</span>
             </>
           ) : (
             <>
-              <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-              <span className="text-emerald-400 font-bold">SYS OK</span>
+              <CheckCircle2 className="w-3.5 h-3.5 text-cyber-emerald" />
+              <span className="text-cyber-emerald font-bold text-xs">SYS OK</span>
             </>
           )}
         </div>
@@ -119,3 +161,4 @@ export const TopBar: React.FC<TopBarProps> = ({
     </header>
   );
 };
+
