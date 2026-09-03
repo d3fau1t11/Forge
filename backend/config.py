@@ -19,7 +19,7 @@ try:
         # Database
         DATABASE_URL: str = "sqlite:///./forge.db"
         
-        # API Keys
+        # API Keys & Per-Model AgentRouter Keys
         GEMINI_API_KEY: str = ""
         NVIDIA_API_KEY: str = ""
         CEREBRAS_API_KEY: str = ""
@@ -31,6 +31,18 @@ try:
         MISTRAL_API_KEY: str = ""
         COHERE_API_KEY: str = ""
         GROQ_API_KEY: str = ""
+
+        # AgentRouter Per-Model Keys
+        AGENTROUTER_CLAUDE_OPUS_5_KEY: str = ""
+        AGENTROUTER_CLAUDE_OPUS_4_8_KEY: str = ""
+        AGENTROUTER_GPT_5_6_KEY: str = ""
+        AGENTROUTER_GPT_5_6_SOL_KEY: str = ""
+        AGENTROUTER_GLM_5_3_KEY: str = ""
+        AGENTROUTER_DEEPSEEK_V4_FLASH_KEY: str = ""
+
+        # CLI Path Overrides
+        CLAUDE_CODE_PATH: str = ""
+        CODEX_PATH: str = ""
         
         # Budget Controls
         PAID_MODEL_ALLOWED: bool = True
@@ -58,6 +70,19 @@ except ImportError:
             self.MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
             self.COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
             self.GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+            # AgentRouter Per-Model Keys
+            self.AGENTROUTER_CLAUDE_OPUS_5_KEY = os.getenv("AGENTROUTER_CLAUDE_OPUS_5_KEY", "")
+            self.AGENTROUTER_CLAUDE_OPUS_4_8_KEY = os.getenv("AGENTROUTER_CLAUDE_OPUS_4_8_KEY", "")
+            self.AGENTROUTER_GPT_5_6_KEY = os.getenv("AGENTROUTER_GPT_5_6_KEY", "")
+            self.AGENTROUTER_GPT_5_6_SOL_KEY = os.getenv("AGENTROUTER_GPT_5_6_SOL_KEY", "")
+            self.AGENTROUTER_GLM_5_3_KEY = os.getenv("AGENTROUTER_GLM_5_3_KEY", "")
+            self.AGENTROUTER_DEEPSEEK_V4_FLASH_KEY = os.getenv("AGENTROUTER_DEEPSEEK_V4_FLASH_KEY", "")
+
+            # CLI Paths
+            self.CLAUDE_CODE_PATH = os.getenv("CLAUDE_CODE_PATH", "")
+            self.CODEX_PATH = os.getenv("CODEX_PATH", "")
+
             self.PAID_MODEL_ALLOWED = os.getenv("PAID_MODEL_ALLOWED", "true").lower() == "true"
             self.DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", 5.0))
             self.SESSION_BUDGET_USD = float(os.getenv("SESSION_BUDGET_USD", 2.0))

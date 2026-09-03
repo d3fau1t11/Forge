@@ -4,26 +4,40 @@ from backend.config import settings
 from backend.providers.base import BaseProvider, ProviderResponse
 from backend.providers.mock import MockProvider
 from backend.providers.real_providers import GeminiProvider, OpenAISpecProvider, HuggingFaceProvider, CloudflareProvider
+from backend.providers.cli.claude_code import AgentRouterClaudeCodeProvider
+from backend.providers.cli.codex import AgentRouterCodexProvider
 
 logger = logging.getLogger("forge.router")
 
 class ModelRouter:
-    """Model Router selecting appropriate provider/model based on capability, cost, & budget."""
+    """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
 
     DEFAULT_ROUTING_MAP = {
         "recon": ["cloudflare", "openrouter", "cerebras", "gemini", "mock"],
         "directory_enumeration": ["cloudflare", "openrouter", "cerebras", "gemini", "mock"],
         "web_analysis": ["cloudflare", "openrouter", "gemini", "nvidia", "mock"],
-        "code_analysis": ["openrouter", "nvidia", "huggingface", "mock"],
-        "reverse_engineering": ["openrouter", "nvidia", "agentrouter", "mock"],
+        "code_analysis": ["agentrouter_claude_code", "agentrouter_codex", "openrouter", "nvidia", "mock"],
+        "reverse_engineering": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "mock"],
         "fast_reasoning": ["cloudflare", "openrouter", "cerebras", "mock"],
-        "general_reasoning": ["cloudflare", "openrouter", "gemini", "nvidia", "huggingface", "mock"],
+        "general_reasoning": ["cloudflare", "openrouter", "gemini", "nvidia", "mock"],
         "verification": ["cloudflare", "openrouter", "nvidia", "gemini", "mock"]
+    }
+
+    # Model to Provider/CLI Transport Mapping
+    MODEL_PROVIDER_MAP = {
+        "claude-opus-5": ("agentrouter_claude_code", "claude_code"),
+        "claude-opus-4-8": ("agentrouter_claude_code", "claude_code"),
+        "gpt-5.6": ("agentrouter_codex", "codex"),
+        "gpt-5.6-sol": ("agentrouter_codex", "codex"),
+        "glm-5.3": ("agentrouter_codex", "codex"),
+        "deepseek-v4-flash": ("agentrouter_codex", "codex")
     }
 
     def __init__(self):
         self.providers: Dict[str, BaseProvider] = {
-            "mock": MockProvider()
+            "mock": MockProvider(),
+            "agentrouter_claude_code": AgentRouterClaudeCodeProvider(),
+            "agentrouter_codex": AgentRouterCodexProvider()
         }
         self.paid_allowed = settings.PAID_MODEL_ALLOWED
         self.daily_budget_usd = settings.DAILY_BUDGET_USD
@@ -85,8 +99,28 @@ class ModelRouter:
         prompt: str,
         capability: str = "general_reasoning",
         system_instruction: Optional[str] = None,
+        target_model: Optional[str] = None,
         **kwargs
     ) -> ProviderResponse:
+
+        # 1. Direct Model Request (e.g. claude-opus-5, gpt-5.6)
+        if target_model and target_model in self.MODEL_PROVIDER_MAP:
+            provider_name, cli_type = self.MODEL_PROVIDER_MAP[target_model]
+            provider = self.providers.get(provider_name)
+            if provider and await provider.is_available():
+                logger.info(f"[ModelRouter] Direct routing model '{target_model}' to CLI provider '{provider_name}'")
+                res = await provider.generate_response(
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    capability=capability,
+                    model=target_model,
+                    **kwargs
+                )
+                if not res.is_refusal:
+                    return res
+                logger.warning(f"CLI Provider '{provider_name}' failed for model '{target_model}': {res.refusal_reason}. Falling back...")
+
+        # 2. Capability Candidates Fallback Chain
         candidates = self.DEFAULT_ROUTING_MAP.get(capability, ["cloudflare", "openrouter", "gemini", "mock"])
 
         for provider_name in candidates:

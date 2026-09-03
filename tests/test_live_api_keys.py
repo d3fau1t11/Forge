@@ -45,7 +45,8 @@ class TestLiveAPIKeys(unittest.TestCase):
         results = asyncio.run(run_live_tests())
         print("\n--- LIVE API KEY TEST RESULTS ---")
         for p_name, status in results.items():
-            print(f"Provider [{p_name.upper()}]: {status}")
+            clean_status = status.replace("\n", " ").encode("ascii", "replace").decode("ascii")
+            print(f"Provider [{p_name.upper()}]: {clean_status}")
         print("---------------------------------\n")
 
 if __name__ == "__main__":
