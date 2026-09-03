@@ -20,6 +20,8 @@ class HTTPBaseProvider(BaseProvider):
             res = await client.post(url, headers=headers, json=payload)
             if res.status_code in (401, 403):
                 raise PermissionError(f"HTTP {res.status_code} Unauthorized/Forbidden for {self.name}: {res.text[:200]}")
+            elif res.status_code == 402:
+                raise RuntimeError(f"HTTP 402 Quota Exhausted for {self.name}: {res.text[:200]}")
             elif res.status_code == 429:
                 raise RuntimeError(f"HTTP 429 Rate Limit for {self.name}: {res.text[:200]}")
             elif res.status_code >= 500:

@@ -19,7 +19,8 @@
 
 ## Completed Features
 - [x] Full database ORM models for all 14 entities in `backend/database/models.py`
-- [x] Configured local `.env` with API keys for Gemini, NVIDIA, Cerebras, OpenRouter, Hugging Face, and Cloudflare Workers AI
+- [x] Configured local `.env` with API keys for Gemini, NVIDIA, Cerebras, AgentRouter, OpenRouter, Hugging Face, and Cloudflare Workers AI
+- [x] AgentRouter multi-model adapter integrated into `ModelRouter` (`backend/providers/router.py`) with automatic refusal fallback handling
 - [x] Validated live API endpoints with automated tests: **Cloudflare Workers AI** (`@cf/meta/llama-3.1-8b-instruct`) and **OpenRouter** (`meta-llama/llama-3.1-8b-instruct`) verified live!
 - [x] `HTTPBaseProvider`, `GeminiProvider`, and `OpenAISpecProvider` handling HTTP 401/403/429/5xx error codes and token cost tracking
 - [x] Controlled capability-based Tool Manager and Privilege Manager audit logging
