@@ -230,6 +230,8 @@ export default function App() {
                   targets={targets}
                   onRediscover={(id) => console.log('Rediscovering target:', id)}
                   onVerify={(id) => console.log('Verifying target:', id)}
+                  onCreateTarget={handleCreateChallenge}
+                  onNavigateTab={(tab) => setActiveTab(tab)}
                 />
               )}
 

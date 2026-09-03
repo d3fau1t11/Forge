@@ -22,7 +22,7 @@ export type ChallengeTab =
 export interface Challenge {
   id: string;
   name: string;
-  category: 'WEB' | 'RECON' | 'CRYPTO' | 'FORENSICS' | 'PWN' | 'REV';
+  category: string;
   difficulty: 'EASY' | 'MEDIUM' | 'HARD' | 'INSANE';
   target: string;
   status: 'RUNNING' | 'PAUSED' | 'WAITING' | 'SOLVED' | 'FAILED';
@@ -63,7 +63,7 @@ export interface AgentInfo {
 
 export interface ToolItem {
   name: string;
-  capabilityCategory: 'NETWORK SCANNING' | 'DIRECTORY ENUMERATION' | 'WEB ANALYSIS' | 'PACKET ANALYSIS' | 'FILE ANALYSIS';
+  capabilityCategory: string;
   binary: string;
   installed: boolean;
   version: string;

@@ -32,7 +32,7 @@ export const Challenges: React.FC<ChallengesProps> = ({
 
   // Form states
   const [name, setName] = useState('');
-  const [category, setCategory] = useState<'WEB' | 'RECON' | 'CRYPTO' | 'FORENSICS' | 'PWN' | 'REV'>('WEB');
+  const [category, setCategory] = useState<string>('WEB');
   const [difficulty, setDifficulty] = useState<'EASY' | 'MEDIUM' | 'HARD' | 'INSANE'>('MEDIUM');
   const [target, setTarget] = useState('');
   const [description, setDescription] = useState('');
@@ -233,19 +233,27 @@ export const Challenges: React.FC<ChallengesProps> = ({
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold">Category</label>
-                  <select
+                  <label className="block text-slate-400 uppercase mb-1 font-bold">Category (Typeable)</label>
+                  <input
+                    type="text"
+                    list="category-suggestions"
                     value={category}
-                    onChange={(e) => setCategory(e.target.value as any)}
-                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                  >
-                    <option value="WEB">WEB</option>
-                    <option value="REV">REV</option>
-                    <option value="PWN">PWN</option>
-                    <option value="CRYPTO">CRYPTO</option>
-                    <option value="FORENSICS">FORENSICS</option>
-                    <option value="RECON">RECON</option>
-                  </select>
+                    onChange={(e) => setCategory(e.target.value)}
+                    placeholder="e.g. WEB, PWN, OSINT, CLOUD..."
+                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono uppercase"
+                  />
+                  <datalist id="category-suggestions">
+                    <option value="WEB" />
+                    <option value="PWN" />
+                    <option value="REV" />
+                    <option value="CRYPTO" />
+                    <option value="FORENSICS" />
+                    <option value="RECON" />
+                    <option value="OSINT" />
+                    <option value="MISC" />
+                    <option value="CLOUD" />
+                    <option value="BLOCKCHAIN" />
+                  </datalist>
                 </div>
 
                 <div>

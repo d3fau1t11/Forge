@@ -56,7 +56,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   return (
-    <aside className="w-64 border-r border-cyan-500/20 bg-obsidian-950/95 flex flex-col justify-between select-none z-20 backdrop-blur-xl relative">
+    <aside className="w-68 border-r border-cyan-500/20 bg-obsidian-950/95 flex flex-col justify-between select-none z-20 backdrop-blur-xl relative">
       {/* Subtle Grid overlay */}
       <div className="absolute inset-0 cyber-grid-bg opacity-40 pointer-events-none"></div>
 
@@ -64,9 +64,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <div className="relative z-10">
         <div className="p-4 border-b border-cyan-500/20 flex items-center justify-between bg-obsidian-900/60">
           <div className="flex items-center space-x-3 cursor-pointer" onClick={() => handleNav('command')}>
-            <div className="relative flex items-center justify-center w-10 h-10 rounded bg-obsidian-900 border border-cyber-cyan/60 shadow-[0_0_15px_rgba(0,240,255,0.3)] group hover:scale-105 transition-transform">
+            <div className="relative flex items-center justify-center w-10 h-10 rounded-lg bg-obsidian-900 border border-cyber-cyan/60 shadow-[0_0_15px_rgba(0,240,255,0.3)] group hover:scale-105 transition-transform">
               <Shield className="w-5 h-5 text-cyber-cyan group-hover:rotate-12 transition-transform" />
-              <div className="absolute inset-0 bg-cyber-cyan/10 animate-pulse rounded"></div>
+              <div className="absolute inset-0 bg-cyber-cyan/10 animate-pulse rounded-lg"></div>
             </div>
             <div>
               <div className="flex items-center space-x-1.5">
@@ -81,14 +81,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <button 
             onClick={toggleAudio}
             title={muted ? "Unmute Audio FX" : "Mute Audio FX"}
-            className="p-1.5 rounded-lg border border-slate-800 hover:border-cyber-cyan/50 bg-obsidian-800 text-slate-400 hover:text-cyber-cyan transition-colors"
+            className="p-2 rounded-lg border border-slate-800 hover:border-cyber-cyan/50 bg-obsidian-800 text-slate-400 hover:text-cyber-cyan transition-colors"
           >
-            {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5 text-cyber-cyan" />}
+            {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4 text-cyber-cyan" />}
           </button>
         </div>
 
         {/* Navigation Sections */}
-        <nav className="p-3 space-y-4 overflow-y-auto max-h-[calc(100vh-230px)] font-mono relative z-10">
+        <nav className="p-3.5 space-y-5 overflow-y-auto max-h-[calc(100vh-230px)] font-mono relative z-10">
           {/* COMMAND SECTION */}
           <div>
             <div className="text-[9px] font-bold text-slate-400 uppercase tracking-widest px-2 mb-1.5 flex items-center justify-between">

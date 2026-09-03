@@ -17,8 +17,8 @@ import { Challenge, Target, AgentInfo, ProviderInfo } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
 
 interface CommandCenterProps {
-  activeChallenge: Challenge;
-  target: Target;
+  activeChallenge?: Challenge | null;
+  target?: Target | null;
   agents: AgentInfo[];
   providers: ProviderInfo[];
   onOpenWorkspace: (challenge: Challenge) => void;
@@ -37,18 +37,17 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
 }) => {
   const [quickNotice, setQuickNotice] = useState<string | null>(null);
 
-  const liveEvents = [
-    { time: '18:42:01', source: 'ORCHESTRATOR', text: 'Target profile initialized (10.10.14.23)', color: 'text-cyber-cyan' },
-    { time: '18:42:04', source: 'RECON', text: 'Capability requested: network_scan', color: 'text-cyber-emerald' },
-    { time: '18:42:05', source: 'TOOL MANAGER', text: 'Selected nmap (-sV -sC -p 22,80,8080)', color: 'text-cyber-amber' },
-    { time: '18:42:14', source: 'NMAP SCAN', text: 'Discovered: 22/tcp SSH, 80/tcp HTTP, 8080/tcp HTTP-Proxy', color: 'text-cyan-300' },
-    { time: '18:42:17', source: 'WEB AGENT', text: 'New hypothesis: Investigate HTTP authentication endpoint /api/v1/auth', color: 'text-emerald-300' },
-    { time: '18:42:20', source: 'WEB AGENT', text: 'CONFIRMED: SQL Injection on parameter "username"', color: 'text-cyber-rose font-bold' }
+  const liveEvents = activeChallenge ? [
+    { time: '00:00:01', source: 'ORCHESTRATOR', text: `Target profile initialized (${target?.currentIp || '127.0.0.1'})`, color: 'text-cyber-cyan' },
+    { time: '00:00:03', source: 'RECON', text: 'Capability requested: network_scan', color: 'text-cyber-emerald' },
+    { time: '00:00:05', source: 'TOOL MANAGER', text: 'Standby for tool invocation', color: 'text-cyber-amber' },
+  ] : [
+    { time: '00:00:00', source: 'SYSTEM', text: 'FORGE Engine online. Standing by for new challenge registration...', color: 'text-cyber-cyan font-bold' }
   ];
 
   const handleQuickAction = (actionName: string) => {
     soundEngine.playClick();
-    setQuickNotice(`[COMMAND SENT] ${actionName} triggered on target ${target.currentIp}`);
+    setQuickNotice(`[COMMAND SENT] ${actionName} triggered on target ${target?.currentIp || 'SYSTEM'}`);
     setTimeout(() => setQuickNotice(null), 3500);
   };
 
@@ -62,110 +61,128 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         </div>
       )}
 
-      {/* 1. Active Operation Banner Card */}
-      <div className="glass-panel border-2 border-cyber-cyan/30 rounded-xl p-6 shadow-[0_0_30px_rgba(0,240,255,0.15)] relative overflow-hidden cyber-corner">
-        <div className="absolute -top-10 -right-10 w-72 h-72 bg-cyber-cyan/10 rounded-full blur-3xl pointer-events-none"></div>
+      {/* 1. Active Operation Banner Card / Empty State */}
+      {activeChallenge ? (
+        <div className="glass-panel border-2 border-cyber-cyan/30 rounded-xl p-6 shadow-[0_0_30px_rgba(0,240,255,0.15)] relative overflow-hidden cyber-corner">
+          <div className="absolute -top-10 -right-10 w-72 h-72 bg-cyber-cyan/10 rounded-full blur-3xl pointer-events-none"></div>
 
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-5 pb-5 border-b border-slate-800/80">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-5 pb-5 border-b border-slate-800/80">
+            <div>
+              <div className="flex items-center space-x-3 mb-2 flex-wrap gap-y-1">
+                <span className="px-2.5 py-1 rounded bg-cyan-950/80 border border-cyber-cyan/60 text-cyber-cyan text-xs font-display font-bold tracking-widest uppercase">
+                  {activeChallenge.category} CTF TARGET
+                </span>
+                <h1 className="text-2xl font-display font-bold tracking-wider text-slate-100 neon-text-cyan">
+                  {activeChallenge.name}
+                </h1>
+                {target && (
+                  <span className="text-xs text-slate-400 font-mono">
+                    • IP: <span className="text-cyber-cyan font-bold">{target.currentIp}</span> ({target.hostname})
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center space-x-3 text-xs">
+                <span className={`w-3 h-3 rounded-full ${killSwitchActive ? 'bg-cyber-rose' : 'bg-cyber-emerald animate-ping'}`}></span>
+                <span className={`font-bold tracking-wider ${killSwitchActive ? 'text-cyber-rose' : 'text-cyber-emerald'}`}>
+                  {killSwitchActive ? '● ENGINE LOCKDOWN (HALTED BY OPERATOR)' : '● AUTONOMOUS REASONING LOOP RUNNING'}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center space-x-3">
+              <button
+                onClick={() => { soundEngine.playClick(); onOpenWorkspace(activeChallenge); }}
+                className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] hover:scale-105 transition-all uppercase tracking-wider"
+              >
+                <Play className="w-4 h-4 fill-current" />
+                <span>LAUNCH WORKSPACE</span>
+              </button>
+              <button
+                onClick={() => { soundEngine.playAlarm(); onTriggerKillSwitch(); }}
+                className="px-4 py-2.5 rounded-lg bg-red-950/80 hover:bg-red-900 border border-cyber-rose text-cyber-rose hover:text-white font-display font-bold text-xs flex items-center space-x-2 transition-all uppercase shadow-[0_0_15px_rgba(255,42,109,0.3)]"
+              >
+                <AlertOctagon className="w-4 h-4" />
+                <span>STOP ENGINE</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Operational Metrics Row */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-5 text-xs">
+            <div className="bg-obsidian-900/80 border border-slate-800 rounded-lg p-3.5 hover:border-cyber-cyan/40 transition-colors">
+              <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Target Mission</span>
+              <span className="text-cyber-cyan font-semibold text-xs leading-snug block">
+                {activeChallenge.description || 'Autonomous CTF Target Attack'}
+              </span>
+            </div>
+
+            <div className="bg-obsidian-900/80 border border-slate-800 rounded-lg p-3.5 hover:border-cyber-emerald/40 transition-colors">
+              <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Active AI Brain</span>
+              <span className="text-cyber-emerald font-semibold text-xs block">
+                Gemini 1.5 Pro + DeepSeek R1
+              </span>
+            </div>
+
+            <div className="bg-obsidian-900/80 border border-slate-800 rounded-lg p-3.5 hover:border-cyber-amber/40 transition-colors">
+              <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Status</span>
+              <span className="text-cyber-amber font-semibold text-xs block">
+                {activeChallenge.status}
+              </span>
+            </div>
+
+            <div className="bg-obsidian-900/80 border border-slate-800 rounded-lg p-3.5 hover:border-cyber-violet/40 transition-colors">
+              <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Operation Duration</span>
+              <div className="flex items-center space-x-1.5 text-slate-100 font-bold text-sm font-mono">
+                <Clock className="w-4 h-4 text-cyber-cyan" />
+                <span>00:00:00</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Quick Action Cyber Bar */}
+          <div className="mt-5 pt-4 border-t border-slate-800/80 flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center space-x-2 text-[10px] text-slate-400 uppercase font-bold">
+              <Zap className="w-3.5 h-3.5 text-cyber-cyan" />
+              <span>QUICK OPERATIONS ARSENAL:</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={() => handleQuickAction('DEEP NMAP SCAN')}
+                className="px-2.5 py-1 rounded bg-obsidian-900 border border-slate-700 hover:border-cyber-cyan text-slate-300 hover:text-cyber-cyan text-[11px] font-semibold transition-colors"
+              >
+                🔍 DEEP SCAN
+              </button>
+              <button
+                onClick={() => handleQuickAction('FLAG SEARCH BURST')}
+                className="px-2.5 py-1 rounded bg-obsidian-900 border border-slate-700 hover:border-cyber-emerald text-slate-300 hover:text-cyber-emerald text-[11px] font-semibold transition-colors"
+              >
+                🚀 FLAG BURST
+              </button>
+              <button
+                onClick={() => handleQuickAction('PAYLOAD GENERATION')}
+                className="px-2.5 py-1 rounded bg-obsidian-900 border border-slate-700 hover:border-cyber-amber text-slate-300 hover:text-cyber-amber text-[11px] font-semibold transition-colors"
+              >
+                ⚡ SYNTH PAYLOAD
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="glass-panel border-2 border-cyber-cyan/40 rounded-xl p-8 shadow-[0_0_30px_rgba(0,240,255,0.15)] flex flex-col items-center justify-center text-center space-y-4 cyber-corner">
+          <div className="w-14 h-14 rounded-xl bg-obsidian-900 border border-cyber-cyan flex items-center justify-center text-cyber-cyan shadow-[0_0_20px_rgba(0,240,255,0.4)] animate-pulse">
+            <Zap className="w-7 h-7" />
+          </div>
           <div>
-            <div className="flex items-center space-x-3 mb-2 flex-wrap gap-y-1">
-              <span className="px-2.5 py-1 rounded bg-cyan-950/80 border border-cyber-cyan/60 text-cyber-cyan text-xs font-display font-bold tracking-widest uppercase">
-                {activeChallenge.category} CTF TARGET
-              </span>
-              <h1 className="text-2xl font-display font-bold tracking-wider text-slate-100 neon-text-cyan">
-                {activeChallenge.name}
-              </h1>
-              <span className="text-xs text-slate-400 font-mono">
-                • IP: <span className="text-cyber-cyan font-bold">{target.currentIp}</span> ({target.hostname})
-              </span>
-            </div>
-
-            <div className="flex items-center space-x-3 text-xs">
-              <span className={`w-3 h-3 rounded-full ${killSwitchActive ? 'bg-cyber-rose' : 'bg-cyber-emerald animate-ping'}`}></span>
-              <span className={`font-bold tracking-wider ${killSwitchActive ? 'text-cyber-rose' : 'text-cyber-emerald'}`}>
-                {killSwitchActive ? '● ENGINE LOCKDOWN (HALTED BY OPERATOR)' : '● AUTONOMOUS REASONING LOOP RUNNING'}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center space-x-3">
-            <button
-              onClick={() => { soundEngine.playClick(); onOpenWorkspace(activeChallenge); }}
-              className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] hover:scale-105 transition-all uppercase tracking-wider"
-            >
-              <Play className="w-4 h-4 fill-current" />
-              <span>LAUNCH WORKSPACE</span>
-            </button>
-            <button
-              onClick={() => { soundEngine.playAlarm(); onTriggerKillSwitch(); }}
-              className="px-4 py-2.5 rounded-lg bg-red-950/80 hover:bg-red-900 border border-cyber-rose text-cyber-rose hover:text-white font-display font-bold text-xs flex items-center space-x-2 transition-all uppercase shadow-[0_0_15px_rgba(255,42,109,0.3)]"
-            >
-              <AlertOctagon className="w-4 h-4" />
-              <span>STOP ENGINE</span>
-            </button>
+            <h1 className="text-2xl font-display font-bold tracking-wider text-slate-100 neon-text-cyan uppercase">
+              NO ACTIVE OPERATION IN SYSTEM
+            </h1>
+            <p className="text-xs text-slate-400 max-w-lg mt-1 font-mono leading-relaxed">
+              FORGE is online and standing by. Go to Challenges to initialize a new CTF challenge by entering the target IP, challenge name, and flag pattern.
+            </p>
           </div>
         </div>
-
-        {/* Operational Metrics Row */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-5 text-xs">
-          <div className="bg-obsidian-900/80 border border-slate-800 rounded-lg p-3.5 hover:border-cyber-cyan/40 transition-colors">
-            <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Target Mission</span>
-            <span className="text-cyber-cyan font-semibold text-xs leading-snug block">
-              Exploit HTTP AUTH & Extract Admin JWT
-            </span>
-          </div>
-
-          <div className="bg-obsidian-900/80 border border-slate-800 rounded-lg p-3.5 hover:border-cyber-emerald/40 transition-colors">
-            <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Active AI Brain</span>
-            <span className="text-cyber-emerald font-semibold text-xs block">
-              Gemini 1.5 Pro + DeepSeek R1
-            </span>
-          </div>
-
-          <div className="bg-obsidian-900/80 border border-slate-800 rounded-lg p-3.5 hover:border-cyber-amber/40 transition-colors">
-            <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Next Exploit Step</span>
-            <span className="text-cyber-amber font-semibold text-xs block">
-              Inject Union Select Payload
-            </span>
-          </div>
-
-          <div className="bg-obsidian-900/80 border border-slate-800 rounded-lg p-3.5 hover:border-cyber-violet/40 transition-colors">
-            <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Operation Duration</span>
-            <div className="flex items-center space-x-1.5 text-slate-100 font-bold text-sm font-mono">
-              <Clock className="w-4 h-4 text-cyber-cyan" />
-              <span>00:14:32</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Quick Action Cyber Bar */}
-        <div className="mt-5 pt-4 border-t border-slate-800/80 flex items-center justify-between flex-wrap gap-2">
-          <div className="flex items-center space-x-2 text-[10px] text-slate-400 uppercase font-bold">
-            <Zap className="w-3.5 h-3.5 text-cyber-cyan" />
-            <span>QUICK OPERATIONS ARSENAL:</span>
-          </div>
-          <div className="flex items-center space-x-2">
-            <button
-              onClick={() => handleQuickAction('DEEP NMAP SCAN')}
-              className="px-2.5 py-1 rounded bg-obsidian-900 border border-slate-700 hover:border-cyber-cyan text-slate-300 hover:text-cyber-cyan text-[11px] font-semibold transition-colors"
-            >
-              🔍 DEEP SCAN
-            </button>
-            <button
-              onClick={() => handleQuickAction('FLAG SEARCH BURST')}
-              className="px-2.5 py-1 rounded bg-obsidian-900 border border-slate-700 hover:border-cyber-emerald text-slate-300 hover:text-cyber-emerald text-[11px] font-semibold transition-colors"
-            >
-              🚀 FLAG BURST
-            </button>
-            <button
-              onClick={() => handleQuickAction('PAYLOAD GENERATION')}
-              className="px-2.5 py-1 rounded bg-obsidian-900 border border-slate-700 hover:border-cyber-amber text-slate-300 hover:text-cyber-amber text-[11px] font-semibold transition-colors"
-            >
-              ⚡ SYNTH PAYLOAD
-            </button>
-          </div>
-        </div>
-      </div>
+      )}
 
       {/* Grid Layout: Agent Overview + Target Radar Sweep */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -277,34 +294,38 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
               {/* Target Location Marker */}
               <div className="absolute top-8 right-12 flex items-center space-x-1 bg-obsidian-900/90 border border-cyber-rose/60 px-2 py-0.5 rounded text-[10px] text-cyber-rose font-bold">
                 <span className="w-1.5 h-1.5 rounded-full bg-cyber-rose animate-ping"></span>
-                <span>{target.currentIp}</span>
+                <span>{target?.currentIp || 'NO TARGET'}</span>
               </div>
             </div>
 
             <div className="space-y-2 text-xs">
               <div className="flex justify-between border-b border-slate-800/60 pb-1.5">
                 <span className="text-slate-400">Hostname:</span>
-                <span className="text-slate-200 font-bold">{target.hostname}</span>
+                <span className="text-slate-200 font-bold">{target?.hostname || 'N/A'}</span>
               </div>
               <div className="flex justify-between border-b border-slate-800/60 pb-1.5">
                 <span className="text-slate-400">Discovery:</span>
-                <span className="text-cyber-cyan text-[11px] font-semibold">{target.discoveryMethod}</span>
+                <span className="text-cyber-cyan text-[11px] font-semibold">{target?.discoveryMethod || 'N/A'}</span>
               </div>
               <div className="flex justify-between border-b border-slate-800/60 pb-1.5">
                 <span className="text-slate-400">Last Probe:</span>
-                <span className="text-cyber-emerald font-bold">{target.lastVerified}</span>
+                <span className="text-cyber-emerald font-bold">{target?.lastVerified || 'Never'}</span>
               </div>
 
               <div className="pt-1">
                 <span className="text-slate-400 text-[11px] block mb-1 font-bold">Open Ports & Services:</span>
                 <div className="space-y-1">
-                  {target.services.map((s) => (
-                    <div key={s.port} className="flex items-center justify-between px-2.5 py-1 rounded bg-obsidian-950 border border-slate-800 text-[11px]">
-                      <span className="text-cyber-cyan font-bold">{s.port}/{s.proto}</span>
-                      <span className="text-slate-200 font-semibold">{s.service}</span>
-                      <span className="text-slate-400 text-[10px]">{s.version}</span>
-                    </div>
-                  ))}
+                  {target?.services && target.services.length > 0 ? (
+                    target.services.map((s) => (
+                      <div key={s.port} className="flex items-center justify-between px-2.5 py-1 rounded bg-obsidian-950 border border-slate-800 text-[11px]">
+                        <span className="text-cyber-cyan font-bold">{s.port}/{s.proto}</span>
+                        <span className="text-slate-200 font-semibold">{s.service}</span>
+                        <span className="text-slate-400 text-[10px]">{s.version}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-slate-500 text-[11px] py-1">No services discovered yet</div>
+                  )}
                 </div>
               </div>
             </div>
@@ -312,8 +333,9 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
 
           <div className="pt-3 border-t border-slate-800">
             <button 
-              onClick={() => { soundEngine.playClick(); onOpenWorkspace(activeChallenge); }}
-              className="w-full py-2 rounded-lg bg-obsidian-900 hover:bg-slate-800 border border-cyber-cyan/50 text-cyber-cyan text-xs font-bold flex items-center justify-center space-x-1 transition-all"
+              onClick={() => { soundEngine.playClick(); if (activeChallenge) onOpenWorkspace(activeChallenge); }}
+              disabled={!activeChallenge}
+              className="w-full py-2 rounded-lg bg-obsidian-900 hover:bg-slate-800 border border-cyber-cyan/50 text-cyber-cyan text-xs font-bold flex items-center justify-center space-x-1 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <span>EXPLORE TARGET MATRIX</span>
               <ChevronRight className="w-4 h-4" />

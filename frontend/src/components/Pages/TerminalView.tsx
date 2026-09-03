@@ -21,9 +21,37 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'all' | 'forge_tools' | 'ai_cli'>('all');
   const [commandInput, setCommandInput] = useState('');
-  const [terminalLogs, setTerminalLogs] = useState<TerminalLog[]>(logs);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
+
+  const defaultCliLogs: TerminalLog[] = [
+    {
+      id: 'log-cli-01',
+      timestamp: new Date().toISOString().substring(11, 19),
+      type: 'CLAUDE CODE',
+      command: 'claude-code daemon --auto-start --agentrouter',
+      output: '[+] Claude Code CLI Agent Router daemon online (v3.5 Sonnet).\n[+] Subprocess session initialized cleanly.\n[+] Standing by for autonomous escalation loops.',
+      exitCode: 0,
+      duration: '0.18s',
+      privilege: 'SAFE',
+      agent: 'AGENTROUTER'
+    },
+    {
+      id: 'log-cli-02',
+      timestamp: new Date().toISOString().substring(11, 19),
+      type: 'CODEX',
+      command: 'codex exec --init-session',
+      output: '[+] OpenAI Codex CLI Subprocess Daemon active.\n[+] Code synthesis & patch analysis pipe ready.',
+      exitCode: 0,
+      duration: '0.12s',
+      privilege: 'SAFE',
+      agent: 'AGENTROUTER'
+    }
+  ];
+
+  const [terminalLogs, setTerminalLogs] = useState<TerminalLog[]>(
+    logs && logs.length > 0 ? logs : defaultCliLogs
+  );
 
   const handleCopy = (id: string, text: string) => {
     soundEngine.playClick();
