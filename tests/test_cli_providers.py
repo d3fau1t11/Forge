@@ -42,11 +42,14 @@ class TestCLIProviders(unittest.TestCase):
         orig_key = settings.AGENTROUTER_API_KEY
         orig_opus5 = settings.AGENTROUTER_CLAUDE_OPUS_5_KEY
         orig_env_key = os.environ.get("AGENTROUTER_API_KEY")
+        orig_env_opus5 = os.environ.get("AGENTROUTER_CLAUDE_OPUS_5_KEY")
         try:
             settings.AGENTROUTER_API_KEY = ""
             settings.AGENTROUTER_CLAUDE_OPUS_5_KEY = ""
             if "AGENTROUTER_API_KEY" in os.environ:
                 del os.environ["AGENTROUTER_API_KEY"]
+            if "AGENTROUTER_CLAUDE_OPUS_5_KEY" in os.environ:
+                del os.environ["AGENTROUTER_CLAUDE_OPUS_5_KEY"]
             res = asyncio.run(prov.generate_response("Test prompt", model="claude-opus-5"))
             self.assertTrue(res.is_refusal)
             self.assertIn("No API key", res.refusal_reason)
@@ -55,6 +58,8 @@ class TestCLIProviders(unittest.TestCase):
             settings.AGENTROUTER_CLAUDE_OPUS_5_KEY = orig_opus5
             if orig_env_key:
                 os.environ["AGENTROUTER_API_KEY"] = orig_env_key
+            if orig_env_opus5:
+                os.environ["AGENTROUTER_CLAUDE_OPUS_5_KEY"] = orig_env_opus5
 
     def test_5_correct_model_key_mapping_resolution(self):
         prov = AgentRouterClaudeCodeProvider()
