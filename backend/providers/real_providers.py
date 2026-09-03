@@ -119,6 +119,53 @@ class OpenAISpecProvider(HTTPBaseProvider):
             logger.error(f"{self.name} API error: {str(e)}")
             return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason=str(e))
 
+class AnthropicSpecProvider(HTTPBaseProvider):
+    """Generic Provider for Anthropic Messages API specification (/v1/messages)."""
+    def __init__(self, name: str, is_paid: bool, api_key: str, default_model: str, base_url: str):
+        super().__init__(name=name, is_paid=is_paid, api_key=api_key, default_model=default_model, base_url=base_url)
+
+    async def generate_response(
+        self, prompt: str, system_instruction: Optional[str] = None, capability: str = "general_reasoning", model: Optional[str] = None, **kwargs
+    ) -> ProviderResponse:
+        model_to_use = model or self.default_model
+        if not await self.is_available():
+            return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="API Key unconfigured")
+
+        url = f"{self.base_url}/v1/messages"
+        headers = {
+            "x-api-key": self.api_key,
+            "Authorization": f"Bearer {self.api_key}",
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": model_to_use,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        if system_instruction:
+            payload["system"] = system_instruction
+
+        try:
+            data = await self._post_json(url, headers, payload)
+            content_blocks = data.get("content", [])
+            text_content = ""
+            for block in content_blocks:
+                if block.get("type") == "text":
+                    text_content += block.get("text", "")
+
+            return ProviderResponse(
+                provider_name=self.name,
+                model_name=model_to_use,
+                content=text_content,
+                prompt_tokens=len(prompt) // 4,
+                completion_tokens=len(text_content) // 4,
+                estimated_cost_usd=0.001 if self.is_paid else 0.0
+            )
+        except Exception as e:
+            logger.error(f"{self.name} Anthropic Spec API error: {str(e)}")
+            return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason=str(e))
+
 class HuggingFaceProvider(HTTPBaseProvider):
     def __init__(self, api_key: str = ""):
         super().__init__(
