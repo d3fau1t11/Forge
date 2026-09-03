@@ -32,10 +32,15 @@ evidence/
 reports/*
 !reports/.gitkeep
 logs/*.log
+scratch/
+.serena/
 
 # Environment variables
 .env
 .env.local
+
+# Design Reference Assets
+Design/
 
 # Node / Frontend
 node_modules/
