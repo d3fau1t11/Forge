@@ -13,6 +13,9 @@ export const Agents: React.FC<AgentsProps> = ({ agents }) => {
   const [selectedAgentId, setSelectedAgentId] = useState<string>(agents[0]?.id || 'ag-orchestrator');
   const activeAgent = agents.find((a) => a.id === selectedAgentId) || agents[0];
 
+  const runningCount = agents.filter((a) => a.status === 'RUNNING' || a.status === 'ANALYZING').length;
+  const standbyCount = agents.length - runningCount;
+
   return (
     <div className="space-y-5 font-mono text-slate-100 pb-8">
       {/* Header Banner */}
@@ -28,10 +31,10 @@ export const Agents: React.FC<AgentsProps> = ({ agents }) => {
         </div>
         <div className="flex items-center space-x-3 text-xs">
           <span className="px-2.5 py-1 rounded bg-emerald-950 border border-emerald-800 text-emerald-400 font-bold">
-            3 RUNNING
+            {runningCount} RUNNING
           </span>
           <span className="px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-slate-400">
-            4 STANDBY
+            {standbyCount} STANDBY
           </span>
         </div>
       </div>

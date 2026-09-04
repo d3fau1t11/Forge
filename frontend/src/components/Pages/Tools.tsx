@@ -10,13 +10,7 @@ interface ToolsProps {
 }
 
 export const Tools: React.FC<ToolsProps> = ({ tools }) => {
-  const categories: Array<ToolItem['capabilityCategory']> = [
-    'NETWORK SCANNING',
-    'DIRECTORY ENUMERATION',
-    'WEB ANALYSIS',
-    'PACKET ANALYSIS',
-    'FILE ANALYSIS'
-  ];
+  const categories = Array.from(new Set(tools.map((t) => t.capabilityCategory)));
 
   return (
     <div className="space-y-5 font-mono text-slate-100 pb-8">

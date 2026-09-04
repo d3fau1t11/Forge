@@ -44,12 +44,12 @@ export default function App() {
   const [challenges, setChallenges] = useState<Challenge[]>(INITIAL_CHALLENGES);
   const [targets, setTargets] = useState<Target[]>(INITIAL_TARGETS);
   const [agents] = useState<AgentInfo[]>(INITIAL_AGENTS);
-  const [tools] = useState<ToolItem[]>(INITIAL_TOOLS);
+  const [tools, setTools] = useState<ToolItem[]>(INITIAL_TOOLS);
   const [decisions, setDecisions] = useState<AiDecision[]>(INITIAL_AI_DECISIONS);
   const [routes] = useState<ModelRoute[]>(INITIAL_MODEL_ROUTES);
   const [evidenceList, setEvidenceList] = useState<EvidenceItem[]>(INITIAL_EVIDENCE);
   const [terminalLogs, setTerminalLogs] = useState<TerminalLog[]>(INITIAL_TERMINAL_LOGS);
-  const [providers] = useState<ProviderInfo[]>(INITIAL_PROVIDERS);
+  const [providers, setProviders] = useState<ProviderInfo[]>(INITIAL_PROVIDERS);
   const [checkpoints] = useState<CheckpointItem[]>(INITIAL_CHECKPOINTS);
   const [auditLogs] = useState<AuditLog[]>(INITIAL_AUDIT_LOGS);
   const [findings, setFindings] = useState<Finding[]>(INITIAL_FINDINGS);
@@ -199,6 +199,16 @@ export default function App() {
       const backendFindings = await apiService.getFindings();
       if (Array.isArray(backendFindings)) {
         setFindings(backendFindings);
+      }
+
+      const backendTools = await apiService.getTools();
+      if (Array.isArray(backendTools) && backendTools.length > 0) {
+        setTools(backendTools);
+      }
+
+      const backendProviders = await apiService.getProviders();
+      if (backendProviders && Array.isArray(backendProviders)) {
+        setProviders(backendProviders);
       }
     } catch (e) {
       console.log('Backend sync active.');
