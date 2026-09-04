@@ -13,7 +13,8 @@ import {
   Cpu,
   FileText,
   AlertTriangle,
-  FileCode
+  FileCode,
+  Folder
 } from 'lucide-react';
 import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
@@ -49,36 +50,37 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   const [copiedReadme, setCopiedReadme] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  // Writeup content
-  const [writeupText, setWriteupText] = useState<string>(`# CTF WRITEUP: ${challenge.name} (${challenge.category})
+  const buildDynamicWriteup = () => {
+    const evidenceText = evidenceList.map(e => `### [${e.source}] ${e.description}\n\`\`\`text\n${e.content}\n\`\`\``).join('\n\n') || '*No evidence collected yet.*';
+    const findingsText = findings.map(f => `- **${f.severity}**: ${f.title} — ${f.description}`).join('\n') || '*No findings logged yet.*';
+    return `# CTF WRITEUP: ${challenge.name} (${challenge.category})
 
 ## Challenge Information
+- **Platform / Competition**: ${challenge.platformName || 'FORGE CTF Framework'}
 - **Category**: ${challenge.category}
-- **Target IP**: ${target.currentIp} (${target.hostname})
+- **Target Address**: ${target.currentIp} (${target.hostname})
+- **Working Directory**: \`${challenge.workingDirectory || './workspaces/' + challenge.name.toLowerCase().replace(/\s+/g, '_')}\`
 - **Difficulty**: ${challenge.difficulty}
 - **Status**: ${challenge.status}
-- **Flag**: ${challenge.flag || 'HTB{sql_1nj3ct10n_byp4ss_m4st3r}'}
+- **Flag**: ${challenge.flag || (challenge.flagStatus === 'CAPTURED' ? 'FORGE{flag_captured}' : 'Pending / Unfound')}
 
-## 1. Reconnaissance & Target Profiling
-Nmap scan revealed active services:
-- Port 22/tcp: OpenSSH 8.9p1
-- Port 80/tcp: nginx 1.18.0
-- Port 8080/tcp: Apache Tomcat 9.0.65
+## 1. Reconnaissance & Investigation Strategy
+The FORGE Autonomous Framework conducted targeted analysis on \`${target.currentIp}\`.
 
-## 2. Attack Surface Enumeration
-Fuzzing HTTP endpoints with \`ffuf\` identified authentication route \`/api/v1/auth\`.
+## 2. Key Findings & Vulnerability Assessment
+${findingsText}
 
-## 3. Vulnerability Exploitation
-Discovered error-based SQL Injection on parameter \`username\`.
-Payload: \`{"username": "admin' OR 1=1--", "password": "x"}\`
-Extracted administrative JWT session token.
+## 3. Collected Telemetry & Evidence Artifacts
+${evidenceText}
 
-## 4. Flag Extraction
-Root flag obtained from target filesystem.
+## 4. Flag Extraction & Verification
+- Status: **${challenge.flagStatus}**
+- Flag: \`${challenge.flag || 'In Progress'}\`
+`;
+  };
 
-## 5. Lessons Learned
-Parameterize all SQL database queries and enforce strict input validation schemas.
-`);
+  // Writeup content state
+  const [writeupText, setWriteupText] = useState<string>(buildDynamicWriteup());
 
   const handleTabChange = (tabKey: any) => {
     soundEngine.playClick();
@@ -101,7 +103,7 @@ Parameterize all SQL database queries and enforce strict input validation schema
 
   const handleGenerateWriteup = () => {
     soundEngine.playSuccess();
-    setWriteupText(`[+] AUTOMATICALLY GENERATED CTF WRITEUP FOR ${challenge.name}\n\n# Target: ${target.currentIp}\n# Exploited Endpoint: /api/v1/auth\n# Findings: ${findings.map(f => f.title).join(', ')}\n# Verified Flag: ${challenge.flag || 'HTB{sql_1nj3ct10n_byp4ss_m4st3r}'}`);
+    setWriteupText(buildDynamicWriteup());
   };
 
   return (
@@ -224,10 +226,23 @@ Parameterize all SQL database queries and enforce strict input validation schema
               <h2 className="font-display font-bold text-slate-100 uppercase border-b border-slate-800 pb-2 text-sm neon-text-cyan">
                 TARGET DISCOVERY & SERVICES MATRIX
               </h2>
-              <div className="grid grid-cols-2 gap-4 text-[11px]">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-[11px]">
                 <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
                   <span className="text-slate-500 block font-bold mb-0.5">IP / Host:</span>
                   <span className="text-cyber-cyan font-bold text-sm">{target.currentIp} ({target.hostname})</span>
+                </div>
+                <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block font-bold mb-0.5">Platform / CTF:</span>
+                  <span className="text-purple-300 font-bold text-xs truncate block">{challenge.platformName || 'FORGE CTF'}</span>
+                </div>
+                <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block font-bold mb-0.5 flex items-center space-x-1">
+                    <Folder className="w-3.5 h-3.5 text-cyber-cyan" />
+                    <span>Working Directory:</span>
+                  </span>
+                  <span className="text-cyber-cyan font-bold text-xs truncate block" title={challenge.workingDirectory}>
+                    {challenge.workingDirectory || './workspaces/' + challenge.name.toLowerCase().replace(/\s+/g, '_')}
+                  </span>
                 </div>
                 <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
                   <span className="text-slate-500 block font-bold mb-0.5">Discovery Method:</span>

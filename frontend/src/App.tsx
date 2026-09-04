@@ -31,11 +31,13 @@ import { TerminalView } from './components/Pages/TerminalView';
 import { Providers } from './components/Pages/Providers';
 import { SystemView } from './components/Pages/SystemView';
 import { ChallengeWorkspace } from './components/Pages/ChallengeWorkspace';
+import { apiService } from './services/api';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('command');
   const [activeChallenge, setActiveChallenge] = useState<Challenge | null>(null);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [showModalKillSwitch, setShowModalKillSwitch] = useState(false);
   const [operationalMode, setOperationalMode] = useState<string>('CTF_OFFENSIVE_CONTROLLED');
 
   // Application Data States
@@ -43,24 +45,26 @@ export default function App() {
   const [targets, setTargets] = useState<Target[]>(INITIAL_TARGETS);
   const [agents] = useState<AgentInfo[]>(INITIAL_AGENTS);
   const [tools] = useState<ToolItem[]>(INITIAL_TOOLS);
-  const [decisions] = useState<AiDecision[]>(INITIAL_AI_DECISIONS);
+  const [decisions, setDecisions] = useState<AiDecision[]>(INITIAL_AI_DECISIONS);
   const [routes] = useState<ModelRoute[]>(INITIAL_MODEL_ROUTES);
-  const [evidenceList] = useState<EvidenceItem[]>(INITIAL_EVIDENCE);
-  const [terminalLogs] = useState<TerminalLog[]>(INITIAL_TERMINAL_LOGS);
+  const [evidenceList, setEvidenceList] = useState<EvidenceItem[]>(INITIAL_EVIDENCE);
+  const [terminalLogs, setTerminalLogs] = useState<TerminalLog[]>(INITIAL_TERMINAL_LOGS);
   const [providers] = useState<ProviderInfo[]>(INITIAL_PROVIDERS);
   const [checkpoints] = useState<CheckpointItem[]>(INITIAL_CHECKPOINTS);
   const [auditLogs] = useState<AuditLog[]>(INITIAL_AUDIT_LOGS);
-  const [findings] = useState<Finding[]>(INITIAL_FINDINGS);
+  const [findings, setFindings] = useState<Finding[]>(INITIAL_FINDINGS);
   const [workflowNodes] = useState<WorkflowNode[]>(INITIAL_WORKFLOW_PIPELINE);
 
   useEffect(() => {
-    // Fetch live data from FastAPI backend where available
     fetchBackendData();
 
     // Setup live WebSocket listener
     let ws: WebSocket | null = null;
     try {
-      ws = new WebSocket(`ws://${window.location.host}/ws/events`);
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsHost = window.location.host || 'localhost:8000';
+      ws = new WebSocket(`${wsProtocol}//${wsHost}/ws/events`);
+
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
@@ -68,8 +72,70 @@ export default function App() {
             setChallenges((prev) =>
               prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
             );
+          } else if (data.event === 'PROGRESS_UPDATED') {
+            setChallenges((prev) =>
+              prev.map((c) => (c.id === data.challenge_id ? { ...c, progress: data.progress, status: 'RUNNING' } : c))
+            );
+          } else if (data.event === 'LOG_OUTPUT') {
+            const newLog: TerminalLog = {
+              id: `log-${Date.now()}-${Math.random()}`,
+              timestamp: data.timestamp || new Date().toLocaleTimeString(),
+              command: data.command,
+              output: data.output,
+              exitCode: data.exit_code,
+              duration: '1.2s',
+              type: 'EXECUTION',
+              challengeId: data.challenge_id
+            };
+            setTerminalLogs((prev) => [newLog, ...prev]);
+          } else if (data.event === 'AI_DECISION') {
+            const newDecision: AiDecision = {
+              id: `dec-${Date.now()}`,
+              timestamp: new Date().toLocaleTimeString(),
+              agent: data.agent,
+              goal: data.goal,
+              capability: data.capability,
+              selectedTool: data.capability,
+              result: data.result,
+              confidence: data.confidence || 90,
+              costUsd: 0,
+              challengeId: data.challenge_id
+            };
+            setDecisions((prev) => [newDecision, ...prev]);
+          } else if (data.event === 'EVIDENCE_CAPTURED') {
+            const newEv: EvidenceItem = {
+              id: data.evidence_id || `ev-${Date.now()}`,
+              timestamp: new Date().toLocaleTimeString(),
+              agent: 'RECON',
+              type: data.type || 'command_output',
+              source: data.source || 'tool',
+              description: data.description || 'Captured Telemetry',
+              content: `Evidence generated for challenge ${data.challenge_id}`,
+              hash: `sha256-${Date.now()}`,
+              challengeId: data.challenge_id
+            };
+            setEvidenceList((prev) => [newEv, ...prev]);
+          } else if (data.event === 'FLAG_CAPTURED') {
+            setChallenges((prev) =>
+              prev.map((c) => (c.id === data.challenge_id ? { ...c, flagStatus: 'CAPTURED', flag: data.flag } : c))
+            );
+            const newFinding: Finding = {
+              id: `find-${Date.now()}`,
+              title: `Flag Extracted`,
+              severity: 'CRITICAL',
+              endpoint: 'Target System',
+              status: 'VERIFIED',
+              description: `Successfully extracted flag: ${data.flag}`,
+              challengeId: data.challenge_id
+            };
+            setFindings((prev) => [newFinding, ...prev]);
+          } else if (data.event === 'RUN_COMPLETED') {
+            setChallenges((prev) =>
+              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'COMPLETED', progress: 100 } : c))
+            );
           } else if (data.event === 'KILL_SWITCH_ACTIVATED') {
             setKillSwitchActive(true);
+            setShowModalKillSwitch(true);
           }
         } catch (err) {
           console.error('WS Parse Error', err);
@@ -86,24 +152,59 @@ export default function App() {
 
   const fetchBackendData = async () => {
     try {
-      const resHealth = await fetch('/api/health');
-      if (resHealth.ok) {
-        const data = await resHealth.json();
-        console.log('Backend health status:', data);
+      const backendChallenges = await apiService.getChallenges();
+      if (Array.isArray(backendChallenges) && backendChallenges.length > 0) {
+        const formatted: Challenge[] = backendChallenges.map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          category: c.category,
+          difficulty: c.difficulty || 'MEDIUM',
+          target: c.target_address || c.target || '127.0.0.1',
+          status: c.status,
+          progress: c.progress || 0,
+          lastActivity: 'Just now',
+          flagStatus: c.flagStatus || 'UNFOUND',
+          flag: c.flag,
+          description: c.description,
+          workingDirectory: c.working_directory,
+          platformName: c.platform_name
+        }));
+        setChallenges(formatted);
+      }
+
+      const backendTargets = await apiService.getTargets();
+      if (Array.isArray(backendTargets) && backendTargets.length > 0) {
+        const formattedT: Target[] = backendTargets.map((t: any) => ({
+          id: t.id,
+          currentIp: t.current_address,
+          hostname: t.hostname,
+          services: [
+            { port: 80, proto: 'tcp', service: 'HTTP', version: 'Target Server' }
+          ],
+          technologies: ['Linux'],
+          status: t.verification_status.toUpperCase(),
+          discoveryMethod: 'FORGE Auto Ingest',
+          lastVerified: 'Just now',
+          addressHistory: [t.current_address],
+          challengeId: t.challenge_id
+        }));
+        setTargets(formattedT);
       }
     } catch (e) {
-      console.log('Backend sync: using local state');
+      console.log('Backend sync: using initial state');
     }
   };
 
-  const handleCreateChallenge = (newCh: {
+  const handleCreateChallenge = async (newCh: {
     name: string;
     category: any;
     difficulty: any;
     target: string;
     description: string;
+    workingDirectory?: string;
+    platformName?: string;
   }) => {
-    const created: Challenge = {
+    const createdLocally: Challenge = {
       id: `ch-${Date.now()}`,
       name: newCh.name,
       category: newCh.category,
@@ -113,26 +214,46 @@ export default function App() {
       progress: 0,
       lastActivity: 'Just now',
       flagStatus: 'UNFOUND',
-      description: newCh.description
+      description: newCh.description,
+      workingDirectory: newCh.workingDirectory,
+      platformName: newCh.platformName
     };
-    setChallenges((prev) => [created, ...prev]);
+    setChallenges((prev) => [createdLocally, ...prev]);
 
-    // Also register target identity
     const newTargetObj: Target = {
       id: `TARGET-${Math.floor(1000 + Math.random() * 9000)}`,
       currentIp: newCh.target,
       hostname: `${newCh.name.toLowerCase()}.ctf`,
       services: [
-        { port: 80, proto: 'tcp', service: 'HTTP', version: 'Target Web Server' }
+        { port: 80, proto: 'tcp', service: 'HTTP', version: 'Target Server' }
       ],
       technologies: ['HTTP', 'Linux'],
       status: 'VERIFIED',
       discoveryMethod: 'FORGE Auto Ingest',
       lastVerified: 'Just now',
       addressHistory: [newCh.target],
-      challengeId: created.id
+      challengeId: createdLocally.id
     };
     setTargets((prev) => [newTargetObj, ...prev]);
+
+    try {
+      const resp = await apiService.createChallenge({
+        name: newCh.name,
+        category: newCh.category,
+        difficulty: newCh.difficulty,
+        description: newCh.description,
+        target_address: newCh.target,
+        working_directory: newCh.workingDirectory,
+        platform_name: newCh.platformName
+      });
+      if (resp && resp.id) {
+        setChallenges((prev) =>
+          prev.map((c) => (c.id === createdLocally.id ? { ...c, id: resp.id } : c))
+        );
+      }
+    } catch (e) {
+      console.warn('Backend API challenge creation offline fallback:', e);
+    }
   };
 
   const handleToggleChallengeStatus = (id: string) => {
@@ -145,6 +266,7 @@ export default function App() {
 
   const handleTriggerKillSwitch = async () => {
     setKillSwitchActive(true);
+    setShowModalKillSwitch(true);
     try {
       await fetch('/api/killswitch', { method: 'POST' });
     } catch (e) {
@@ -154,6 +276,11 @@ export default function App() {
 
   const handleResumeKillSwitch = () => {
     setKillSwitchActive(false);
+    setShowModalKillSwitch(false);
+  };
+
+  const handleMinimizeKillSwitchModal = () => {
+    setShowModalKillSwitch(false);
   };
 
   const handleOpenChallengeWorkspace = (ch: Challenge) => {
@@ -187,6 +314,7 @@ export default function App() {
           killSwitchActive={killSwitchActive}
           operationalMode={operationalMode}
           onModeChange={setOperationalMode}
+          onResumeKillSwitch={handleResumeKillSwitch}
         />
 
         {/* 3. Page Router Body */}
@@ -231,8 +359,8 @@ export default function App() {
               {activeTab === 'targets' && (
                 <Targets
                   targets={targets}
-                  onRediscover={(id) => console.log('Rediscovering target:', id)}
-                  onVerify={(id) => console.log('Verifying target:', id)}
+                  onRediscover={(id) => apiService.rediscoverTarget(id)}
+                  onVerify={(id) => apiService.verifyTarget(id)}
                   onCreateTarget={handleCreateChallenge}
                   onNavigateTab={(tab) => setActiveTab(tab)}
                 />
@@ -255,7 +383,7 @@ export default function App() {
               )}
 
               {activeTab === 'terminal' && (
-                <TerminalView logs={terminalLogs} />
+                <TerminalView logs={terminalLogs} activeChallengeId={undefined} />
               )}
 
               {activeTab === 'providers' && (
@@ -279,9 +407,11 @@ export default function App() {
 
       {/* 4. Global Emergency Stop Overlay Modal */}
       <EmergencyStopModal
-        isOpen={killSwitchActive}
+        isOpen={showModalKillSwitch}
         onResume={handleResumeKillSwitch}
+        onMinimize={handleMinimizeKillSwitchModal}
       />
     </div>
   );
 }
+

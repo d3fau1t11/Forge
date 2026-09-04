@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Play, 
   Target as TargetIcon, 
@@ -36,6 +36,26 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   killSwitchActive
 }) => {
   const [quickNotice, setQuickNotice] = useState<string | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
+
+  useEffect(() => {
+    let interval: any = null;
+    if (activeChallenge && activeChallenge.status === 'RUNNING' && !killSwitchActive) {
+      interval = setInterval(() => {
+        setElapsedSeconds((prev) => prev + 1);
+      }, 1000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [activeChallenge?.status, killSwitchActive]);
+
+  const formatDuration = (totalSeconds: number): string => {
+    const hrs = Math.floor(totalSeconds / 3600);
+    const mins = Math.floor((totalSeconds % 3600) / 60);
+    const secs = totalSeconds % 60;
+    return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
 
   const liveEvents = activeChallenge ? [
     { time: '00:00:01', source: 'ORCHESTRATOR', text: `Target profile initialized (${target?.currentIp || '127.0.0.1'})`, color: 'text-cyber-cyan' },
@@ -77,7 +97,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                 </h1>
                 {target && (
                   <span className="text-xs text-slate-400 font-mono">
-                    • IP: <span className="text-cyber-cyan font-bold">{target.currentIp}</span> ({target.hostname})
+                    • TARGET: <span className="text-cyber-cyan font-bold">{target.currentIp}</span> ({target.hostname})
                   </span>
                 )}
               </div>
@@ -93,10 +113,16 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
             <div className="flex items-center space-x-3">
               <button
                 onClick={() => { soundEngine.playClick(); onOpenWorkspace(activeChallenge); }}
-                className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] hover:scale-105 transition-all uppercase tracking-wider"
+                className={`px-5 py-2.5 rounded-lg font-display font-bold text-xs flex items-center space-x-2 transition-all uppercase tracking-wider ${
+                  activeChallenge.status === 'RUNNING'
+                    ? 'bg-cyber-emerald hover:bg-emerald-400 text-obsidian-950 shadow-[0_0_20px_rgba(16,185,129,0.4)]'
+                    : 'bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 shadow-[0_0_20px_rgba(0,240,255,0.4)]'
+                } hover:scale-105`}
               >
                 <Play className="w-4 h-4 fill-current" />
-                <span>LAUNCH WORKSPACE</span>
+                <span>
+                  {activeChallenge.status === 'RUNNING' ? 'WORKSPACE (LIVE)' : (activeChallenge.status === 'PAUSED' ? 'WORKSPACE (PAUSED)' : 'LAUNCH WORKSPACE')}
+                </span>
               </button>
               <button
                 onClick={() => { soundEngine.playAlarm(); onTriggerKillSwitch(); }}
@@ -135,7 +161,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
               <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Operation Duration</span>
               <div className="flex items-center space-x-1.5 text-slate-100 font-bold text-sm font-mono">
                 <Clock className="w-4 h-4 text-cyber-cyan" />
-                <span>00:00:00</span>
+                <span>{formatDuration(elapsedSeconds)}</span>
               </div>
             </div>
           </div>

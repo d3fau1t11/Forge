@@ -21,9 +21,11 @@ class ReportGenerator:
 
         target_str = target.current_address if target else "Unknown Target"
 
+        platform = getattr(challenge, "platform_name", "") or "FORGE CTF Framework"
         markdown_content = f"""# CTF Challenge Writeup — {challenge.name}
 
 ## Challenge Overview
+- **Platform / Competition**: {platform}
 - **Category**: {challenge.category.upper()}
 - **Target**: `{target_str}`
 - **Status**: `{challenge.status}`

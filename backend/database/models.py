@@ -42,7 +42,11 @@ class ChallengeModel(Base):
     name = Column(String, nullable=False)
     category = Column(String, default="general") # web, recon, forensics, crypto, pwn, rev
     description = Column(Text, default="")
+    working_directory = Column(String, default="")
+    platform_name = Column(String, default="")
     status = Column(String, default="QUEUED") # QUEUED, RUNNING, PAUSED, COMPLETED, FAILED
+    progress = Column(Integer, default=0)
+    flag_status = Column(String, default="UNFOUND")
     flag = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

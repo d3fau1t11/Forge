@@ -88,6 +88,8 @@ export class ApiService {
     difficulty?: string;
     description: string;
     target_address: string;
+    working_directory?: string;
+    platform_name?: string;
   }) {
     const res = await fetch(`${API_BASE_URL}/challenges`, {
       method: 'POST',
@@ -182,6 +184,16 @@ export class ApiService {
     } catch (e) {
       return [];
     }
+  }
+
+  public async executeTerminalCommand(command: string, challengeId?: string) {
+    const res = await fetch(`${API_BASE_URL}/terminal/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command, challenge_id: challengeId })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
   }
 
   // ----------------------------------------------------

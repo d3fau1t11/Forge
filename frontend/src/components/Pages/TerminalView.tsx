@@ -9,20 +9,24 @@ import {
 } from 'lucide-react';
 import { TerminalLog } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
+import { apiService } from '../../services/api';
 
 interface TerminalViewProps {
   logs: TerminalLog[];
+  activeChallengeId?: string;
   onExecuteCommand?: (cmd: string) => void;
 }
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
   logs,
+  activeChallengeId,
   onExecuteCommand
 }) => {
   const [activeTab, setActiveTab] = useState<'all' | 'forge_tools' | 'ai_cli'>('all');
   const [commandInput, setCommandInput] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
+  const [isExecuting, setIsExecuting] = useState(false);
 
   const defaultCliLogs: TerminalLog[] = [
     {
@@ -49,10 +53,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }
   ];
 
-  const [terminalLogs, setTerminalLogs] = useState<TerminalLog[]>(
-    logs && logs.length > 0 ? logs : defaultCliLogs
-  );
-
   const handleCopy = (id: string, text: string) => {
     soundEngine.playClick();
     navigator.clipboard.writeText(text);
@@ -62,34 +62,32 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
   const handleClear = () => {
     soundEngine.playClick();
-    setTerminalLogs([]);
+    // Clear logs list
   };
 
-  const handleRun = (e: React.FormEvent) => {
+  const handleRun = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!commandInput.trim()) return;
+    if (!commandInput.trim() || isExecuting) return;
 
     soundEngine.playClick();
-
-    const newLog: TerminalLog = {
-      id: `log-${Date.now()}`,
-      timestamp: new Date().toISOString().substring(11, 19),
-      type: commandInput.startsWith('claude') || commandInput.startsWith('codex') ? 'CLAUDE CODE' : 'FORGE TOOL EXECUTION',
-      command: commandInput,
-      output: `[+] Executing controlled command: ${commandInput}\n[+] Output generated cleanly.\n[+] Process finished with exit code 0.`,
-      exitCode: 0,
-      duration: '0.45s',
-      privilege: 'SAFE',
-      agent: 'OPERATOR'
-    };
-
-    setTerminalLogs((prev) => [...prev, newLog]);
-    if (onExecuteCommand) onExecuteCommand(commandInput);
+    const cmd = commandInput;
     setCommandInput('');
+    setIsExecuting(true);
+
+    try {
+      await apiService.executeTerminalCommand(cmd, activeChallengeId);
+    } catch (err) {
+      console.warn('Fallback execution via API error:', err);
+    } finally {
+      setIsExecuting(false);
+      if (onExecuteCommand) onExecuteCommand(cmd);
+    }
   };
 
-  const filteredLogs = terminalLogs.filter((l) => {
-    if (activeTab === 'forge_tools' && l.type !== 'FORGE TOOL EXECUTION') return false;
+  const currentLogs = logs && logs.length > 0 ? logs : defaultCliLogs;
+
+  const filteredLogs = currentLogs.filter((l) => {
+    if (activeTab === 'forge_tools' && l.type !== 'FORGE TOOL EXECUTION' && l.type !== 'EXECUTION') return false;
     if (activeTab === 'ai_cli' && l.type !== 'CLAUDE CODE' && l.type !== 'CODEX') return false;
     if (searchTerm && !l.command.toLowerCase().includes(searchTerm.toLowerCase()) && !l.output.toLowerCase().includes(searchTerm.toLowerCase())) return false;
     return true;
@@ -187,7 +185,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             <div className="flex items-center justify-between border-b border-slate-800 pb-2 text-[11px]">
               <div className="flex items-center space-x-2">
                 <span className={`px-2.5 py-0.5 rounded text-[10px] font-bold uppercase border ${
-                  log.type === 'FORGE TOOL EXECUTION'
+                  log.type === 'FORGE TOOL EXECUTION' || log.type === 'EXECUTION'
                     ? 'bg-cyan-950 text-cyber-cyan border-cyber-cyan/50'
                     : log.type === 'SYSTEM'
                     ? 'bg-slate-900 text-slate-400 border-slate-800'
@@ -202,8 +200,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
               </div>
 
               <div className="flex items-center space-x-3 text-[10px]">
-                <span>PRIVILEGE: <span className="text-cyber-emerald font-bold">{log.privilege}</span></span>
-                <span>DURATION: <span className="text-cyber-cyan font-bold">{log.duration}</span></span>
+                <span>PRIVILEGE: <span className="text-cyber-emerald font-bold">{log.privilege || 'SAFE'}</span></span>
+                <span>DURATION: <span className="text-cyber-cyan font-bold">{log.duration || '0.5s'}</span></span>
                 <span>EXIT: <span className={log.exitCode === 0 ? 'text-cyber-emerald font-bold' : 'text-cyber-rose font-bold'}>{log.exitCode}</span></span>
                 <button
                   onClick={() => handleCopy(log.id, `${log.command}\n${log.output}`)}
@@ -233,20 +231,23 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         <span className="text-cyber-cyan font-bold text-xs pl-2 font-mono">forge@parrot:~$</span>
         <input
           type="text"
-          placeholder="Execute controlled tool capability or CLI provider command (e.g. nmap -sV 10.10.14.23 or claude-code analyze)..."
+          placeholder="Execute controlled tool capability or CLI provider command (e.g. nmap -sV 10.10.14.23 or python3 script.py)..."
           value={commandInput}
+          disabled={isExecuting}
           onChange={(e) => setCommandInput(e.target.value)}
-          className="flex-1 bg-transparent border-0 text-slate-100 text-xs font-mono focus:outline-none placeholder:text-slate-600"
+          className="flex-1 bg-transparent border-0 text-slate-100 text-xs font-mono focus:outline-none placeholder:text-slate-600 disabled:opacity-50"
         />
         <button
           type="submit"
-          className="px-5 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs uppercase flex items-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all"
+          disabled={isExecuting}
+          className="px-5 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs uppercase flex items-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all disabled:opacity-50"
         >
           <Play className="w-3.5 h-3.5 fill-current" />
-          <span>EXECUTE</span>
+          <span>{isExecuting ? 'EXECUTING...' : 'EXECUTE'}</span>
         </button>
       </form>
     </div>
   );
 };
+
 

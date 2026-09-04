@@ -15,6 +15,7 @@ interface TopBarProps {
   killSwitchActive: boolean;
   operationalMode: string;
   onModeChange: (mode: string) => void;
+  onResumeKillSwitch?: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -22,7 +23,8 @@ export const TopBar: React.FC<TopBarProps> = ({
   activeChallenge,
   killSwitchActive,
   operationalMode,
-  onModeChange
+  onModeChange,
+  onResumeKillSwitch
 }) => {
   const [timeStr, setTimeStr] = useState<string>('');
   const [useLocalTime, setUseLocalTime] = useState<boolean>(false);
@@ -61,71 +63,94 @@ export const TopBar: React.FC<TopBarProps> = ({
   };
 
   return (
-    <header className="h-14 border-b border-cyber-cyan/20 bg-obsidian-950/90 backdrop-blur-md px-5 flex items-center justify-between font-mono z-10 select-none relative">
-      {/* Left: Section Header & Operational Mode Dropdown */}
-      <div className="flex items-center space-x-4">
-        <div className="flex items-center space-x-2">
-          <div className="w-2 h-2 rounded-full bg-cyber-cyan shadow-[0_0_8px_#00f0ff] animate-ping"></div>
-          <h2 className="text-sm font-display font-bold tracking-wider text-slate-100 uppercase neon-text-cyan">
-            {getSectionTitle()}
-          </h2>
-        </div>
-
-      {/* Operational Strategy Mode Selector */}
-        <div className="flex items-center space-x-2 bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-1 text-xs">
-          <SlidersHorizontal className="w-3.5 h-3.5 text-cyber-cyan" />
-          <span className="text-[10px] text-slate-400 font-bold uppercase">MODE:</span>
-          <select 
-            value={operationalMode}
-            onChange={(e) => {
-              soundEngine.playClick();
-              onModeChange(e.target.value);
-            }}
-            className="bg-transparent text-slate-200 font-mono text-xs focus:outline-none cursor-pointer text-cyber-cyan font-bold"
-          >
-            <option value="CTF_OFFENSIVE_CONTROLLED" className="bg-obsidian-950 text-cyber-cyan">⚡ CTF CONTROLLED</option>
-            <option value="FULL_AUTONOMOUS_EXPLOITATION" className="bg-obsidian-950 text-cyber-rose">🔥 FULL AUTONOMOUS</option>
-            <option value="STEALTH_RECON" className="bg-obsidian-950 text-emerald-400">🛡️ STEALTH RECON</option>
-          </select>
-        </div>
-      </div>
-
-      {/* Right: Essential Telemetry Controls */}
-      <div className="flex items-center space-x-3 text-xs font-mono">
-        {/* Active Challenge Badge */}
-        {activeChallenge && (
-          <div className="hidden sm:flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-obsidian-900 border border-cyber-cyan/40 text-cyber-cyan">
-            <Zap className="w-3.5 h-3.5 text-cyber-cyan animate-pulse" />
-            <span className="font-bold truncate max-w-[140px] uppercase">{activeChallenge.name}</span>
+    <div className="flex flex-col select-none z-10">
+      {/* Emergency Lockdown Sticky Banner */}
+      {killSwitchActive && (
+        <div className="bg-red-950 border-b border-cyber-rose/60 text-cyber-rose px-5 py-2 text-xs flex items-center justify-between shadow-[0_0_20px_rgba(255,42,109,0.4)] animate-pulse font-mono">
+          <div className="flex items-center space-x-2">
+            <AlertTriangle className="w-4 h-4 text-cyber-rose animate-bounce" />
+            <span className="font-bold tracking-wider uppercase">
+              ⚠️ EMERGENCY LOCKDOWN ACTIVE — AUTONOMOUS OPERATIONS HALTED (READ-ONLY NAVIGATION ALLOWED)
+            </span>
           </div>
-        )}
 
-        {/* UTC / Local Clock */}
-        <button 
-          onClick={() => { soundEngine.playClick(); setUseLocalTime(!useLocalTime); }}
-          title="Click to toggle UTC / Local Time"
-          className="flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-obsidian-900 border border-slate-800 hover:border-cyber-cyan/50 text-slate-200 transition-colors"
-        >
-          <Clock className="w-3.5 h-3.5 text-slate-400" />
-          <span className="text-cyber-cyan font-bold font-mono">{timeStr || '18:42:05 UTC'}</span>
-        </button>
-
-        {/* System Health Status */}
-        <div className="flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-obsidian-900 border border-slate-800">
-          {killSwitchActive ? (
-            <>
-              <AlertTriangle className="w-3.5 h-3.5 text-cyber-rose animate-bounce" />
-              <span className="text-cyber-rose font-bold text-xs">LOCKDOWN</span>
-            </>
-          ) : (
-            <>
-              <CheckCircle2 className="w-3.5 h-3.5 text-cyber-emerald" />
-              <span className="text-cyber-emerald font-bold text-xs">SYS OK</span>
-            </>
+          {onResumeKillSwitch && (
+            <button
+              onClick={() => { soundEngine.playSuccess(); onResumeKillSwitch(); }}
+              className="px-3 py-1 rounded bg-cyber-emerald hover:bg-emerald-400 text-obsidian-950 font-display font-bold text-[11px] uppercase tracking-wider shadow-[0_0_10px_rgba(16,185,129,0.5)] transition-all"
+            >
+              [ RESUME OPERATIONS ]
+            </button>
           )}
         </div>
-      </div>
-    </header>
+      )}
+
+      <header className="h-14 border-b border-cyber-cyan/20 bg-obsidian-950/90 backdrop-blur-md px-5 flex items-center justify-between font-mono">
+        {/* Left: Section Header & Operational Mode Dropdown */}
+        <div className="flex items-center space-x-4">
+          <div className="flex items-center space-x-2">
+            <div className="w-2 h-2 rounded-full bg-cyber-cyan shadow-[0_0_8px_#00f0ff] animate-ping"></div>
+            <h2 className="text-sm font-display font-bold tracking-wider text-slate-100 uppercase neon-text-cyan">
+              {getSectionTitle()}
+            </h2>
+          </div>
+
+          {/* Operational Strategy Mode Selector */}
+          <div className="flex items-center space-x-2 bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-1 text-xs">
+            <SlidersHorizontal className="w-3.5 h-3.5 text-cyber-cyan" />
+            <span className="text-[10px] text-slate-400 font-bold uppercase">MODE:</span>
+            <select 
+              value={operationalMode}
+              onChange={(e) => {
+                soundEngine.playClick();
+                onModeChange(e.target.value);
+              }}
+              className="bg-transparent text-slate-200 font-mono text-xs focus:outline-none cursor-pointer text-cyber-cyan font-bold"
+            >
+              <option value="CTF_OFFENSIVE_CONTROLLED" className="bg-obsidian-950 text-cyber-cyan">⚡ CTF CONTROLLED</option>
+              <option value="FULL_AUTONOMOUS_EXPLOITATION" className="bg-obsidian-950 text-cyber-rose">🔥 FULL AUTONOMOUS</option>
+              <option value="STEALTH_RECON" className="bg-obsidian-950 text-emerald-400">🛡️ STEALTH RECON</option>
+            </select>
+          </div>
+        </div>
+
+        {/* Right: Essential Telemetry Controls */}
+        <div className="flex items-center space-x-3 text-xs font-mono">
+          {/* Active Challenge Badge */}
+          {activeChallenge && (
+            <div className="hidden sm:flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-obsidian-900 border border-cyber-cyan/40 text-cyber-cyan">
+              <Zap className="w-3.5 h-3.5 text-cyber-cyan animate-pulse" />
+              <span className="font-bold truncate max-w-[140px] uppercase">{activeChallenge.name}</span>
+            </div>
+          )}
+
+          {/* UTC / Local Clock */}
+          <button 
+            onClick={() => { soundEngine.playClick(); setUseLocalTime(!useLocalTime); }}
+            title="Click to toggle UTC / Local Time"
+            className="flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-obsidian-900 border border-slate-800 hover:border-cyber-cyan/50 text-slate-200 transition-colors"
+          >
+            <Clock className="w-3.5 h-3.5 text-slate-400" />
+            <span className="text-cyber-cyan font-bold font-mono">{timeStr || '18:42:05 UTC'}</span>
+          </button>
+
+          {/* System Health Status */}
+          <div className="flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-obsidian-900 border border-slate-800">
+            {killSwitchActive ? (
+              <>
+                <AlertTriangle className="w-3.5 h-3.5 text-cyber-rose animate-bounce" />
+                <span className="text-cyber-rose font-bold text-xs">LOCKDOWN</span>
+              </>
+            ) : (
+              <>
+                <CheckCircle2 className="w-3.5 h-3.5 text-cyber-emerald" />
+                <span className="text-cyber-emerald font-bold text-xs">SYS OK</span>
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+    </div>
   );
 };
 

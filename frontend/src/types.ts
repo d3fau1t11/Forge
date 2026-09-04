@@ -25,12 +25,14 @@ export interface Challenge {
   category: string;
   difficulty: 'EASY' | 'MEDIUM' | 'HARD' | 'INSANE';
   target: string;
-  status: 'RUNNING' | 'PAUSED' | 'WAITING' | 'SOLVED' | 'FAILED';
+  status: 'RUNNING' | 'PAUSED' | 'WAITING' | 'SOLVED' | 'FAILED' | 'COMPLETED' | 'QUEUED';
   progress: number; // 0 - 100
   lastActivity: string;
   flagStatus: 'UNFOUND' | 'CAPTURED' | 'VERIFYING';
   flag?: string;
   description?: string;
+  workingDirectory?: string;
+  platformName?: string;
 }
 
 export interface Target {
@@ -39,7 +41,7 @@ export interface Target {
   hostname: string;
   services: { port: number; proto: string; service: string; version?: string }[];
   technologies: string[];
-  status: 'VERIFIED' | 'UNVERIFIED' | 'UNREACHABLE';
+  status: string;
   discoveryMethod: string;
   lastVerified: string;
   addressHistory: string[];
@@ -80,10 +82,11 @@ export interface AiDecision {
   goal: string;
   capability: string;
   selectedTool: string;
-  reason: string;
+  reason?: string;
   result: string;
-  nextAction: string;
+  nextAction?: string;
   confidence: number;
+  costUsd?: number;
   challengeId?: string;
 }
 
@@ -101,23 +104,24 @@ export interface EvidenceItem {
   timestamp: string;
   source: string;
   agent: string;
-  tool: string;
-  target: string;
-  type: 'HTTP RESPONSE' | 'SCREENSHOT' | 'COMMAND OUTPUT' | 'FILE' | 'HASH' | 'BANNER' | 'FINDING' | 'FLAG';
+  tool?: string;
+  target?: string;
+  type: string;
   description: string;
   content: string;
+  hash?: string;
   challengeId?: string;
 }
 
 export interface TerminalLog {
   id: string;
   timestamp: string;
-  type: 'FORGE TOOL EXECUTION' | 'CLAUDE CODE' | 'CODEX' | 'SYSTEM';
+  type: 'FORGE TOOL EXECUTION' | 'CLAUDE CODE' | 'CODEX' | 'SYSTEM' | 'EXECUTION';
   command: string;
   output: string;
   exitCode: number;
   duration: string;
-  privilege: 'SAFE' | 'ELEVATED' | 'SUDO';
+  privilege?: 'SAFE' | 'ELEVATED' | 'SUDO';
   agent?: string;
   challengeId?: string;
 }
@@ -160,10 +164,10 @@ export interface Finding {
   id: string;
   severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
   title: string;
-  target: string;
+  target?: string;
   endpoint: string;
   status: 'VERIFIED' | 'UNVERIFIED' | 'EXPLOITED';
-  evidenceRef: string;
+  evidenceRef?: string;
   description: string;
   challengeId?: string;
 }

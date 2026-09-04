@@ -1,3 +1,5 @@
+import os
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -29,6 +31,8 @@ class CreateChallengeRequest(BaseModel):
     difficulty: str = "MEDIUM"
     description: str = ""
     target_address: str
+    working_directory: Optional[str] = ""
+    platform_name: Optional[str] = ""
 
 class UpdateTargetAddressRequest(BaseModel):
     new_address: str
@@ -36,6 +40,11 @@ class UpdateTargetAddressRequest(BaseModel):
 class ExecuteToolRequest(BaseModel):
     capability: str
     target: str
+
+class TerminalExecuteRequest(BaseModel):
+    command: str
+    challenge_id: Optional[str] = None
+    working_directory: Optional[str] = None
 
 class EvidenceCreateRequest(BaseModel):
     challenge_id: str
@@ -104,24 +113,42 @@ def get_challenge(challenge_id: str, db: Session = Depends(get_db)):
 
 @router.post("/challenges")
 async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(get_db)):
+    working_dir = req.working_directory.strip() if (req.working_directory and req.working_directory.strip()) else os.path.abspath(os.path.join("workspaces", req.name.lower().replace(" ", "_")))
+    os.makedirs(working_dir, exist_ok=True)
+
     challenge = ChallengeModel(
         name=req.name,
         category=req.category,
         description=req.description,
-        status="QUEUED"
+        working_directory=working_dir,
+        platform_name=req.platform_name.strip() if req.platform_name else "FORGE CTF",
+        status="RUNNING"
     )
     db.add(challenge)
     db.commit()
     db.refresh(challenge)
 
+    is_file = os.path.exists(req.target_address)
     target = TargetProfileModel(
         challenge_id=challenge.id,
         current_address=req.target_address,
-        hostname=f"{req.name.lower()}.ctf",
-        verification_status="verified"
+        hostname=os.path.basename(req.target_address) if is_file else f"{req.name.lower()}.ctf",
+        verification_status="verified_file" if is_file else "verified_network"
     )
     db.add(target)
     db.commit()
+
+    run = RunModel(
+        challenge_id=challenge.id,
+        status="RUNNING",
+        current_phase="recon",
+        current_agent="orchestrator"
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    workflow_runner.start_run(run.id, challenge.id, req.target_address)
 
     await ws_manager.broadcast({
         "event": "CHALLENGE_CREATED",
@@ -198,11 +225,12 @@ async def verify_target(target_id: str, db: Session = Depends(get_db)):
     if not target:
         raise HTTPException(status_code=404, detail="Target identity not found")
     
-    target.verification_status = "verified"
+    is_file = os.path.exists(target.current_address)
+    target.verification_status = "verified_file" if is_file else "verified_network"
     target.last_verified_at = datetime.utcnow()
     db.commit()
 
-    await ws_manager.broadcast({"event": "TARGET_VERIFIED", "target_id": target_id, "address": target.current_address})
+    await ws_manager.broadcast({"event": "TARGET_VERIFIED", "target_id": target_id, "address": target.current_address, "status": target.verification_status})
     return target
 
 @router.post("/targets/{target_id}/rediscover")
@@ -311,6 +339,38 @@ def list_tool_executions(db: Session = Depends(get_db)):
 async def execute_tool(req: ExecuteToolRequest):
     result = await tool_manager.execute_capability(capability=req.capability, target=req.target)
     return result
+
+@router.post("/terminal/execute")
+async def execute_terminal_command(req: TerminalExecuteRequest):
+    start_time = datetime.utcnow()
+    try:
+        exec_cwd = req.working_directory if (req.working_directory and os.path.exists(req.working_directory)) else None
+        process = await asyncio.create_subprocess_shell(
+            req.command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=exec_cwd
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=60)
+        output = stdout_bytes.decode(errors="replace") or stderr_bytes.decode(errors="replace") or "Command completed with no output."
+        exit_code = process.returncode
+    except asyncio.TimeoutError:
+        output = "Command timed out after 60 seconds."
+        exit_code = -1
+    except Exception as e:
+        output = f"Execution error: {str(e)}"
+        exit_code = -1
+
+    event_payload = {
+        "event": "LOG_OUTPUT",
+        "challenge_id": req.challenge_id,
+        "command": req.command,
+        "output": output,
+        "exit_code": exit_code,
+        "timestamp": start_time.strftime("%H:%M:%S")
+    }
+    await ws_manager.broadcast(event_payload)
+    return event_payload
 
 # ----------------------------------------------------
 # PRIVILEGE MANAGER

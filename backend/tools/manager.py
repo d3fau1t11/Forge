@@ -1,3 +1,4 @@
+import os
 import asyncio
 import time
 import shutil
@@ -27,7 +28,8 @@ class ToolManager:
         self,
         capability: str,
         target: str,
-        extra_args: Optional[str] = None
+        extra_args: Optional[str] = None,
+        cwd: Optional[str] = None
     ) -> ToolExecutionResult:
         start_time = time.time()
         
@@ -68,14 +70,16 @@ class ToolManager:
             raw_args += f" {extra_args}"
         
         full_command = f"{selected_tool.binary} {raw_args}"
-        logger.info(f"Executing tool '{selected_tool.tool_name}': {full_command}")
+        logger.info(f"Executing tool '{selected_tool.tool_name}' (cwd={cwd}): {full_command}")
 
         # 4. Controlled subprocess execution
         try:
+            exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
             process = await asyncio.create_subprocess_shell(
                 full_command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                cwd=exec_cwd
             )
 
             try:

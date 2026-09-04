@@ -46,8 +46,8 @@ export const Evidence: React.FC<EvidenceProps> = ({ evidence }) => {
 
   const filtered = evidence.filter((e) => {
     const matchesSearch = e.description.toLowerCase().includes(searchTerm.toLowerCase()) || 
-                          e.target.includes(searchTerm) ||
-                          e.tool.toLowerCase().includes(searchTerm.toLowerCase());
+                          (e.target && e.target.includes(searchTerm)) ||
+                          (e.tool && e.tool.toLowerCase().includes(searchTerm.toLowerCase()));
     const matchesType = typeFilter === 'ALL' || e.type === typeFilter;
     return matchesSearch && matchesType;
   });

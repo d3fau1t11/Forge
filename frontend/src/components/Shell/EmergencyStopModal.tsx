@@ -1,15 +1,17 @@
 import React, { useEffect } from 'react';
-import { AlertOctagon, ShieldAlert, Play, Database, FileText, Lock } from 'lucide-react';
+import { AlertOctagon, ShieldAlert, Play, Database, FileText, Lock, Eye } from 'lucide-react';
 import { soundEngine } from '../../utils/soundEngine';
 
 interface EmergencyStopModalProps {
   isOpen: boolean;
   onResume: () => void;
+  onMinimize?: () => void;
 }
 
 export const EmergencyStopModal: React.FC<EmergencyStopModalProps> = ({
   isOpen,
-  onResume
+  onResume,
+  onMinimize
 }) => {
   useEffect(() => {
     if (isOpen) {
@@ -22,6 +24,11 @@ export const EmergencyStopModal: React.FC<EmergencyStopModalProps> = ({
   const handleResume = () => {
     soundEngine.playSuccess();
     onResume();
+  };
+
+  const handleMinimize = () => {
+    soundEngine.playClick();
+    if (onMinimize) onMinimize();
   };
 
   return (
@@ -109,11 +116,14 @@ export const EmergencyStopModal: React.FC<EmergencyStopModalProps> = ({
         </div>
 
         {/* Action Controls */}
-        <div className="mt-6 pt-4 border-t border-cyber-rose/40 flex items-center justify-between">
-          <div className="flex items-center space-x-2 text-cyber-rose text-xs font-bold tracking-wider">
-            <span className="w-3 h-3 rounded-full bg-cyber-rose animate-ping"></span>
-            <span>SYSTEM WAITING FOR OPERATOR OVERRIDE</span>
-          </div>
+        <div className="mt-6 pt-4 border-t border-cyber-rose/40 flex items-center justify-between flex-wrap gap-3">
+          <button
+            onClick={handleMinimize}
+            className="px-4 py-2.5 rounded-lg bg-obsidian-900 border border-slate-700 hover:border-cyber-cyan text-slate-300 hover:text-cyber-cyan font-mono text-xs font-bold flex items-center space-x-2 transition-all uppercase"
+          >
+            <Eye className="w-4 h-4 text-cyber-cyan" />
+            <span>INSPECT READ-ONLY</span>
+          </button>
 
           <button
             onClick={handleResume}
@@ -127,4 +137,5 @@ export const EmergencyStopModal: React.FC<EmergencyStopModalProps> = ({
     </div>
   );
 };
+
 
