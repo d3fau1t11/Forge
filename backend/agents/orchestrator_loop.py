@@ -175,17 +175,18 @@ class AutonomousOrchestrator:
                 stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
                 log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Execution finished with no output."
 
-                # Append Turn Telemetry to Dedicated Challenge Log File
+                # Append Full AI Conversation & Telemetry to Dedicated Challenge Log File
                 logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
                 ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
                 try:
                     with open(ch_log_path, "a", encoding="utf-8") as f:
-                        f.write(f"[{datetime.utcnow().strftime('%H:%M:%S')}] TURN #{turn} ({model_used})\n")
-                        f.write(f"  AI RAW RESPONSE: {raw_ai_output}\n")
-                        f.write(f"  EXECUTED CMD: {cmd_line}\n")
-                        f.write(f"  EXIT CODE: {tool_res.exit_code}\n")
-                        f.write(f"  OUTPUT:\n{log_output}\n")
-                        f.write(f"--------------------------------------------------\n\n")
+                        f.write(f"[{datetime.utcnow().strftime('%H:%M:%S')}] TURN #{turn} (Model Provider: {model_used})\n")
+                        f.write(f"  --- SYSTEM INSTRUCTION SENT TO AI ---\n{system_instruction}\n\n")
+                        f.write(f"  --- PROMPT / RECENT HISTORY SENT TO AI ---\n{prompt}\n\n")
+                        f.write(f"  --- RAW AI RESPONSE RECEIVED ---\n{raw_ai_output}\n\n")
+                        f.write(f"  --- EXECUTED BASH COMMAND ---\n{cmd_line}\n\n")
+                        f.write(f"  --- STDOUT / STDERR OUTPUT (Exit Code {tool_res.exit_code}) ---\n{log_output}\n")
+                        f.write(f"================================================================================\n\n")
                 except Exception as log_err:
                     logger.warning(f"Failed to append to challenge log file: {log_err}")
 
