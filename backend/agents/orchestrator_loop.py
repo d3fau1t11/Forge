@@ -2,7 +2,9 @@ import asyncio
 import json
 import re
 import os
+import sys
 import logging
+import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
@@ -21,8 +23,46 @@ from backend.reporting.generator import report_generator
 
 logger = logging.getLogger("forge.orchestrator")
 
+# Common import-name to pip-package-name mappings
+IMPORT_TO_PACKAGE_MAP = {
+    "bs4": "beautifulsoup4",
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "Crypto": "pycryptodome",
+    "yaml": "pyyaml",
+    "sklearn": "scikit-learn",
+    "flask_unsign": "flask-unsign",
+    "pwn": "pwntools",
+}
+
 class AutonomousOrchestrator:
     """Central autonomous investigation ReAct 1-Command Cycle loop."""
+
+    def __init__(self):
+        # Tracks pending install requests: request_id -> asyncio.Event
+        self._install_events: dict[str, asyncio.Event] = {}
+        self._install_results: dict[str, bool] = {}
+        # Tracks pending root/privilege requests: request_id -> asyncio.Event
+        self._root_events: dict[str, asyncio.Event] = {}
+        self._root_results: dict[str, dict] = {}
+
+    def resolve_install_request(self, request_id: str, success: bool):
+        """Called by the API route after user approves and pip install completes."""
+        self._install_results[request_id] = success
+        event = self._install_events.get(request_id)
+        if event:
+            event.set()
+
+    def resolve_root_request(self, request_id: str, success: bool, tool_res: Optional[Any] = None, message: str = ""):
+        """Called by the API route when operator approves or denies root execution."""
+        self._root_results[request_id] = {
+            "success": success,
+            "tool_res": tool_res,
+            "message": message
+        }
+        event = self._root_events.get(request_id)
+        if event:
+            event.set()
 
     async def run_autonomous_loop(self, run_id: str, challenge_id: str, target: str):
         """Asynchronous background 1-command ping-pong loop processing CTF challenge target."""
@@ -72,7 +112,7 @@ class AutonomousOrchestrator:
                     return
 
                 # Calculate realistic progress based on investigation state milestones
-                if challenge.flagStatus == "CAPTURED":
+                if challenge.flag_status == "CAPTURED":
                     progress = 100
                 elif state_memory["discovered_endpoints"] or state_memory["observed_cookies"]:
                     progress = min(85, 30 + (turn * 4))
@@ -250,6 +290,114 @@ class AutonomousOrchestrator:
                 stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
                 log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Execution finished with no output."
 
+                # ── ImportError Auto-Install Detection ──
+                if is_python_script and tool_res.exit_code != 0:
+                    combined_err = f"{stdout_text}\n{stderr_text}"
+                    import_err_match = re.search(
+                        r"(?:ModuleNotFoundError|ImportError):\s*No module named ['\"]([^'\"]+)['\"]",
+                        combined_err
+                    )
+                    if import_err_match:
+                        missing_import = import_err_match.group(1).split('.')[0]
+                        pip_package = IMPORT_TO_PACKAGE_MAP.get(missing_import, missing_import)
+                        request_id = str(uuid.uuid4())
+                        error_snippet = combined_err.strip()[-300:]
+
+                        logger.info(f"Detected missing module '{missing_import}' (pip: {pip_package}). Requesting user install approval.")
+
+                        # Send install request popup to frontend
+                        await ws_manager.broadcast({
+                            "event": "PACKAGE_INSTALL_REQUEST",
+                            "request_id": request_id,
+                            "challenge_id": challenge_id,
+                            "challenge_name": challenge.name,
+                            "package_name": pip_package,
+                            "import_name": missing_import,
+                            "error_snippet": error_snippet,
+                            "timestamp": datetime.utcnow().strftime("%H:%M:%S")
+                        })
+
+                        # Wait for user decision (up to 120s)
+                        install_event = asyncio.Event()
+                        self._install_events[request_id] = install_event
+                        try:
+                            await asyncio.wait_for(install_event.wait(), timeout=120)
+                            if self._install_results.get(request_id, False):
+                                logger.info(f"Package '{pip_package}' installed. Retrying solver script.")
+                                # Re-run the same solver script
+                                tool_res = await tool_manager.execute_raw_command(
+                                    command=cmd_line,
+                                    cwd=challenge.working_directory,
+                                    timeout_seconds=120
+                                )
+                                stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
+                                stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
+                                log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Re-execution finished."
+                            else:
+                                logger.warning(f"Package install for '{pip_package}' failed or was rejected.")
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Install approval for '{pip_package}' timed out after 120s. Continuing.")
+                        finally:
+                            self._install_events.pop(request_id, None)
+                            self._install_results.pop(request_id, None)
+
+                # ── Root / Privilege Elevation Detection ──
+                requires_root_pattern = r"(?:Permission denied|Operation not permitted|You must be root|need root privileges|requires root|must be run as root|sudo:\s*a password is required|superuser privileges|EACCES)"
+                combined_output = f"{stdout_text}\n{stderr_text}"
+                needs_root_elevation = (
+                    cmd_line.strip().startswith("sudo ") or
+                    (tool_res.exit_code != 0 and re.search(requires_root_pattern, combined_output, re.I))
+                )
+
+                if needs_root_elevation and not is_python_script:
+                    root_request_id = str(uuid.uuid4())
+                    root_reason = "This command requires elevated root / superuser privileges to execute."
+                    error_snippet = (stderr_text or stdout_text).strip()[-300:]
+                    logger.info(f"Command '{cmd_line}' requires root/sudo privileges. Requesting user approval [ID: {root_request_id}].")
+
+                    await ws_manager.broadcast({
+                        "event": "ROOT_PERMISSION_REQUEST",
+                        "request_id": root_request_id,
+                        "challenge_id": challenge_id,
+                        "challenge_name": challenge.name,
+                        "command": cmd_line,
+                        "reason": root_reason,
+                        "error_snippet": error_snippet,
+                        "timestamp": datetime.utcnow().strftime("%H:%M:%S")
+                    })
+
+                    root_event = asyncio.Event()
+                    self._root_events[root_request_id] = root_event
+                    try:
+                        await asyncio.wait_for(root_event.wait(), timeout=120)
+                        res = self._root_results.get(root_request_id, {})
+                        if res.get("success"):
+                            logger.info(f"Root permission approved for '{cmd_line}'.")
+                            if res.get("tool_res"):
+                                tool_res = res["tool_res"]
+                            else:
+                                sudo_cmd = cmd_line if cmd_line.startswith("sudo ") else f"sudo {cmd_line}"
+                                tool_res = await tool_manager.execute_raw_command(
+                                    command=sudo_cmd,
+                                    cwd=challenge.working_directory,
+                                    timeout_seconds=120
+                                )
+                            stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
+                            stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
+                            log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Elevated execution completed."
+                        else:
+                            logger.warning(f"Root permission was rejected/denied by operator for '{cmd_line}'.")
+                            stdout_text = ""
+                            stderr_text = f"[ACCESS DENIED] Root/sudo permission was rejected by the operator for: {cmd_line}. Please pivot to an unprivileged user-space alternative."
+                            log_output = stderr_text
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Root approval request timed out for '{cmd_line}'.")
+                        stderr_text = f"[TIMEOUT] Root permission request timed out after 120s. Please pivot to an unprivileged user-space alternative."
+                        log_output = stderr_text
+                    finally:
+                        self._root_events.pop(root_request_id, None)
+                        self._root_results.pop(root_request_id, None)
+
                 # Update Structured State Memory from Command Output
                 self._update_state_memory(state_memory, stdout_text)
 
@@ -313,7 +461,16 @@ class AutonomousOrchestrator:
                 )
 
             except Exception as e:
-                logger.error(f"Error during turn #{turn} of run {run_id}: {str(e)}")
+                import traceback
+                logger.error(f"Error during turn #{turn} of run {run_id}: {str(e)}\n{traceback.format_exc()}")
+                # Append error to challenge log for visibility
+                try:
+                    logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
+                    ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
+                    with open(ch_log_path, "a", encoding="utf-8") as f:
+                        f.write(f"[{datetime.utcnow().strftime('%H:%M:%S')}] TURN #{turn} ERROR: {str(e)}\n{traceback.format_exc()}\n")
+                except Exception:
+                    pass
             finally:
                 db.close()
 
@@ -342,7 +499,7 @@ class AutonomousOrchestrator:
 
     async def _record_flag_capture(self, db: Session, challenge, run, challenge_id: str, run_id: str, flag_str: str, source: str):
         """Helper to record flag capture and broadcast websocket event."""
-        challenge.flagStatus = "CAPTURED"
+        challenge.flag_status = "CAPTURED"
         challenge.flag = flag_str
         challenge.progress = 100
         db.commit()

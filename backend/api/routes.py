@@ -588,6 +588,179 @@ async def kill_switch(run_id: Optional[str] = None):
     return {"status": "KILL_SWITCH_ACTIVATED", "run_id": run_id}
 
 # ----------------------------------------------------
+# PACKAGE INSTALL APPROVAL SYSTEM
+# ----------------------------------------------------
+
+class PackageInstallRequest(BaseModel):
+    request_id: str
+    package_name: str
+    challenge_id: Optional[str] = None
+
+# In-memory registry of pending install requests from the orchestrator
+pending_install_requests: dict = {}
+
+@router.post("/package/install")
+async def install_package(req: PackageInstallRequest):
+    """User-approved pip install for a missing solver dependency."""
+    import subprocess, sys, logging
+    logger = logging.getLogger("forge.package_installer")
+
+    package_name = req.package_name.strip()
+    # Basic safety check: only allow simple package names
+    if not all(c.isalnum() or c in '-_.[]=<>!' for c in package_name):
+        raise HTTPException(status_code=400, detail=f"Invalid package name: {package_name}")
+
+    logger.info(f"User approved pip install: {package_name}")
+    await ws_manager.broadcast({
+        "event": "PACKAGE_INSTALL_STARTED",
+        "request_id": req.request_id,
+        "package_name": package_name,
+        "challenge_id": req.challenge_id
+    })
+
+    try:
+        result = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", package_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(result.communicate(), timeout=120)
+        stdout_text = stdout_bytes.decode(errors="replace")
+        stderr_text = stderr_bytes.decode(errors="replace")
+        success = result.returncode == 0
+
+        await ws_manager.broadcast({
+            "event": "PACKAGE_INSTALL_RESULT",
+            "request_id": req.request_id,
+            "package_name": package_name,
+            "challenge_id": req.challenge_id,
+            "success": success,
+            "output": stdout_text[:2000] if success else stderr_text[:2000]
+        })
+
+        # Remove from pending queue
+        pending_install_requests.pop(req.request_id, None)
+
+        # Signal orchestrator to resume if it was waiting
+        from backend.agents.orchestrator_loop import orchestrator_loop
+        orchestrator_loop.resolve_install_request(req.request_id, success)
+
+        return {
+            "status": "SUCCESS" if success else "FAILED",
+            "package_name": package_name,
+            "output": stdout_text[:2000] if success else stderr_text[:2000]
+        }
+    except asyncio.TimeoutError:
+        await ws_manager.broadcast({
+            "event": "PACKAGE_INSTALL_RESULT",
+            "request_id": req.request_id,
+            "package_name": package_name,
+            "success": False,
+            "output": "Installation timed out after 120 seconds."
+        })
+        return {"status": "TIMEOUT", "package_name": package_name}
+    except Exception as e:
+        return {"status": "ERROR", "package_name": package_name, "error": str(e)}
+
+class PackageSkipRequest(BaseModel):
+    request_id: str
+    challenge_id: Optional[str] = None
+
+@router.post("/package/skip")
+async def skip_package_install(req: PackageSkipRequest):
+    """User skipped or rejected package installation."""
+    from backend.agents.orchestrator_loop import orchestrator_loop
+    pending_install_requests.pop(req.request_id, None)
+    orchestrator_loop.resolve_install_request(req.request_id, False)
+    return {"status": "SKIPPED", "request_id": req.request_id}
+
+# ----------------------------------------------------
+# ROOT PRIVILEGE ELEVATION APPROVAL SYSTEM
+# ----------------------------------------------------
+
+class PrivilegeApprovalRequest(BaseModel):
+    request_id: str
+    command: str
+    challenge_id: Optional[str] = None
+    sudo_password: Optional[str] = None
+    working_directory: Optional[str] = None
+
+class PrivilegeRejectRequest(BaseModel):
+    request_id: str
+    challenge_id: Optional[str] = None
+
+@router.post("/privilege/approve")
+async def approve_privilege_execution(req: PrivilegeApprovalRequest):
+    """Executes an approved root/superuser command on behalf of the operator."""
+    import logging
+    from backend.agents.orchestrator_loop import orchestrator_loop
+    from backend.tools.manager import tool_manager
+
+    logger = logging.getLogger("forge.privilege")
+    cmd = req.command.strip()
+    logger.info(f"Operator approved root elevation for command: {cmd}")
+
+    if req.sudo_password:
+        elevated_cmd = f"echo {req.sudo_password} | sudo -S {cmd.removeprefix('sudo ').strip()}"
+    elif not cmd.startswith("sudo"):
+        elevated_cmd = f"sudo {cmd}"
+    else:
+        elevated_cmd = cmd
+
+    tool_res = await tool_manager.execute_raw_command(
+        command=elevated_cmd,
+        cwd=req.working_directory,
+        timeout_seconds=120
+    )
+
+    await ws_manager.broadcast({
+        "event": "ROOT_PERMISSION_RESULT",
+        "request_id": req.request_id,
+        "challenge_id": req.challenge_id,
+        "success": tool_res.exit_code == 0,
+        "exit_code": tool_res.exit_code,
+        "output": (tool_res.stdout or tool_res.stderr)[:2000]
+    })
+
+    orchestrator_loop.resolve_root_request(
+        request_id=req.request_id,
+        success=True,
+        tool_res=tool_res
+    )
+
+    return {
+        "status": "APPROVED",
+        "exit_code": tool_res.exit_code,
+        "stdout": tool_res.stdout[:2000],
+        "stderr": tool_res.stderr[:2000]
+    }
+
+@router.post("/privilege/reject")
+async def reject_privilege_execution(req: PrivilegeRejectRequest):
+    """Operator rejected root execution for a command."""
+    import logging
+    from backend.agents.orchestrator_loop import orchestrator_loop
+
+    logger = logging.getLogger("forge.privilege")
+    logger.info(f"Operator rejected root elevation for request: {req.request_id}")
+
+    orchestrator_loop.resolve_root_request(
+        request_id=req.request_id,
+        success=False,
+        message="Root permission rejected by operator."
+    )
+
+    await ws_manager.broadcast({
+        "event": "ROOT_PERMISSION_RESULT",
+        "request_id": req.request_id,
+        "challenge_id": req.challenge_id,
+        "success": False,
+        "output": "Root privilege rejected by operator."
+    })
+
+    return {"status": "REJECTED", "request_id": req.request_id}
+
+
 # DIRECTORY BROWSER & CREATOR API
 # ----------------------------------------------------
 

@@ -19,6 +19,8 @@ import {
 import { Sidebar } from './components/Shell/Sidebar';
 import { TopBar } from './components/Shell/TopBar';
 import { EmergencyStopModal } from './components/Shell/EmergencyStopModal';
+import { PackageInstallModal, PackageInstallRequest } from './components/Shell/PackageInstallModal';
+import { RootPermissionModal, RootPermissionRequest } from './components/Shell/RootPermissionModal';
 
 import { CommandCenter } from './components/Pages/CommandCenter';
 import { Challenges } from './components/Pages/Challenges';
@@ -54,6 +56,8 @@ export default function App() {
   const [auditLogs] = useState<AuditLog[]>(INITIAL_AUDIT_LOGS);
   const [findings, setFindings] = useState<Finding[]>(INITIAL_FINDINGS);
   const [workflowNodes] = useState<WorkflowNode[]>(INITIAL_WORKFLOW_PIPELINE);
+  const [packageRequests, setPackageRequests] = useState<PackageInstallRequest[]>([]);
+  const [rootRequests, setRootRequests] = useState<RootPermissionRequest[]>([]);
 
   useEffect(() => {
     fetchBackendData();
@@ -152,6 +156,36 @@ export default function App() {
           } else if (data.event === 'KILL_SWITCH_ACTIVATED') {
             setKillSwitchActive(true);
             setShowModalKillSwitch(true);
+          } else if (data.event === 'PACKAGE_INSTALL_REQUEST') {
+            setPackageRequests((prev) => [
+              ...prev.filter((r) => r.requestId !== data.request_id),
+              {
+                requestId: data.request_id,
+                challengeId: data.challenge_id,
+                challengeName: data.challenge_name || 'Autonomous Target',
+                packageName: data.package_name,
+                importName: data.import_name,
+                errorSnippet: data.error_snippet || '',
+                timestamp: data.timestamp || new Date().toLocaleTimeString()
+              }
+            ]);
+          } else if (data.event === 'PACKAGE_INSTALL_RESULT') {
+            setPackageRequests((prev) => prev.filter((r) => r.requestId !== data.request_id));
+          } else if (data.event === 'ROOT_PERMISSION_REQUEST') {
+            setRootRequests((prev) => [
+              ...prev.filter((r) => r.requestId !== data.request_id),
+              {
+                requestId: data.request_id,
+                challengeId: data.challenge_id,
+                challengeName: data.challenge_name || 'Autonomous Agent',
+                command: data.command,
+                reason: data.reason || 'Superuser privilege required',
+                errorSnippet: data.error_snippet || '',
+                timestamp: data.timestamp || new Date().toLocaleTimeString()
+              }
+            ]);
+          } else if (data.event === 'ROOT_PERMISSION_RESULT') {
+            setRootRequests((prev) => prev.filter((r) => r.requestId !== data.request_id));
           }
         } catch (err) {
           console.error('WS Parse Error', err);
@@ -343,6 +377,46 @@ export default function App() {
     setShowModalKillSwitch(false);
   };
 
+  const handleApprovePackageInstall = async (requestId: string, packageName: string) => {
+    try {
+      await apiService.installPackage(requestId, packageName);
+    } catch (e) {
+      console.error('Failed to approve package install:', e);
+    }
+  };
+
+  const handleDismissPackageInstall = async (requestId: string) => {
+    setPackageRequests((prev) => prev.filter((r) => r.requestId !== requestId));
+    try {
+      await apiService.skipPackageInstall(requestId);
+    } catch (e) {
+      console.error('Failed to skip package install:', e);
+    }
+  };
+
+  const handleApproveRoot = async (requestId: string, command: string, sudoPassword?: string) => {
+    try {
+      await apiService.approvePrivilege(
+        requestId,
+        command,
+        sudoPassword,
+        activeChallenge?.id,
+        activeChallenge?.workingDirectory
+      );
+    } catch (e) {
+      console.error('Failed to approve root permission:', e);
+    }
+  };
+
+  const handleDismissRoot = async (requestId: string) => {
+    setRootRequests((prev) => prev.filter((r) => r.requestId !== requestId));
+    try {
+      await apiService.rejectPrivilege(requestId, activeChallenge?.id);
+    } catch (e) {
+      console.error('Failed to reject root permission:', e);
+    }
+  };
+
   const handleOpenChallengeWorkspace = (ch: Challenge) => {
     setActiveChallenge(ch);
   };
@@ -485,6 +559,20 @@ export default function App() {
         isOpen={showModalKillSwitch}
         onResume={handleResumeKillSwitch}
         onMinimize={handleMinimizeKillSwitchModal}
+      />
+
+      {/* 5. Missing Package Install Approval Modal */}
+      <PackageInstallModal
+        requests={packageRequests}
+        onApprove={handleApprovePackageInstall}
+        onDismiss={handleDismissPackageInstall}
+      />
+
+      {/* 6. Root / Privileged Elevation Approval Modal */}
+      <RootPermissionModal
+        requests={rootRequests}
+        onApprove={handleApproveRoot}
+        onDismiss={handleDismissRoot}
       />
     </div>
   );

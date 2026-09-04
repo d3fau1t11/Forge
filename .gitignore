@@ -31,7 +31,8 @@ forge.db
 evidence/
 reports/*
 !reports/.gitkeep
-logs/*.log
+*.log
+logs/
 scratch/
 .serena/
 .agents/

@@ -299,6 +299,66 @@ export class ApiService {
   }
 
   // ----------------------------------------------------
+  // PACKAGE INSTALLATION & PRIVILEGE APPROVALS
+  // ----------------------------------------------------
+
+  public async installPackage(requestId: string, packageName: string, challengeId?: string) {
+    const res = await fetch(`${API_BASE_URL}/package/install`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        request_id: requestId,
+        package_name: packageName,
+        challenge_id: challengeId
+      })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async skipPackageInstall(requestId: string, challengeId?: string) {
+    const res = await fetch(`${API_BASE_URL}/package/skip`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        request_id: requestId,
+        challenge_id: challengeId
+      })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async approvePrivilege(requestId: string, command: string, sudoPassword?: string, challengeId?: string, workingDirectory?: string) {
+    const res = await fetch(`${API_BASE_URL}/privilege/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        request_id: requestId,
+        command: command,
+        sudo_password: sudoPassword,
+        challenge_id: challengeId,
+        working_directory: workingDirectory
+      })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async rejectPrivilege(requestId: string, challengeId?: string) {
+    const res = await fetch(`${API_BASE_URL}/privilege/reject`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        request_id: requestId,
+        challenge_id: challengeId
+      })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  // ----------------------------------------------------
   // DIRECTORY BROWSER & FOLDER PICKER
   // ----------------------------------------------------
 
