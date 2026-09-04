@@ -284,6 +284,30 @@ export default function App() {
     );
   };
 
+  const handleDeleteChallenge = async (id: string) => {
+    setChallenges((prev) => prev.filter((c) => c.id !== id));
+    setTargets((prev) => prev.filter((t) => t.challengeId !== id));
+    if (activeChallenge?.id === id) {
+      setActiveChallenge(null);
+    }
+    try {
+      await apiService.deleteChallenge(id);
+    } catch (e) {
+      console.warn('Delete challenge fallback:', e);
+    }
+  };
+
+  const handleDeleteAllChallenges = async () => {
+    setChallenges([]);
+    setTargets([]);
+    setActiveChallenge(null);
+    try {
+      await apiService.deleteAllChallenges();
+    } catch (e) {
+      console.warn('Delete all challenges fallback:', e);
+    }
+  };
+
   const handleTriggerKillSwitch = async () => {
     setKillSwitchActive(true);
     setShowModalKillSwitch(true);
@@ -311,7 +335,20 @@ export default function App() {
     setActiveChallenge(null);
   };
 
-  const currentTarget = targets.find((t) => t.challengeId === activeChallenge?.id) || targets[0];
+  const currentTarget: Target = (activeChallenge ? targets.find((t) => t.challengeId === activeChallenge.id) : undefined) || targets[0] || {
+    id: activeChallenge?.id || 'target-main',
+    currentIp: activeChallenge?.target || '127.0.0.1',
+    hostname: `${(activeChallenge?.name || 'target').toLowerCase().replace(/\s+/g, '_')}.ctf`,
+    services: [
+      { port: 80, proto: 'tcp', service: 'HTTP', version: 'Target Server' }
+    ],
+    technologies: ['Linux'],
+    status: 'VERIFIED',
+    discoveryMethod: 'FORGE Auto Ingest',
+    lastVerified: 'Just now',
+    addressHistory: [activeChallenge?.target || '127.0.0.1'],
+    challengeId: activeChallenge?.id
+  };
 
   return (
     <div className="h-screen w-screen flex bg-[#06090e] text-slate-100 overflow-hidden font-sans select-none">
@@ -373,6 +410,8 @@ export default function App() {
                   onSelectChallenge={handleOpenChallengeWorkspace}
                   onCreateChallenge={handleCreateChallenge}
                   onToggleStatus={handleToggleChallengeStatus}
+                  onDeleteChallenge={handleDeleteChallenge}
+                  onDeleteAllChallenges={handleDeleteAllChallenges}
                 />
               )}
 

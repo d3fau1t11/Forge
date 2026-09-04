@@ -2,6 +2,9 @@ import unittest
 import asyncio
 import os
 import shutil
+
+os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
+
 from backend.database.session import init_db, SessionLocal
 from backend.database.models import ChallengeModel, TargetProfileModel, RunModel, CheckpointModel, EvidenceModel, FindingModel
 from backend.tools.manager import tool_manager

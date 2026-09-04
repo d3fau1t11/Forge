@@ -100,6 +100,18 @@ export class ApiService {
     return await res.json();
   }
 
+  public async deleteChallenge(challengeId: string) {
+    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async deleteAllChallenges() {
+    const res = await fetch(`${API_BASE_URL}/challenges`, { method: 'DELETE' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
   public async generateReport(challengeId: string) {
     const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/report`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);

@@ -46,7 +46,16 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
     'overview' | 'workflow' | 'terminal' | 'ai_decisions' | 'evidence' | 'findings' | 'readme'
   >('overview');
 
-  const [selectedWorkflowNode, setSelectedWorkflowNode] = useState<WorkflowNode | null>(workflowNodes[6] || null);
+  const activeWorkflowNodes: WorkflowNode[] = workflowNodes.length > 0 ? workflowNodes : [
+    { id: 'wn-1', label: '1. INGEST', status: 'COMPLETED', description: `Challenge scope & target ${challenge.target} initialized in workspace.` },
+    { id: 'wn-2', label: '2. RECON', status: challenge.progress >= 20 ? 'COMPLETED' : (challenge.status === 'RUNNING' ? 'ACTIVE' : 'PENDING'), description: 'Target IP scanning & service version fingerprinting.' },
+    { id: 'wn-3', label: '3. ENUM', status: challenge.progress >= 40 ? 'COMPLETED' : (challenge.progress >= 20 && challenge.status === 'RUNNING' ? 'ACTIVE' : 'PENDING'), description: 'Directory enumeration & web surface discovery.' },
+    { id: 'wn-4', label: '4. ANALYSIS', status: challenge.progress >= 60 ? 'COMPLETED' : (challenge.progress >= 40 && challenge.status === 'RUNNING' ? 'ACTIVE' : 'PENDING'), description: 'AI vulnerability assessment & exploit path strategy formulation.' },
+    { id: 'wn-5', label: '5. EXPLOITATION', status: challenge.progress >= 80 ? 'COMPLETED' : (challenge.progress >= 60 && challenge.status === 'RUNNING' ? 'ACTIVE' : 'PENDING'), description: 'Exploit payload execution & privilege verification.' },
+    { id: 'wn-6', label: '6. FLAG CAPTURE', status: challenge.flagStatus === 'CAPTURED' ? 'COMPLETED' : (challenge.progress >= 80 && challenge.status === 'RUNNING' ? 'ACTIVE' : 'PENDING'), description: 'Flag extraction from file system, memory, or database.' }
+  ];
+
+  const [selectedWorkflowNode, setSelectedWorkflowNode] = useState<WorkflowNode | null>(activeWorkflowNodes[0]);
   const [copiedReadme, setCopiedReadme] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -306,7 +315,7 @@ ${evidenceText}
           {/* Node Flow Horizontal Pipeline */}
           <div className="bg-obsidian-950 border border-slate-800 rounded-xl p-6 overflow-x-auto shadow-inner">
             <div className="flex items-center space-x-3 min-w-max">
-              {workflowNodes.map((node, idx) => (
+              {activeWorkflowNodes.map((node, idx) => (
                 <React.Fragment key={node.id}>
                   <div
                     onClick={() => { soundEngine.playClick(); setSelectedWorkflowNode(node); }}
@@ -333,7 +342,7 @@ ${evidenceText}
                     </span>
                   </div>
 
-                  {idx < workflowNodes.length - 1 && (
+                  {idx < activeWorkflowNodes.length - 1 && (
                     <ArrowRight className="w-5 h-5 text-slate-600 shrink-0" />
                   )}
                 </React.Fragment>

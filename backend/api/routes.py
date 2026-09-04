@@ -159,11 +159,25 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
 
     return challenge
 
+@router.delete("/challenges")
+def delete_all_challenges(db: Session = Depends(get_db)):
+    db.query(TargetProfileModel).delete()
+    db.query(RunModel).delete()
+    db.query(EvidenceModel).delete()
+    db.query(FindingModel).delete()
+    db.query(ChallengeModel).delete()
+    db.commit()
+    return {"status": "ALL_CHALLENGES_DELETED"}
+
 @router.delete("/challenges/{challenge_id}")
 def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
     challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
+    db.query(TargetProfileModel).filter(TargetProfileModel.challenge_id == challenge_id).delete()
+    db.query(RunModel).filter(RunModel.challenge_id == challenge_id).delete()
+    db.query(EvidenceModel).filter(EvidenceModel.challenge_id == challenge_id).delete()
+    db.query(FindingModel).filter(FindingModel.challenge_id == challenge_id).delete()
     db.delete(challenge)
     db.commit()
     return {"status": "DELETED", "id": challenge_id}

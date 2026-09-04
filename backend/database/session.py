@@ -1,14 +1,16 @@
+import os
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from backend.config import settings
 from backend.database.models import Base
 
 # Database engine initialization (Supports SQLite out-of-the-box and PostgreSQL)
+db_url = os.getenv("DATABASE_URL", settings.DATABASE_URL)
 engine_kwargs = {}
-if settings.DATABASE_URL.startswith("sqlite"):
+if db_url.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 
-engine = create_engine(settings.DATABASE_URL, **engine_kwargs)
+engine = create_engine(db_url, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
