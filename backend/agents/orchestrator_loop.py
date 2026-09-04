@@ -32,6 +32,14 @@ class AutonomousOrchestrator:
         os_distro = env_info.get("distro") or env_info.get("os", "Linux (Parrot OS)")
         installed_tools = [name for name, meta in env_info.get("installed_tools", {}).items() if meta.get("installed")]
         tools_str = ", ".join(installed_tools) if installed_tools else "nmap, ffuf, curl, python3, gdb, strings, objdump"
+        
+        # Audit importable Python libraries for solver scripts
+        installed_py_libs = [lib for lib, active in env_info.get("installed_python_libs", {}).items() if active]
+        py_libs_str = ", ".join(installed_py_libs) if installed_py_libs else "requests, beautifulsoup4, flask-unsign, cryptography"
+        
+        for req_lib in ["requests", "bs4", "flask_unsign", "cryptography"]:
+            if not env_info.get("installed_python_libs", {}).get(req_lib, True):
+                logger.warning(f"[SOLVER LIB WARNING] Advertised library '{req_lib}' is NOT importable in host Python runtime ({sys.executable}).")
 
         history_summary = []
         normalized_history = []
@@ -63,8 +71,14 @@ class AutonomousOrchestrator:
                     logger.info(f"Run {run_id} terminated or paused externally.")
                     return
 
-                # Calculate progress based on turns
-                progress = min(95, int((turn / max_turns) * 100))
+                # Calculate realistic progress based on investigation state milestones
+                if challenge.flagStatus == "CAPTURED":
+                    progress = 100
+                elif state_memory["discovered_endpoints"] or state_memory["observed_cookies"]:
+                    progress = min(85, 30 + (turn * 4))
+                else:
+                    progress = min(40, 10 + (turn * 3))
+
                 challenge.progress = max(challenge.progress, progress)
                 run.current_phase = "recon" if turn <= 3 else ("web" if turn <= 10 else "exploitation")
                 run.current_agent = "orchestrator"
@@ -93,10 +107,10 @@ class AutonomousOrchestrator:
                     f"Target Scope: {target}\n"
                     f"Challenge Name: {challenge.name} | Category: {challenge.category} | Difficulty: {challenge.difficulty} | Platform: {challenge.platform_name}\n"
                     f"Working Directory: {challenge.working_directory}\n"
-                    f"Installed Pentest Tools & Python Libraries: {tools_str}, python3, requests, pwntools, flask-unsign, beautifulsoup4, cryptography\n\n"
+                    f"Installed Pentest Tools & Python Libraries: {tools_str}, python3, {py_libs_str}\n\n"
                     f"ACTION SELECTION MODES:\n"
                     f"Mode A (CLI Command): Output a SINGLE executable bash/shell command line.\n"
-                    f"Mode B (Python Solver Script): Output a complete Python script inside ```python ... ``` blocks. FORGE will save it to `solve.py` and run `python3 solve.py` automatically.\n\n"
+                    f"Mode B (Python Solver Script): Output a complete Python script inside ```python ... ``` blocks. FORGE will save it to `solve.py` and run `{sys.executable} solve.py` automatically.\n\n"
                     f"STRICT RULES:\n"
                     f"1. Output ONLY the bash command line OR the ```python ... ``` solver script block. No surrounding conversation or Markdown headers.\n"
                     f"2. If you discover the real flag (e.g. picoCTF{{...}}, FLAG{{...}}, HTB{{...}}), reply EXACTLY: FLAG: <captured_flag>\n"
@@ -186,11 +200,11 @@ class AutonomousOrchestrator:
                     try:
                         with open(solve_file_path, "w", encoding="utf-8") as sf:
                             sf.write(script_code)
-                        cmd_line = "python3 solve.py"
-                        logger.info(f"Synthesized Python solver script `solve.py` for turn #{turn}")
+                        cmd_line = f'"{sys.executable}" solve.py'
+                        logger.info(f"Synthesized Python solver script `solve.py` for turn #{turn} (interpreter: {sys.executable})")
                     except Exception as sf_err:
                         logger.error(f"Failed to save solve.py: {sf_err}")
-                        cmd_line = "python3 -c " + json.dumps(script_code)
+                        cmd_line = f'"{sys.executable}" -c ' + json.dumps(script_code)
                 else:
                     cmd_line = raw_ai_output.split("\n")[0].strip()
                     cmd_line = re.sub(r"^```(?:bash|sh)?", "", cmd_line).strip()

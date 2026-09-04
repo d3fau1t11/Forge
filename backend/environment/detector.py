@@ -42,6 +42,14 @@ class EnvironmentDetector:
         cpu_count = psutil.cpu_count(logical=True) if psutil else 1
         ram_gb = round(psutil.virtual_memory().total / (1024 ** 3), 2) if psutil else 0.0
 
+        # Check importable Python solver libraries
+        python_libs = ["requests", "bs4", "flask_unsign", "pwn", "cryptography"]
+        installed_libs = {}
+        import importlib.util
+        for lib in python_libs:
+            spec = importlib.util.find_spec(lib)
+            installed_libs[lib] = spec is not None
+
         return {
             "os": system_os,
             "distro": distro_name,
@@ -50,6 +58,7 @@ class EnvironmentDetector:
             "cpu_cores": cpu_count,
             "ram_gb": ram_gb,
             "installed_tools": installed_tools,
+            "installed_python_libs": installed_libs,
             "is_parrot_os": "parrot" in distro_name.lower(),
             "is_kali_linux": "kali" in distro_name.lower()
         }

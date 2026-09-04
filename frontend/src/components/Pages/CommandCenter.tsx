@@ -40,15 +40,32 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
 
   useEffect(() => {
     let interval: any = null;
+
+    const calcElapsed = () => {
+      if (!activeChallenge) {
+        setElapsedSeconds(0);
+        return;
+      }
+      const createdStr = activeChallenge.createdAt || (activeChallenge as any).created_at;
+      if (createdStr) {
+        const createdMs = new Date(createdStr).getTime();
+        const nowMs = Date.now();
+        if (!isNaN(createdMs)) {
+          setElapsedSeconds(Math.max(0, Math.floor((nowMs - createdMs) / 1000)));
+          return;
+        }
+      }
+      setElapsedSeconds((prev) => prev + 1);
+    };
+
+    calcElapsed();
     if (activeChallenge && activeChallenge.status === 'RUNNING' && !killSwitchActive) {
-      interval = setInterval(() => {
-        setElapsedSeconds((prev) => prev + 1);
-      }, 1000);
+      interval = setInterval(calcElapsed, 1000);
     }
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [activeChallenge?.status, killSwitchActive]);
+  }, [activeChallenge?.id, activeChallenge?.status, (activeChallenge as any)?.createdAt, (activeChallenge as any)?.created_at, killSwitchActive]);
 
   const formatDuration = (totalSeconds: number): string => {
     const hrs = Math.floor(totalSeconds / 3600);

@@ -33,6 +33,8 @@ export interface Challenge {
   description?: string;
   workingDirectory?: string;
   platformName?: string;
+  createdAt?: string;
+  created_at?: string;
 }
 
 export interface Target {

@@ -188,6 +188,15 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
 
 @router.delete("/challenges")
 def delete_all_challenges(db: Session = Depends(get_db)):
+    challenges = db.query(ChallengeModel).all()
+    for ch in challenges:
+        if ch.working_directory and os.path.exists(ch.working_directory):
+            try:
+                import shutil
+                shutil.rmtree(ch.working_directory, ignore_errors=True)
+            except Exception as e:
+                logger.warning(f"Failed to delete directory {ch.working_directory}: {e}")
+
     db.query(TargetProfileModel).delete()
     db.query(RunModel).delete()
     db.query(EvidenceModel).delete()
@@ -201,6 +210,14 @@ def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
     challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
+
+    if challenge.working_directory and os.path.exists(challenge.working_directory):
+        try:
+            import shutil
+            shutil.rmtree(challenge.working_directory, ignore_errors=True)
+        except Exception as e:
+            logger.warning(f"Failed to delete working directory {challenge.working_directory}: {e}")
+
     db.query(TargetProfileModel).filter(TargetProfileModel.challenge_id == challenge_id).delete()
     db.query(RunModel).filter(RunModel.challenge_id == challenge_id).delete()
     db.query(EvidenceModel).filter(EvidenceModel.challenge_id == challenge_id).delete()
