@@ -30,7 +30,11 @@ class ModelRouter:
         "gpt-5.6": ("agentrouter_codex", "codex"),
         "gpt-5.6-sol": ("agentrouter_codex", "codex"),
         "glm-5.3": ("agentrouter_codex", "codex"),
-        "deepseek-v4-flash": ("agentrouter_codex", "codex")
+        "deepseek-v4-flash": ("agentrouter_codex", "codex"),
+        "deepseek-v4-pro": ("nvidia", "deepseek-ai/deepseek-v4-pro-0813"),
+        "nemotron-lightning": ("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b"),
+        "nemotron-ultra": ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
+        "kimi-k3": ("nvidia", "moonshotai/kimi-k3")
     }
 
     def __init__(self):
@@ -52,7 +56,7 @@ class ModelRouter:
                 name="nvidia",
                 is_paid=True,
                 api_key=settings.NVIDIA_API_KEY,
-                default_model="deepseek-ai/deepseek-v3",
+                default_model="deepseek-ai/deepseek-v4-pro-0813",
                 base_url="https://integrate.api.nvidia.com/v1"
             ))
         if settings.CEREBRAS_API_KEY:
