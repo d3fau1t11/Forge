@@ -34,7 +34,16 @@ class AutonomousOrchestrator:
         tools_str = ", ".join(installed_tools) if installed_tools else "nmap, ffuf, curl, python3, gdb, strings, objdump"
 
         history_summary = []
+        normalized_history = []
         max_turns = 20
+        
+        # Structured State Memory Object
+        state_memory = {
+            "discovered_endpoints": set(),
+            "observed_cookies": set(),
+            "headers_found": set(),
+            "repetition_warnings": 0
+        }
 
         for turn in range(1, max_turns + 1):
             if workflow_runner.is_cancelled(run_id):
@@ -69,32 +78,55 @@ class AutonomousOrchestrator:
                     "progress": challenge.progress
                 })
 
-                # Construct transparent ReAct System Prompt with OS Context
+                # Format Structured State Memory for Prompt Injection
+                memory_json = json.dumps({
+                    "discovered_endpoints": list(state_memory["discovered_endpoints"])[:10],
+                    "observed_cookies": list(state_memory["observed_cookies"])[:5],
+                    "headers_found": list(state_memory["headers_found"])[:5],
+                    "loop_warning": state_memory["repetition_warnings"] > 0
+                }, indent=2)
+
+                # Construct transparent ReAct System Prompt with Python Execution Mode & OS Context
                 system_instruction = (
                     f"You are FORGE Autonomous CTF Pentest Agent running on {os_distro}.\n"
-                    f"SYSTEM DIRECTIVE: NEVER use demo or mock data in the system. Rely exclusively on live target scope and real execution outputs.\n"
+                    f"SYSTEM DIRECTIVE: Rely exclusively on live target scope and real execution outputs. Zero fake flags allowed.\n"
                     f"Target Scope: {target}\n"
                     f"Challenge Name: {challenge.name} | Category: {challenge.category} | Difficulty: {challenge.difficulty} | Platform: {challenge.platform_name}\n"
                     f"Working Directory: {challenge.working_directory}\n"
-                    f"Installed Pentest Tools: {tools_str}\n\n"
+                    f"Installed Pentest Tools & Python Libraries: {tools_str}, python3, requests, pwntools, flask-unsign, beautifulsoup4, cryptography\n\n"
+                    f"ACTION SELECTION MODES:\n"
+                    f"Mode A (CLI Command): Output a SINGLE executable bash/shell command line.\n"
+                    f"Mode B (Python Solver Script): Output a complete Python script inside ```python ... ``` blocks. FORGE will save it to `solve.py` and run `python3 solve.py` automatically.\n\n"
                     f"STRICT RULES:\n"
-                    f"1. You must issue EXACTLY ONE executable bash/shell command per step to run inside the working directory.\n"
-                    f"2. Output ONLY the raw command line (no markdown formatting, no code blocks, no explanations).\n"
-                    f"3. Prefer fast, non-blocking commands suited for CTF speed.\n"
-                    f"4. If you discover the flag (e.g. picoCTF{{...}}, FLAG{{...}}, HTB{{...}}), reply EXACTLY: FLAG: <captured_flag>\n"
-                    f"5. If mission is complete without flag, reply: DONE\n"
-                    f"6. Multi-target inputs (IPs, URLs, local files) are joined using '+' sign. Process targets accordingly."
+                    f"1. Output ONLY the bash command line OR the ```python ... ``` solver script block. No surrounding conversation or Markdown headers.\n"
+                    f"2. If you discover the real flag (e.g. picoCTF{{...}}, FLAG{{...}}, HTB{{...}}), reply EXACTLY: FLAG: <captured_flag>\n"
+                    f"3. If mission is complete without flag, reply: DONE\n"
+                    f"4. Multi-target inputs are joined using '+' sign. Process targets accordingly."
                 )
 
                 history_context = "\n".join(history_summary[-6:]) if history_summary else "No commands executed yet."
+                
+                # Check for Strategic Repetition Override
+                repetition_warning_prompt = ""
+                if state_memory["repetition_warnings"] > 0:
+                    repetition_warning_prompt = (
+                        "\n⚠️ STRATEGIC OVERRIDE ALERT: Your recent actions are repeating similar commands on the target without progress.\n"
+                        "YOU MUST PIVOT METHODOLOGY IMMEDIATELY!\n"
+                        "- Do NOT repeat curl requests with similar cookies or endpoints.\n"
+                        "- Use Mode B to write a Python script using requests.Session(), flask-unsign, pwntools, or bs4.\n"
+                        "- Inspect HTML comments, script tags, or unusual HTTP response headers.\n"
+                    )
+
                 prompt = (
-                    f"--- RECENT STEP HISTORY ---\n{history_context}\n\n"
+                    f"--- STRUCTURED TARGET MEMORY STATE ---\n{memory_json}\n\n"
+                    f"--- RECENT STEP HISTORY ---\n{history_context}\n"
+                    f"{repetition_warning_prompt}\n"
                     f"--- CURRENT TURN #{turn} ---\n"
-                    f"Analyze the history and issue the NEXT single command to execute on target scope '{target}'."
+                    f"Analyze the target memory and step history. Issue the NEXT single command OR Python solver script to execute on '{target}'."
                 )
 
                 # Query AI Router
-                capability = "general_reasoning" if turn == 1 else "web_testing"
+                capability = "code_analysis" if state_memory["repetition_warnings"] > 0 else ("general_reasoning" if turn == 1 else "web_testing")
                 llm_response = await model_router.route_request(
                     prompt=prompt,
                     capability=capability,
@@ -124,7 +156,7 @@ class AutonomousOrchestrator:
                     "goal": f"Turn #{turn} Action Selection ({os_distro})",
                     "capability": capability,
                     "model": model_used,
-                    "result": raw_ai_output,
+                    "result": raw_ai_output[:300],
                     "confidence": 95
                 })
 
@@ -139,32 +171,53 @@ class AutonomousOrchestrator:
                     logger.info(f"AI declared mission completed on turn #{turn}.")
                     break
 
-                # Extract cleaned 1 command line from raw AI output
-                cmd_line = raw_ai_output.split("\n")[0].strip()
-                cmd_line = re.sub(r"^```(?:bash|sh)?", "", cmd_line).strip()
-                cmd_line = re.sub(r"```$", "", cmd_line).strip()
+                # Extract Python script block OR single CLI command line
+                cmd_line = ""
+                py_match = re.search(r"```python\s*(.*?)\s*```", raw_ai_output, re.DOTALL)
+                if not py_match:
+                    py_match = re.search(r"```(?:sh|bash)?\s*(import\s+.*|from\s+.*)\s*```", raw_ai_output, re.DOTALL)
+
+                if py_match or raw_ai_output.startswith("import ") or raw_ai_output.startswith("from "):
+                    script_code = py_match.group(1) if py_match else raw_ai_output
+                    solve_file_path = os.path.join(challenge.working_directory, "solve.py")
+                    try:
+                        with open(solve_file_path, "w", encoding="utf-8") as sf:
+                            sf.write(script_code)
+                        cmd_line = "python3 solve.py"
+                        logger.info(f"Synthesized Python solver script `solve.py` for turn #{turn}")
+                    except Exception as sf_err:
+                        logger.error(f"Failed to save solve.py: {sf_err}")
+                        cmd_line = "python3 -c " + json.dumps(script_code)
+                else:
+                    cmd_line = raw_ai_output.split("\n")[0].strip()
+                    cmd_line = re.sub(r"^```(?:bash|sh)?", "", cmd_line).strip()
+                    cmd_line = re.sub(r"```$", "", cmd_line).strip()
 
                 # Sanitize nmap target if AI passes http:// or port
                 if cmd_line.startswith("nmap"):
                     clean_host = target.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
                     cmd_line = re.sub(r"https?://[^\s]+", clean_host, cmd_line)
 
-                # Anti-repetition loop breaker: prevent issuing identical command as previous turn
-                if history_summary and len(history_summary) >= 1:
-                    if f"Command: `{cmd_line}`" in history_summary[-1]:
-                        logger.warning(f"Detected repeated command `{cmd_line}`. Forcing alternative exploration.")
-                        if "login" in cmd_line:
-                            cmd_line = f"curl -i -s -c cookies.txt {target.rstrip('/')}/register"
-                        elif "nmap" in cmd_line:
-                            clean_host = target.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
-                            cmd_line = f"nmap -sV -F {clean_host}"
-                        else:
-                            cmd_line = f"curl -i -L {target}"
+                # Normalized Anti-Repetition Loop Guard
+                norm_cmd = self._normalize_command(cmd_line)
+                if normalized_history and normalized_history.count(norm_cmd) >= 1:
+                    state_memory["repetition_warnings"] += 1
+                    logger.warning(f"Normalized loop detected for `{norm_cmd}` (Count={normalized_history.count(norm_cmd)}). Forcing pivot.")
+                    if "login" in cmd_line:
+                        cmd_line = f"curl -i -s -c cookies.txt {target.rstrip('/')}/register"
+                    elif "nmap" in cmd_line:
+                        clean_host = target.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+                        cmd_line = f"nmap -sV -F {clean_host}"
+                    else:
+                        cmd_line = f"curl -i -L {target}"
+                    norm_cmd = self._normalize_command(cmd_line)
+                
+                normalized_history.append(norm_cmd)
 
                 if not cmd_line:
                     cmd_line = f"curl -s -L {target}" if target.startswith("http") else f"nmap -F {target}"
 
-                # Execute 1 Command inside working directory
+                # Execute Command inside working directory
                 tool_res = await tool_manager.execute_raw_command(
                     command=cmd_line,
                     cwd=challenge.working_directory,
@@ -175,6 +228,9 @@ class AutonomousOrchestrator:
                 stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
                 log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Execution finished with no output."
 
+                # Update Structured State Memory from Command Output
+                self._update_state_memory(state_memory, stdout_text)
+
                 # Append Full AI Conversation & Telemetry to Dedicated Challenge Log File
                 logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
                 ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
@@ -184,7 +240,7 @@ class AutonomousOrchestrator:
                         f.write(f"  --- SYSTEM INSTRUCTION SENT TO AI ---\n{system_instruction}\n\n")
                         f.write(f"  --- PROMPT / RECENT HISTORY SENT TO AI ---\n{prompt}\n\n")
                         f.write(f"  --- RAW AI RESPONSE RECEIVED ---\n{raw_ai_output}\n\n")
-                        f.write(f"  --- EXECUTED BASH COMMAND ---\n{cmd_line}\n\n")
+                        f.write(f"  --- EXECUTED COMMAND ---\n{cmd_line}\n\n")
                         f.write(f"  --- STDOUT / STDERR OUTPUT (Exit Code {tool_res.exit_code}) ---\n{log_output}\n")
                         f.write(f"================================================================================\n\n")
                 except Exception as log_err:
@@ -321,11 +377,6 @@ class AutonomousOrchestrator:
 
         if run.current_phase == "recon":
             run.current_phase = "web"
-            run.current_agent = "web"
-        elif run.current_phase == "web":
-            run.current_phase = "completed"
-            run.status = "COMPLETED"
-
         db.commit()
         return {
             "status": run.status,
@@ -334,4 +385,35 @@ class AutonomousOrchestrator:
             "tool_status": "SUCCESS"
         }
 
+    def _normalize_command(self, command: str) -> str:
+        """Normalize command string by removing dynamic cookies, timestamps, and redundant whitespace."""
+        cmd = command.strip()
+        cmd = re.sub(r"session=[a-zA-Z0-9_\-\.%]+", "session=COOKIESUB", cmd)
+        cmd = re.sub(r"Cookie:\s*['\"][^'\"]+['\"]", "Cookie: COOKIESUB", cmd, flags=re.IGNORECASE)
+        cmd = re.sub(r"\?t=\d+", "?t=TIMESTAMP", cmd)
+        cmd = re.sub(r"\s+", " ", cmd)
+        return cmd.lower()
+
+    def _update_state_memory(self, state_memory: Dict[str, Any], output_text: str):
+        """Parse command stdout to update structured target state memory."""
+        if not output_text:
+            return
+        
+        # Extract Discovered URLs / Endpoints
+        urls = re.findall(r"https?://[^\s\"'>]+", output_text)
+        for u in urls:
+            if len(u) < 120:
+                state_memory["discovered_endpoints"].add(u)
+        
+        # Extract Cookies
+        cookies = re.findall(r"Set-Cookie:\s*([^;\r\n]+)", output_text, re.IGNORECASE)
+        for c in cookies:
+            state_memory["observed_cookies"].add(c.strip())
+
+        # Extract Server / Tech Headers
+        headers = re.findall(r"(?:Server|X-Powered-By|X-Framework):\s*([^\r\n]+)", output_text, re.IGNORECASE)
+        for h in headers:
+            state_memory["headers_found"].add(h.strip())
+
 orchestrator_loop = AutonomousOrchestrator()
+
