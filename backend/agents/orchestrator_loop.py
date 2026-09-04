@@ -173,11 +173,14 @@ class AutonomousOrchestrator:
 
                 # Extract Python script block OR single CLI command line
                 cmd_line = ""
+                is_python_script = False
+                script_code = ""
                 py_match = re.search(r"```python\s*(.*?)\s*```", raw_ai_output, re.DOTALL)
                 if not py_match:
                     py_match = re.search(r"```(?:sh|bash)?\s*(import\s+.*|from\s+.*)\s*```", raw_ai_output, re.DOTALL)
 
                 if py_match or raw_ai_output.startswith("import ") or raw_ai_output.startswith("from "):
+                    is_python_script = True
                     script_code = py_match.group(1) if py_match else raw_ai_output
                     solve_file_path = os.path.join(challenge.working_directory, "solve.py")
                     try:
@@ -199,10 +202,15 @@ class AutonomousOrchestrator:
                     cmd_line = re.sub(r"https?://[^\s]+", clean_host, cmd_line)
 
                 # Normalized Anti-Repetition Loop Guard
-                norm_cmd = self._normalize_command(cmd_line)
+                if is_python_script and script_code:
+                    import hashlib
+                    norm_cmd = "python_script:" + hashlib.md5(script_code.strip().encode("utf-8")).hexdigest()
+                else:
+                    norm_cmd = self._normalize_command(cmd_line)
+
                 if normalized_history and normalized_history.count(norm_cmd) >= 1:
                     state_memory["repetition_warnings"] += 1
-                    logger.warning(f"Normalized loop detected for `{norm_cmd}` (Count={normalized_history.count(norm_cmd)}). Forcing pivot.")
+                    logger.warning(f"Normalized loop detected for `{norm_cmd[:30]}` (Count={normalized_history.count(norm_cmd)}). Forcing pivot.")
                     if "login" in cmd_line:
                         cmd_line = f"curl -i -s -c cookies.txt {target.rstrip('/')}/register"
                     elif "nmap" in cmd_line:
