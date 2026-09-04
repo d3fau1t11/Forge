@@ -144,6 +144,23 @@ class AutonomousOrchestrator:
                 cmd_line = re.sub(r"^```(?:bash|sh)?", "", cmd_line).strip()
                 cmd_line = re.sub(r"```$", "", cmd_line).strip()
 
+                # Sanitize nmap target if AI passes http:// or port
+                if cmd_line.startswith("nmap"):
+                    clean_host = target.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+                    cmd_line = re.sub(r"https?://[^\s]+", clean_host, cmd_line)
+
+                # Anti-repetition loop breaker: prevent issuing identical command as previous turn
+                if history_summary and len(history_summary) >= 1:
+                    if f"Command: `{cmd_line}`" in history_summary[-1]:
+                        logger.warning(f"Detected repeated command `{cmd_line}`. Forcing alternative exploration.")
+                        if "login" in cmd_line:
+                            cmd_line = f"curl -i -s -c cookies.txt {target.rstrip('/')}/register"
+                        elif "nmap" in cmd_line:
+                            clean_host = target.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+                            cmd_line = f"nmap -sV -F {clean_host}"
+                        else:
+                            cmd_line = f"curl -i -L {target}"
+
                 if not cmd_line:
                     cmd_line = f"curl -s -L {target}" if target.startswith("http") else f"nmap -F {target}"
 
@@ -157,6 +174,20 @@ class AutonomousOrchestrator:
                 stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
                 stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
                 log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Execution finished with no output."
+
+                # Append Turn Telemetry to Dedicated Challenge Log File
+                logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
+                ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
+                try:
+                    with open(ch_log_path, "a", encoding="utf-8") as f:
+                        f.write(f"[{datetime.utcnow().strftime('%H:%M:%S')}] TURN #{turn} ({model_used})\n")
+                        f.write(f"  AI RAW RESPONSE: {raw_ai_output}\n")
+                        f.write(f"  EXECUTED CMD: {cmd_line}\n")
+                        f.write(f"  EXIT CODE: {tool_res.exit_code}\n")
+                        f.write(f"  OUTPUT:\n{log_output}\n")
+                        f.write(f"--------------------------------------------------\n\n")
+                except Exception as log_err:
+                    logger.warning(f"Failed to append to challenge log file: {log_err}")
 
                 # Broadcast terminal log to frontend
                 await ws_manager.broadcast({

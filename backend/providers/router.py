@@ -13,14 +13,14 @@ class ModelRouter:
     """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
 
     DEFAULT_ROUTING_MAP = {
-        "recon": ["cloudflare", "openrouter", "cerebras", "gemini", "mock"],
-        "directory_enumeration": ["cloudflare", "openrouter", "cerebras", "gemini", "mock"],
-        "web_analysis": ["cloudflare", "openrouter", "gemini", "nvidia", "mock"],
-        "code_analysis": ["agentrouter_claude_code", "agentrouter_codex", "openrouter", "nvidia", "mock"],
-        "reverse_engineering": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "mock"],
-        "fast_reasoning": ["cloudflare", "openrouter", "cerebras", "mock"],
-        "general_reasoning": ["cloudflare", "openrouter", "gemini", "nvidia", "mock"],
-        "verification": ["cloudflare", "openrouter", "nvidia", "gemini", "mock"]
+        "recon": ["gemini", "openrouter", "cloudflare", "mock"],
+        "directory_enumeration": ["gemini", "openrouter", "cloudflare", "mock"],
+        "web_analysis": ["gemini", "openrouter", "cloudflare", "mock"],
+        "code_analysis": ["gemini", "openrouter", "cloudflare", "agentrouter_claude_code", "mock"],
+        "reverse_engineering": ["gemini", "openrouter", "cloudflare", "agentrouter_claude_code", "mock"],
+        "fast_reasoning": ["gemini", "openrouter", "cloudflare", "mock"],
+        "general_reasoning": ["gemini", "openrouter", "cloudflare", "mock"],
+        "verification": ["gemini", "openrouter", "cloudflare", "mock"]
     }
 
     # Model to Provider/CLI Transport Mapping
