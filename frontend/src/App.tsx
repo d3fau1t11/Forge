@@ -153,7 +153,7 @@ export default function App() {
   const fetchBackendData = async () => {
     try {
       const backendChallenges = await apiService.getChallenges();
-      if (Array.isArray(backendChallenges) && backendChallenges.length > 0) {
+      if (Array.isArray(backendChallenges)) {
         const formatted: Challenge[] = backendChallenges.map((c: any) => ({
           id: c.id,
           name: c.name,
@@ -173,7 +173,7 @@ export default function App() {
       }
 
       const backendTargets = await apiService.getTargets();
-      if (Array.isArray(backendTargets) && backendTargets.length > 0) {
+      if (Array.isArray(backendTargets)) {
         const formattedT: Target[] = backendTargets.map((t: any) => ({
           id: t.id,
           currentIp: t.current_address,
@@ -190,8 +190,18 @@ export default function App() {
         }));
         setTargets(formattedT);
       }
+
+      const backendEvidence = await apiService.getEvidence();
+      if (Array.isArray(backendEvidence)) {
+        setEvidenceList(backendEvidence);
+      }
+
+      const backendFindings = await apiService.getFindings();
+      if (Array.isArray(backendFindings)) {
+        setFindings(backendFindings);
+      }
     } catch (e) {
-      console.log('Backend sync: using initial state');
+      console.log('Backend sync active.');
     }
   };
 

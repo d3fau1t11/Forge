@@ -286,6 +286,46 @@ export class ApiService {
     return await res.json();
   }
 
+  // ----------------------------------------------------
+  // DIRECTORY BROWSER & FOLDER PICKER
+  // ----------------------------------------------------
+
+  public async browseDirectory(path?: string) {
+    try {
+      const url = path ? `${API_BASE_URL}/system/browse-dir?path=${encodeURIComponent(path)}` : `${API_BASE_URL}/system/browse-dir`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return {
+        current_path: path || '',
+        parent_path: '',
+        drives: [],
+        directories: []
+      };
+    }
+  }
+
+  public async createDirectory(parent_path: string, dir_name: string) {
+    const res = await fetch(`${API_BASE_URL}/system/create-dir`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parent_path, dir_name })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async selectFolderDialog() {
+    try {
+      const res = await fetch(`${API_BASE_URL}/system/select-folder-dialog`, { method: 'POST' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return { status: 'FAILED', selected_path: '' };
+    }
+  }
+
   public async getSystemRequirements() {
     const urlsToTry = [
       '/api/system/requirements',

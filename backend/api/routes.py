@@ -527,4 +527,87 @@ async def kill_switch(run_id: Optional[str] = None):
         "event": "KILL_SWITCH_ACTIVATED",
         "run_id": run_id
     })
-    return {"status": "HALTED", "message": "Emergency Kill Switch triggered successfully."}
+    return {"status": "KILL_SWITCH_ACTIVATED", "run_id": run_id}
+
+# ----------------------------------------------------
+# DIRECTORY BROWSER & CREATOR API
+# ----------------------------------------------------
+
+class CreateDirRequest(BaseModel):
+    parent_path: str
+    dir_name: str
+
+@router.get("/system/browse-dir")
+def browse_directory(path: Optional[str] = None):
+    if not path or not path.strip():
+        current_path = os.getcwd()
+    else:
+        current_path = os.path.abspath(path.strip())
+    
+    if not os.path.exists(current_path):
+        current_path = os.getcwd()
+
+    parent_path = os.path.dirname(current_path)
+    
+    drives = []
+    if os.name == 'nt':
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.exists(drive):
+                drives.append(drive)
+    else:
+        drives = ["/"]
+
+    directories = []
+    try:
+        with os.scandir(current_path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False) and not entry.name.startswith('.'):
+                        directories.append(entry.name)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+    directories.sort()
+
+    return {
+        "current_path": current_path,
+        "parent_path": parent_path,
+        "drives": drives,
+        "directories": directories
+    }
+
+@router.post("/system/create-dir")
+def create_directory(req: CreateDirRequest):
+    target_path = os.path.abspath(os.path.join(req.parent_path, req.dir_name.strip()))
+    try:
+        os.makedirs(target_path, exist_ok=True)
+        return {"status": "SUCCESS", "created_path": target_path}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to create directory: {str(e)}")
+
+@router.post("/system/select-folder-dialog")
+async def open_native_folder_dialog():
+    selected_path = ""
+    def _open_tkinter():
+        nonlocal selected_path
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            selected = filedialog.askdirectory(title="FORGE CTF — Select Challenge Working Directory")
+            root.destroy()
+            if selected:
+                selected_path = os.path.abspath(selected)
+        except Exception:
+            pass
+
+    await asyncio.to_thread(_open_tkinter)
+    if selected_path:
+        return {"status": "SUCCESS", "selected_path": selected_path}
+    return {"status": "CANCELLED", "selected_path": ""}

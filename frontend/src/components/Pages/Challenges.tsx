@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { Challenge } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
+import { DirectoryBrowserModal } from './DirectoryBrowserModal';
 
 interface ChallengesProps {
   challenges: Challenge[];
@@ -28,6 +29,7 @@ export const Challenges: React.FC<ChallengesProps> = ({
   onToggleStatus
 }) => {
   const [showModal, setShowModal] = useState(false);
+  const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('ALL');
 
@@ -234,136 +236,153 @@ export const Challenges: React.FC<ChallengesProps> = ({
       {/* New Challenge Modal Overlay */}
       {showModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-fadeIn">
-          <div className="w-full max-w-lg bg-obsidian-950 border-2 border-cyber-cyan/60 rounded-xl p-6 space-y-5 shadow-[0_0_60px_rgba(0,240,255,0.3)] cyber-corner">
-            <h2 className="text-lg font-display font-bold tracking-wider text-slate-100 border-b border-slate-800 pb-3 flex items-center space-x-2 neon-text-cyan">
-              <Shield className="w-5 h-5 text-cyber-cyan" />
-              <span>INITIALIZE NEW CTF OPERATION</span>
-            </h2>
+          <div className="w-full max-w-xl max-h-[90vh] flex flex-col bg-obsidian-950 border-2 border-cyber-cyan/60 rounded-xl shadow-[0_0_60px_rgba(0,240,255,0.3)] cyber-corner overflow-hidden my-auto">
+            {/* Modal Header */}
+            <div className="p-5 border-b border-slate-800 flex items-center justify-between shrink-0 bg-obsidian-950">
+              <h2 className="text-base font-display font-bold tracking-wider text-slate-100 flex items-center space-x-2 neon-text-cyan">
+                <Shield className="w-5 h-5 text-cyber-cyan" />
+                <span>INITIALIZE NEW CTF OPERATION</span>
+              </h2>
+            </div>
 
-            <form onSubmit={handleSubmit} className="space-y-4 text-xs">
-              <div>
-                <label className="block text-slate-400 uppercase mb-1 font-bold">Challenge Name</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. HYDRA_AUTHENTICATION_BYPASS"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
-                  <span>Platform / Competition Name</span>
-                  <span className="text-[10px] text-cyber-cyan lowercase font-normal">(optional - e.g. HackTheBox, PicoCTF)</span>
-                </label>
-                <input
-                  type="text"
-                  list="platform-suggestions"
-                  placeholder="e.g. HackTheBox, TryHackMe, PicoCTF 2026, DEF CON"
-                  value={platformName}
-                  onChange={(e) => setPlatformName(e.target.value)}
-                  className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                />
-                <datalist id="platform-suggestions">
-                  <option value="HackTheBox" />
-                  <option value="TryHackMe" />
-                  <option value="PicoCTF 2026" />
-                  <option value="DEF CON CTF" />
-                  <option value="CyberSpace CTF" />
-                  <option value="Custom CTF Platform" />
-                </datalist>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
+            {/* Scrollable Form Body */}
+            <form onSubmit={handleSubmit} className="flex flex-col flex-1 min-h-0 overflow-hidden">
+              <div className="p-5 space-y-4 text-xs overflow-y-auto flex-1 custom-scrollbar">
                 <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold">Category (Typeable)</label>
+                  <label className="block text-slate-400 uppercase mb-1 font-bold">Challenge Name</label>
                   <input
                     type="text"
-                    list="category-suggestions"
-                    value={category}
-                    onChange={(e) => setCategory(e.target.value)}
-                    placeholder="e.g. WEB, PWN, OSINT, CLOUD..."
-                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono uppercase"
+                    required
+                    placeholder="e.g. HYDRA_AUTHENTICATION_BYPASS"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
                   />
-                  <datalist id="category-suggestions">
-                    <option value="WEB" />
-                    <option value="PWN" />
-                    <option value="REV" />
-                    <option value="CRYPTO" />
-                    <option value="FORENSICS" />
-                    <option value="RECON" />
-                    <option value="OSINT" />
-                    <option value="MISC" />
-                    <option value="CLOUD" />
-                    <option value="BLOCKCHAIN" />
+                </div>
+
+                <div>
+                  <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
+                    <span>Platform / Competition Name</span>
+                    <span className="text-[10px] text-cyber-cyan lowercase font-normal">(optional - e.g. HackTheBox, PicoCTF)</span>
+                  </label>
+                  <input
+                    type="text"
+                    list="platform-suggestions"
+                    placeholder="e.g. HackTheBox, TryHackMe, PicoCTF 2026, DEF CON"
+                    value={platformName}
+                    onChange={(e) => setPlatformName(e.target.value)}
+                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
+                  />
+                  <datalist id="platform-suggestions">
+                    <option value="HackTheBox" />
+                    <option value="TryHackMe" />
+                    <option value="PicoCTF 2026" />
+                    <option value="DEF CON CTF" />
+                    <option value="CyberSpace CTF" />
+                    <option value="Custom CTF Platform" />
                   </datalist>
                 </div>
 
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-slate-400 uppercase mb-1 font-bold">Category (Typeable)</label>
+                    <input
+                      type="text"
+                      list="category-suggestions"
+                      value={category}
+                      onChange={(e) => setCategory(e.target.value)}
+                      placeholder="e.g. WEB, PWN, OSINT, CLOUD..."
+                      className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono uppercase"
+                    />
+                    <datalist id="category-suggestions">
+                      <option value="WEB" />
+                      <option value="PWN" />
+                      <option value="REV" />
+                      <option value="CRYPTO" />
+                      <option value="FORENSICS" />
+                      <option value="RECON" />
+                      <option value="OSINT" />
+                      <option value="MISC" />
+                      <option value="CLOUD" />
+                      <option value="BLOCKCHAIN" />
+                    </datalist>
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-400 uppercase mb-1 font-bold">Difficulty</label>
+                    <select
+                      value={difficulty}
+                      onChange={(e) => setDifficulty(e.target.value as any)}
+                      className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
+                    >
+                      <option value="EASY">EASY</option>
+                      <option value="MEDIUM">MEDIUM</option>
+                      <option value="HARD">HARD</option>
+                      <option value="INSANE">INSANE</option>
+                    </select>
+                  </div>
+                </div>
+
                 <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold">Difficulty</label>
-                  <select
-                    value={difficulty}
-                    onChange={(e) => setDifficulty(e.target.value as any)}
+                  <label className="block text-slate-400 uppercase mb-1 font-bold">Target IP / File Artifact Path</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. 10.10.14.23, target.ctf, or /tmp/challenge.pcap"
+                    value={target}
+                    onChange={(e) => setTarget(e.target.value)}
                     className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                  >
-                    <option value="EASY">EASY</option>
-                    <option value="MEDIUM">MEDIUM</option>
-                    <option value="HARD">HARD</option>
-                    <option value="INSANE">INSANE</option>
-                  </select>
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
+                    <span>Working Directory (Workspace Path)</span>
+                    <span className="text-[10px] text-cyber-cyan lowercase font-normal">(optional - auto-created if empty)</span>
+                  </label>
+                  <div className="flex items-center space-x-2">
+                    <input
+                      type="text"
+                      placeholder="e.g. ./workspaces/web_challenge or /home/kali/ctf/web1"
+                      value={workingDirectory}
+                      onChange={(e) => setWorkingDirectory(e.target.value)}
+                      className="flex-1 bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => { soundEngine.playClick(); setShowDirBrowser(true); }}
+                      className="px-3.5 py-2.5 rounded-lg bg-cyber-cyan/20 hover:bg-cyber-cyan/35 border border-cyber-cyan/60 text-cyber-cyan text-xs font-bold flex items-center space-x-1.5 shrink-0 transition-all shadow-[0_0_12px_rgba(0,240,255,0.2)]"
+                    >
+                      <Folder className="w-4 h-4" />
+                      <span>BROWSE FOLDER</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-slate-400 uppercase mb-1 font-bold">Description / Rules</label>
+                  <textarea
+                    rows={3}
+                    placeholder="Target details, scope boundaries, platform rules..."
+                    value={description}
+                    onChange={(e) => setDescription(e.target.value)}
+                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
+                  ></textarea>
                 </div>
               </div>
 
-              <div>
-                <label className="block text-slate-400 uppercase mb-1 font-bold">Target IP / File Artifact Path</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. 10.10.14.23, target.ctf, or /tmp/challenge.pcap"
-                  value={target}
-                  onChange={(e) => setTarget(e.target.value)}
-                  className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
-                  <span>Working Directory (Workspace Path)</span>
-                  <span className="text-[10px] text-cyber-cyan lowercase font-normal">(optional - auto-created if empty)</span>
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. ./workspaces/web_challenge or /home/kali/ctf/web1"
-                  value={workingDirectory}
-                  onChange={(e) => setWorkingDirectory(e.target.value)}
-                  className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-400 uppercase mb-1 font-bold">Description / Rules</label>
-                <textarea
-                  rows={3}
-                  placeholder="Target details, scope boundaries, platform rules..."
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                ></textarea>
-              </div>
-
-              <div className="pt-4 border-t border-slate-800 flex items-center justify-end space-x-3">
+              {/* Sticky Action Footer */}
+              <div className="p-4 bg-obsidian-950 border-t border-slate-800 flex items-center justify-end space-x-3 shrink-0">
                 <button
                   type="button"
                   onClick={() => setShowModal(false)}
-                  className="px-4 py-2 rounded-lg bg-obsidian-900 text-slate-400 hover:text-slate-200 text-xs font-bold"
+                  className="px-4 py-2 rounded-lg bg-obsidian-900 text-slate-400 hover:text-slate-200 text-xs font-bold transition-colors"
                 >
                   CANCEL
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs uppercase tracking-wider"
+                  className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs uppercase tracking-wider transition-all hover:scale-105 shadow-[0_0_15px_rgba(0,240,255,0.4)]"
                 >
                   INITIALIZE CHALLENGE
                 </button>
@@ -371,6 +390,15 @@ export const Challenges: React.FC<ChallengesProps> = ({
             </form>
           </div>
         </div>
+      )}
+
+      {/* Directory Browser Modal */}
+      {showDirBrowser && (
+        <DirectoryBrowserModal
+          initialPath={workingDirectory}
+          onSelect={(selectedPath) => setWorkingDirectory(selectedPath)}
+          onClose={() => setShowDirBrowser(false)}
+        />
       )}
     </div>
   );

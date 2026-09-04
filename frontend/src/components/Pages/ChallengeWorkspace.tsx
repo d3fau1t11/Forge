@@ -213,11 +213,15 @@ ${evidenceText}
               <div className="space-y-3">
                 <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
                   <span className="text-slate-500 block text-[10px] uppercase font-bold mb-1">Current Primary Objective:</span>
-                  <span className="text-cyber-cyan font-bold text-sm">Enumerating HTTP attack surface & verifying SQL injection payload</span>
+                  <span className="text-cyber-cyan font-bold text-sm">
+                    {decisions[0]?.goal || challenge.description || `Autonomous ${challenge.category} surface analysis & flag discovery`}
+                  </span>
                 </div>
                 <div className="bg-obsidian-950 p-3 rounded-lg border border-slate-800">
                   <span className="text-slate-500 block text-[10px] uppercase font-bold mb-1">Active AI Hypothesis:</span>
-                  <span className="text-slate-200 leading-relaxed">The /api/v1/auth parameter 'username' lacks input sanitization allowing query injection.</span>
+                  <span className="text-slate-200 leading-relaxed">
+                    {decisions[0]?.reason || findings[0]?.description || 'Target capability reasoning active. Formulating vulnerability hypothesis...'}
+                  </span>
                 </div>
               </div>
             </div>
@@ -270,17 +274,19 @@ ${evidenceText}
               <div className="p-3.5 rounded-lg bg-obsidian-950 border border-cyber-cyan/40">
                 <div className="flex justify-between font-bold text-cyber-cyan">
                   <span>ORCHESTRATOR</span>
-                  <span className="text-cyber-emerald">RUNNING</span>
+                  <span className="text-cyber-emerald">{challenge.status}</span>
                 </div>
                 <p className="text-[11px] text-slate-400 mt-1">Coordinating challenge workflow execution</p>
               </div>
 
               <div className="p-3.5 rounded-lg bg-obsidian-950 border border-cyber-cyan/40">
                 <div className="flex justify-between font-bold text-cyber-cyan">
-                  <span>WEB AGENT</span>
-                  <span className="text-cyber-cyan">ANALYZING</span>
+                  <span>{challenge.category.toUpperCase()} AGENT</span>
+                  <span className="text-cyber-cyan">{challenge.status === 'RUNNING' ? 'ANALYZING' : challenge.status}</span>
                 </div>
-                <p className="text-[11px] text-slate-400 mt-1">Fuzzing authentication API endpoint</p>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  {decisions[0]?.capability ? `Executing ${decisions[0].capability}` : `Analyzing ${challenge.category} target surface`}
+                </p>
               </div>
             </div>
           </div>
