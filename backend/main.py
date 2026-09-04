@@ -9,9 +9,17 @@ from backend.database.session import init_db
 from backend.api.routes import router as api_router
 from backend.websocket.manager import ws_manager
 
+log_dir = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file_path = os.path.join(log_dir, "forge.log")
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(log_file_path, encoding="utf-8")
+    ]
 )
 logger = logging.getLogger("forge.main")
 

@@ -43,6 +43,11 @@ def init_db():
                 conn.commit()
             except Exception:
                 pass
+            try:
+                conn.execute(text("ALTER TABLE challenges ADD COLUMN difficulty VARCHAR DEFAULT 'MEDIUM'"))
+                conn.commit()
+            except Exception:
+                pass
 
 def get_db():
     db = SessionLocal()

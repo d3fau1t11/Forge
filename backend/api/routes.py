@@ -160,12 +160,28 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
 
     workflow_runner.start_run(run.id, challenge.id, req.target_address)
 
+    # Initialize Challenge Dedicated Log File
+    logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
+    os.makedirs(logs_dir, exist_ok=True)
+    ch_log_path = os.path.join(logs_dir, f"challenge_{challenge.id}.log")
+    with open(ch_log_path, "w", encoding="utf-8") as f:
+        f.write(f"=== FORGE CTF CHALLENGE LOG STARTED ===\n")
+        f.write(f"Timestamp: {datetime.utcnow().isoformat()} UTC\n")
+        f.write(f"Challenge ID: {challenge.id}\n")
+        f.write(f"Challenge Name: {challenge.name}\n")
+        f.write(f"Platform: {platform} | Category: {category} | Difficulty: {difficulty}\n")
+        f.write(f"Target Scope: {req.target_address}\n")
+        f.write(f"Working Directory: {working_dir}\n")
+        f.write(f"Run ID: {run.id}\n")
+        f.write(f"=======================================\n\n")
+
     await ws_manager.broadcast({
         "event": "CHALLENGE_CREATED",
         "challenge_id": challenge.id,
         "name": challenge.name,
         "target": req.target_address,
-        "working_directory": working_dir
+        "working_directory": working_dir,
+        "log_file": ch_log_path
     })
 
     return challenge

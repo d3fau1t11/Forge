@@ -41,6 +41,7 @@ class ChallengeModel(Base):
     id = Column(String, primary_key=True, default=generate_uuid)
     name = Column(String, nullable=False)
     category = Column(String, default="general") # web, recon, forensics, crypto, pwn, rev
+    difficulty = Column(String, default="MEDIUM") # EASY, MEDIUM, HARD, INSANE
     description = Column(Text, default="")
     working_directory = Column(String, default="")
     platform_name = Column(String, default="")
