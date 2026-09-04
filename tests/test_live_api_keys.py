@@ -1,5 +1,8 @@
 import unittest
 import asyncio
+import os
+
+os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 from backend.config import settings
 from backend.providers.router import model_router
 

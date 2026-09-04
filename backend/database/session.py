@@ -5,19 +5,24 @@ from backend.config import settings
 from backend.database.models import Base
 
 # Database engine initialization (Supports SQLite out-of-the-box and PostgreSQL)
-db_url = os.getenv("DATABASE_URL", settings.DATABASE_URL)
-engine_kwargs = {}
-if db_url.startswith("sqlite"):
-    engine_kwargs["connect_args"] = {"check_same_thread": False}
+def get_engine():
+    current_url = os.getenv("DATABASE_URL", settings.DATABASE_URL)
+    kwargs = {}
+    if current_url.startswith("sqlite"):
+        kwargs["connect_args"] = {"check_same_thread": False}
+    return create_engine(current_url, **kwargs)
 
-engine = create_engine(db_url, **engine_kwargs)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+def SessionLocal():
+    eng = get_engine()
+    return sessionmaker(autocommit=False, autoflush=False, bind=eng)()
 
 def init_db():
-    Base.metadata.create_all(bind=engine)
+    eng = get_engine()
+    Base.metadata.create_all(bind=eng)
+    current_url = os.getenv("DATABASE_URL", settings.DATABASE_URL)
     # Lightweight SQLite column migration
-    if settings.DATABASE_URL.startswith("sqlite"):
-        with engine.connect() as conn:
+    if current_url.startswith("sqlite"):
+        with eng.connect() as conn:
             try:
                 conn.execute(text("ALTER TABLE challenges ADD COLUMN progress INTEGER DEFAULT 0"))
                 conn.commit()

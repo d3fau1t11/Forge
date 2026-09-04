@@ -1,5 +1,8 @@
 import unittest
 import asyncio
+import os
+
+os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 from backend.environment.detector import environment_detector
 from backend.providers.router import model_router
 from backend.tools.registry import tool_registry

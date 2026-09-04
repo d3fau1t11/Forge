@@ -4,6 +4,8 @@ import sys
 import asyncio
 import tempfile
 
+os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from backend.config import settings
