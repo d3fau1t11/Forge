@@ -87,6 +87,7 @@ export interface AiDecision {
   nextAction?: string;
   confidence: number;
   costUsd?: number;
+  model?: string;
   challengeId?: string;
 }
 

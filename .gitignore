@@ -34,6 +34,7 @@ reports/*
 logs/*.log
 scratch/
 .serena/
+.agents/
 
 # Environment variables
 .env

@@ -28,30 +28,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [searchTerm, setSearchTerm] = useState('');
   const [isExecuting, setIsExecuting] = useState(false);
 
-  const defaultCliLogs: TerminalLog[] = [
-    {
-      id: 'log-cli-01',
-      timestamp: new Date().toISOString().substring(11, 19),
-      type: 'CLAUDE CODE',
-      command: 'claude-code daemon --auto-start --agentrouter',
-      output: '[+] Claude Code CLI Agent Router daemon online (v3.5 Sonnet).\n[+] Subprocess session initialized cleanly.\n[+] Standing by for autonomous escalation loops.',
-      exitCode: 0,
-      duration: '0.18s',
-      privilege: 'SAFE',
-      agent: 'AGENTROUTER'
-    },
-    {
-      id: 'log-cli-02',
-      timestamp: new Date().toISOString().substring(11, 19),
-      type: 'CODEX',
-      command: 'codex exec --init-session',
-      output: '[+] OpenAI Codex CLI Subprocess Daemon active.\n[+] Code synthesis & patch analysis pipe ready.',
-      exitCode: 0,
-      duration: '0.12s',
-      privilege: 'SAFE',
-      agent: 'AGENTROUTER'
-    }
-  ];
+  const [userLogs, setUserLogs] = useState<TerminalLog[]>([]);
 
   const handleCopy = (id: string, text: string) => {
     soundEngine.playClick();
@@ -62,7 +39,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
   const handleClear = () => {
     soundEngine.playClick();
-    // Clear logs list
+    setUserLogs([]);
   };
 
   const handleRun = async (e: React.FormEvent) => {
@@ -84,7 +61,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }
   };
 
-  const currentLogs = logs && logs.length > 0 ? logs : defaultCliLogs;
+  const currentLogs = (logs && logs.length > 0 ? logs : userLogs) || [];
 
   const filteredLogs = currentLogs.filter((l) => {
     if (activeTab === 'forge_tools' && l.type !== 'FORGE TOOL EXECUTION' && l.type !== 'EXECUTION') return false;

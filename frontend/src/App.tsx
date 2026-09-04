@@ -99,6 +99,22 @@ export default function App() {
               result: data.result,
               confidence: data.confidence || 90,
               costUsd: 0,
+              model: data.model,
+              challengeId: data.challenge_id
+            };
+            setDecisions((prev) => [newDecision, ...prev]);
+          } else if (data.event === 'AI_PROMPT_TRANSPARENCY') {
+            const newDecision: AiDecision = {
+              id: `dec-prompt-${Date.now()}`,
+              timestamp: new Date().toLocaleTimeString(),
+              agent: 'ORCHESTRATOR',
+              goal: `Turn #${data.turn} AI Prompt & Strategy Generation`,
+              capability: '1-command-react-loop',
+              selectedTool: 'bash_cli',
+              result: data.raw_response,
+              confidence: 95,
+              costUsd: 0,
+              model: data.model,
               challengeId: data.challenge_id
             };
             setDecisions((prev) => [newDecision, ...prev]);

@@ -113,26 +113,36 @@ def get_challenge(challenge_id: str, db: Session = Depends(get_db)):
 
 @router.post("/challenges")
 async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(get_db)):
-    working_dir = req.working_directory.strip() if (req.working_directory and req.working_directory.strip()) else os.path.abspath(os.path.join("workspaces", req.name.lower().replace(" ", "_")))
+    platform = req.platform_name.strip() if (req.platform_name and req.platform_name.strip()) else "PicoCTF"
+    category = req.category.strip().upper() if req.category else "WEB"
+    difficulty = req.difficulty.strip().upper() if req.difficulty else "MEDIUM"
+    name = req.name.strip() if (req.name and req.name.strip()) else "Challenge_Target"
+
+    # Enforce structured hierarchy: ~/Documents/CTF/<Platform>/<Category>/<Difficulty>/<Name>
+    ctf_root_dir = os.path.expanduser(os.path.join("~", "Documents", "CTF"))
+    working_dir = os.path.abspath(os.path.join(ctf_root_dir, platform, category, difficulty, name))
     os.makedirs(working_dir, exist_ok=True)
 
     challenge = ChallengeModel(
-        name=req.name,
-        category=req.category,
+        name=name,
+        category=category,
+        difficulty=difficulty,
         description=req.description,
         working_directory=working_dir,
-        platform_name=req.platform_name.strip() if req.platform_name else "FORGE CTF",
+        platform_name=platform,
         status="RUNNING"
     )
     db.add(challenge)
     db.commit()
     db.refresh(challenge)
 
-    is_file = os.path.exists(req.target_address)
+    multi_targets = [t.strip() for t in req.target_address.replace("+", ",").split(",") if t.strip()]
+    first_target = multi_targets[0] if multi_targets else req.target_address
+    is_file = os.path.exists(first_target) or len(multi_targets) > 1
     target = TargetProfileModel(
         challenge_id=challenge.id,
         current_address=req.target_address,
-        hostname=os.path.basename(req.target_address) if is_file else f"{req.name.lower()}.ctf",
+        hostname=os.path.basename(first_target) if (is_file and os.path.exists(first_target)) else f"{name.lower()}.ctf",
         verification_status="verified_file" if is_file else "verified_network"
     )
     db.add(target)
@@ -141,7 +151,7 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
     run = RunModel(
         challenge_id=challenge.id,
         status="RUNNING",
-        current_phase="recon",
+        current_phase="ingest",
         current_agent="orchestrator"
     )
     db.add(run)
@@ -154,7 +164,8 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
         "event": "CHALLENGE_CREATED",
         "challenge_id": challenge.id,
         "name": challenge.name,
-        "target": req.target_address
+        "target": req.target_address,
+        "working_directory": working_dir
     })
 
     return challenge

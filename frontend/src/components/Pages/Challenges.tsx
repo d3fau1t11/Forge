@@ -47,11 +47,27 @@ export const Challenges: React.FC<ChallengesProps> = ({
   const [description, setDescription] = useState('');
   const [workingDirectory, setWorkingDirectory] = useState('');
 
+  const extractFolderName = (pathStr: string): string => {
+    if (!pathStr) return '';
+    const parts = pathStr.split(/[/\\]/).filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1] : pathStr;
+  };
+
+  const handleWorkingDirectoryChange = (val: string) => {
+    setWorkingDirectory(val);
+    const derived = extractFolderName(val);
+    if (derived) {
+      setName(derived);
+    }
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name || !target) return;
+    const folderName = extractFolderName(workingDirectory);
+    const finalName = name.trim() || folderName || 'NEW_CHALLENGE';
+    if (!target) return;
     soundEngine.playSuccess();
-    onCreateChallenge({ name, category, difficulty, target, description, workingDirectory, platformName });
+    onCreateChallenge({ name: finalName, category, difficulty, target, description, workingDirectory, platformName });
     setName('');
     setPlatformName('');
     setTarget('');
@@ -304,38 +320,63 @@ export const Challenges: React.FC<ChallengesProps> = ({
             {/* Scrollable Form Body */}
             <form onSubmit={handleSubmit} className="flex flex-col flex-1 min-h-0 overflow-hidden">
               <div className="p-5 space-y-4 text-xs overflow-y-auto flex-1 custom-scrollbar">
+                {/* Mandatory System CTF Directory Path Preview */}
+                <div className="p-3.5 rounded-lg bg-obsidian-900 border border-cyber-cyan/40 space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px] font-bold text-cyber-cyan uppercase">
+                    <span className="flex items-center space-x-1.5">
+                      <Folder className="w-3.5 h-3.5 text-cyber-cyan" />
+                      <span>MANDATORY CTF WORKSPACE DIRECTORY</span>
+                    </span>
+                    <span className="text-[10px] text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-800 font-mono">
+                      AUTO-ENFORCED
+                    </span>
+                  </div>
+                  <div className="font-mono text-[11px] text-slate-200 bg-obsidian-950 p-2 rounded border border-slate-800 break-all select-all font-bold">
+                    ~/Documents/CTF/
+                    <span className="text-cyber-cyan">{platformName.trim() || 'PicoCTF'}</span>/
+                    <span className="text-amber-400">{category.trim().toUpperCase() || 'WEB'}</span>/
+                    <span className="text-rose-400">{difficulty}</span>/
+                    <span className="text-emerald-400">{name.trim() || 'Challenge_Target'}</span>
+                  </div>
+                  <p className="text-[10px] text-slate-400">
+                    System directory access locked. Workspace is automatically initialized under system Documents/CTF structured hierarchy.
+                  </p>
+                </div>
+
                 <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold">Challenge Name</label>
+                  <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
+                    <span>Challenge Name</span>
+                    <span className="text-[10px] text-cyber-cyan font-normal">(e.g. Dolphin Cove, Web CTF 1)</span>
+                  </label>
                   <input
                     type="text"
                     required
-                    placeholder="e.g. HYDRA_AUTHENTICATION_BYPASS"
+                    placeholder="Enter Challenge Name..."
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
+                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono font-bold"
                   />
                 </div>
 
                 <div>
                   <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
                     <span>Platform / Competition Name</span>
-                    <span className="text-[10px] text-cyber-cyan lowercase font-normal">(optional - e.g. HackTheBox, PicoCTF)</span>
+                    <span className="text-[10px] text-cyber-cyan lowercase font-normal">(e.g. PicoCTF, HackTheBox)</span>
                   </label>
                   <input
                     type="text"
                     list="platform-suggestions"
-                    placeholder="e.g. HackTheBox, TryHackMe, PicoCTF 2026, DEF CON"
+                    placeholder="e.g. PicoCTF, HackTheBox, TryHackMe, DEF CON"
                     value={platformName}
                     onChange={(e) => setPlatformName(e.target.value)}
                     className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
                   />
                   <datalist id="platform-suggestions">
+                    <option value="PicoCTF" />
                     <option value="HackTheBox" />
                     <option value="TryHackMe" />
-                    <option value="PicoCTF 2026" />
                     <option value="DEF CON CTF" />
                     <option value="CyberSpace CTF" />
-                    <option value="Custom CTF Platform" />
                   </datalist>
                 </div>
 
@@ -380,39 +421,18 @@ export const Challenges: React.FC<ChallengesProps> = ({
                 </div>
 
                 <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold">Target IP / File Artifact Path</label>
+                  <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
+                    <span>Target IP(s) / Web URL(s) / File Artifact(s)</span>
+                    <span className="text-[10px] text-cyber-cyan font-normal">(use '+' sign for multi-target / multiple files)</span>
+                  </label>
                   <input
                     type="text"
                     required
-                    placeholder="e.g. 10.10.14.23, target.ctf, or /tmp/challenge.pcap"
+                    placeholder="e.g. http://10.10.14.23:8000 + /tmp/artifact.pcap + 192.168.1.50"
                     value={target}
                     onChange={(e) => setTarget(e.target.value)}
                     className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
                   />
-                </div>
-
-                <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
-                    <span>Working Directory (Workspace Path)</span>
-                    <span className="text-[10px] text-cyber-cyan lowercase font-normal">(optional - auto-created if empty)</span>
-                  </label>
-                  <div className="flex items-center space-x-2">
-                    <input
-                      type="text"
-                      placeholder="e.g. ./workspaces/web_challenge or /home/kali/ctf/web1"
-                      value={workingDirectory}
-                      onChange={(e) => setWorkingDirectory(e.target.value)}
-                      className="flex-1 bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => { soundEngine.playClick(); setShowDirBrowser(true); }}
-                      className="px-3.5 py-2.5 rounded-lg bg-cyber-cyan/20 hover:bg-cyber-cyan/35 border border-cyber-cyan/60 text-cyber-cyan text-xs font-bold flex items-center space-x-1.5 shrink-0 transition-all shadow-[0_0_12px_rgba(0,240,255,0.2)]"
-                    >
-                      <Folder className="w-4 h-4" />
-                      <span>BROWSE FOLDER</span>
-                    </button>
-                  </div>
                 </div>
 
                 <div>
@@ -452,7 +472,7 @@ export const Challenges: React.FC<ChallengesProps> = ({
       {showDirBrowser && (
         <DirectoryBrowserModal
           initialPath={workingDirectory}
-          onSelect={(selectedPath) => setWorkingDirectory(selectedPath)}
+          onSelect={(selectedPath) => handleWorkingDirectoryChange(selectedPath)}
           onClose={() => setShowDirBrowser(false)}
         />
       )}

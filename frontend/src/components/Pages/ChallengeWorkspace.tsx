@@ -135,6 +135,9 @@ ${evidenceText}
                   {challenge.category} CTF
                 </span>
                 <span className="text-xs text-slate-400">• TARGET: <span className="text-cyber-cyan font-bold">{target.currentIp}</span></span>
+                <span className="px-2.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-400 text-[11px] font-bold font-mono">
+                  🐧 OS: Linux (Parrot/Kali) — Optimal Operational Mode
+                </span>
               </div>
             </div>
           </div>
@@ -397,8 +400,26 @@ ${evidenceText}
                 <span className="font-bold text-cyber-cyan font-display text-sm">{d.agent} • {d.goal}</span>
                 <span className="text-cyber-emerald font-bold">{d.confidence}% CONFIDENCE</span>
               </div>
-              <p className="text-slate-300"><span className="text-slate-500 font-bold">Capability:</span> {d.capability} → <code className="text-cyber-cyan font-bold">{d.selectedTool}</code></p>
-              <p className="text-slate-300 bg-obsidian-950 p-3 rounded-lg border border-slate-900 leading-relaxed">{d.result}</p>
+              <p className="text-slate-300"><span className="text-slate-500 font-bold">Capability:</span> {d.capability} → <code className="text-cyber-cyan font-bold">{d.selectedTool || 'bash_cli'}</code></p>
+              <p className="text-slate-300 bg-obsidian-950 p-3 rounded-lg border border-slate-900 leading-relaxed font-mono">{d.result}</p>
+              
+              {/* Collapsible Full AI Prompt & Response Inspector */}
+              <details className="mt-2 text-[11px] bg-obsidian-950 p-3 rounded-lg border border-slate-800 cursor-pointer">
+                <summary className="text-cyber-cyan font-bold hover:underline select-none flex items-center space-x-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-cyber-cyan" />
+                  <span>[ INSPECT FULL RAW PROMPT & MODEL CONTEXT ]</span>
+                </summary>
+                <div className="mt-3 space-y-2 text-slate-300 font-mono">
+                  <div className="flex items-center space-x-2">
+                    <span className="text-slate-500 font-bold uppercase text-[10px]">Model Provider:</span>
+                    <span className="text-amber-400 font-bold px-2 py-0.5 rounded bg-amber-950/60 border border-amber-800">{d.model || 'model_router'}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 font-bold uppercase block text-[10px] mb-1">Raw Output / Selected Action:</span>
+                    <pre className="bg-obsidian-900 p-2.5 rounded border border-slate-800 text-slate-200 whitespace-pre-wrap text-[10.5px] max-h-48 overflow-y-auto custom-scrollbar">{d.result}</pre>
+                  </div>
+                </div>
+              </details>
             </div>
           ))}
         </div>

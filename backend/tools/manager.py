@@ -64,8 +64,41 @@ class ToolManager:
                 stderr=f"Tool '{first_candidate.tool_name}' required for capability '{capability}' is not installed. Trusted install recipe: `{first_candidate.installation_recipe}`"
             )
 
-        # 3. Construct safe execution command string
-        raw_args = selected_tool.args_template.format(target=target)
+        # 3. Construct safe execution command string & sanitize target format for specific tools
+        parsed_target = target.replace("+", ",").split(",")[0].strip()
+        target_port = None
+        
+        # Parse URL target into host/port if target starts with http:// or https://
+        if parsed_target.startswith("http://") or parsed_target.startswith("https://"):
+            from urllib.parse import urlparse
+            u = urlparse(parsed_target)
+            host_only = u.hostname or parsed_target
+            target_port = u.port
+            base_url = f"{u.scheme}://{u.netloc}"
+        else:
+            host_only = parsed_target.split(":")[0]
+            base_url = parsed_target
+
+        if selected_tool.tool_name == "nmap":
+            target_for_cmd = host_only
+            extra_port = f" -p {target_port}" if target_port else ""
+            raw_args = selected_tool.args_template.format(target=target_for_cmd) + extra_port
+        elif selected_tool.tool_name == "ffuf":
+            clean_url = base_url.rstrip("/")
+            # Check if default wordlist exists, fallback to simple wordlist
+            wl_path = "/usr/share/seclists/Discovery/Web-Content/common.txt"
+            if not os.path.exists(wl_path):
+                wl_path = "/usr/share/wordlists/dirb/common.txt"
+            if not os.path.exists(wl_path):
+                wl_path = os.path.abspath(os.path.join("workspaces", "common.txt"))
+                if not os.path.exists(wl_path):
+                    os.makedirs(os.path.dirname(wl_path), exist_ok=True)
+                    with open(wl_path, "w") as f:
+                        f.write("admin\nlogin\napi\nsessions\nflag\ndashboard\nindex.php\nrobots.txt\n.git\nconfig\n")
+            raw_args = f"-u {clean_url}/FUZZ -w {wl_path} -mc 200,301,302,401,403 -s"
+        else:
+            raw_args = selected_tool.args_template.format(target=parsed_target)
+
         if extra_args:
             raw_args += f" {extra_args}"
         
@@ -110,6 +143,62 @@ class ToolManager:
             tool_name=selected_tool.tool_name,
             capability=capability,
             command=full_command,
+            status=status,
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=exit_code,
+            duration_ms=elapsed_ms
+        )
+
+    async def execute_raw_command(
+        self,
+        command: str,
+        cwd: Optional[str] = None,
+        timeout_seconds: int = 120
+    ) -> ToolExecutionResult:
+        start_time = time.time()
+        raw_cmd = command.strip()
+        logger.info(f"Executing raw Parrot OS CLI command (cwd={cwd}): {raw_cmd}")
+
+        try:
+            exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
+            process = await asyncio.create_subprocess_shell(
+                raw_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=exec_cwd
+            )
+
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=timeout_seconds
+                )
+                stdout = stdout_bytes.decode(errors="replace")
+                stderr = stderr_bytes.decode(errors="replace")
+                exit_code = process.returncode
+                status = "SUCCESS" if exit_code == 0 else "FAILED"
+            except asyncio.TimeoutError:
+                process.kill()
+                stdout = ""
+                stderr = f"Command execution timed out after {timeout_seconds} seconds."
+                exit_code = -1
+                status = "TIMEOUT"
+
+        except Exception as e:
+            stdout = ""
+            stderr = f"Raw subprocess error: {str(e)}"
+            exit_code = -1
+            status = "FAILED"
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        first_word = raw_cmd.split()[0] if raw_cmd else "raw_cmd"
+        binary_name = os.path.basename(first_word)
+
+        return ToolExecutionResult(
+            tool_name=binary_name,
+            capability="custom_command",
+            command=raw_cmd,
             status=status,
             stdout=stdout,
             stderr=stderr,
