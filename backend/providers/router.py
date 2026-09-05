@@ -1,4 +1,7 @@
+import os
+import asyncio
 import logging
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 from backend.config import settings
 from backend.providers.base import BaseProvider, ProviderResponse
@@ -10,22 +13,42 @@ from backend.providers.quota_manager import quota_manager
 
 logger = logging.getLogger("forge.router")
 
+async def _notify_fallback(failed_provider: str, reason: str, next_candidate: Optional[str] = None):
+    """Broadcast real-time WebSocket notification when a provider fails/exhausts quota and triggers cascade."""
+    try:
+        from backend.websocket.manager import ws_manager
+        await ws_manager.broadcast({
+            "type": "PROVIDER_FALLBACK_TRIGGERED",
+            "data": {
+                "failed_provider": failed_provider,
+                "reason": str(reason)[:160],
+                "next_provider": next_candidate or "Next available candidate",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        })
+    except Exception as e:
+        logger.debug(f"[ModelRouter] WS notification skip: {e}")
+
 class ModelRouter:
     """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
 
     DEFAULT_ROUTING_MAP = {
-        "recon": ["nvidia", "agentrouter_codex", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
-        "directory_enumeration": ["nvidia", "agentrouter_codex", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
-        "web_analysis": ["nvidia", "agentrouter_claude_code", "agentrouter_codex", "openrouter", "gemini", "cloudflare", "mock"],
-        "code_analysis": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
-        "reverse_engineering": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
-        "fast_reasoning": ["agentrouter_codex", "nvidia", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
-        "general_reasoning": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
-        "verification": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"]
+        "recon": ["rapidapi_gpt55", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "rapidapi_gpt5_nano", "nvidia", "agentrouter_codex", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
+        "directory_enumeration": ["rapidapi_gpt54_mini", "rapidapi_gpt5_nano", "rapidapi_gpt55", "nvidia", "agentrouter_codex", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
+        "web_analysis": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "nvidia", "agentrouter_claude_code", "agentrouter_codex", "openrouter", "gemini", "cloudflare", "mock"],
+        "code_analysis": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
+        "reverse_engineering": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
+        "fast_reasoning": ["rapidapi_gpt54_mini", "rapidapi_gpt5_nano", "rapidapi_gpt55", "agentrouter_codex", "nvidia", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
+        "general_reasoning": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
+        "verification": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"]
     }
 
     # Model to Provider/CLI Transport Mapping
     MODEL_PROVIDER_MAP = {
+        "gpt-5.5": ("rapidapi_gpt55", "GPT-5.5"),
+        "gpt-5.4-mini": ("rapidapi_gpt54_mini", "gpt-5.4-mini"),
+        "deepseek-v3.2": ("rapidapi_deepseek_v32", "DeepSeek-V3.2"),
+        "gpt-5-nano": ("rapidapi_gpt5_nano", "GPT-5-nano"),
         "claude-opus-5": ("agentrouter_claude_code", "claude_code"),
         "claude-opus-4-8": ("agentrouter_claude_code", "claude_code"),
         "gpt-5.6": ("agentrouter_codex", "codex"),
@@ -50,6 +73,41 @@ class ModelRouter:
         self._initialize_env_providers()
 
     def _initialize_env_providers(self):
+        # 1. RapidAPI Verified Working Models (Priority 1)
+        rapidapi_key = (settings.RAPIDAPI_KEY or os.getenv("RAPIDAPI_KEY", "")).strip()
+        if rapidapi_key:
+            self.register_provider("rapidapi_gpt55", OpenAISpecProvider(
+                name="rapidapi_gpt55",
+                is_paid=True,
+                api_key=rapidapi_key,
+                default_model="GPT-5.5",
+                base_url="https://gpt-5-5.p.rapidapi.com",
+                extra_headers={"x-rapidapi-host": "gpt-5-5.p.rapidapi.com", "x-rapidapi-key": rapidapi_key}
+            ))
+            self.register_provider("rapidapi_gpt54_mini", OpenAISpecProvider(
+                name="rapidapi_gpt54_mini",
+                is_paid=True,
+                api_key=rapidapi_key,
+                default_model="gpt-5.4-mini",
+                base_url="https://gpt-5-4-mini.p.rapidapi.com",
+                extra_headers={"x-rapidapi-host": "gpt-5-4-mini.p.rapidapi.com", "x-rapidapi-key": rapidapi_key}
+            ))
+            self.register_provider("rapidapi_deepseek_v32", OpenAISpecProvider(
+                name="rapidapi_deepseek_v32",
+                is_paid=True,
+                api_key=rapidapi_key,
+                default_model="DeepSeek-V3.2",
+                base_url="https://deepseek-v31.p.rapidapi.com/",
+                extra_headers={"x-rapidapi-host": "deepseek-v31.p.rapidapi.com", "x-rapidapi-key": rapidapi_key}
+            ))
+            self.register_provider("rapidapi_gpt5_nano", OpenAISpecProvider(
+                name="rapidapi_gpt5_nano",
+                is_paid=True,
+                api_key=rapidapi_key,
+                default_model="GPT-5-nano",
+                base_url="https://gpt-5-nano.p.rapidapi.com",
+                extra_headers={"x-rapidapi-host": "gpt-5-nano.p.rapidapi.com", "x-rapidapi-key": rapidapi_key}
+            ))
         if settings.GEMINI_API_KEY:
             self.register_provider("gemini", GeminiProvider(api_key=settings.GEMINI_API_KEY))
         if settings.NVIDIA_API_KEY:
@@ -95,6 +153,32 @@ class ModelRouter:
 
     def register_provider(self, name: str, provider: BaseProvider):
         self.providers[name.lower()] = provider
+
+    def register_custom_model(self, provider_name: str, api_key: str, model_id: str, base_url: str = "https://integrate.api.nvidia.com/v1", is_paid: bool = True) -> OpenAISpecProvider:
+        """Dynamically register or update a model provider from snippet or UI configuration."""
+        key = provider_name.lower()
+        provider = OpenAISpecProvider(
+            name=key,
+            is_paid=is_paid,
+            api_key=api_key,
+            default_model=model_id,
+            base_url=base_url
+        )
+        self.register_provider(key, provider)
+        # Register in model to provider map
+        self.MODEL_PROVIDER_MAP[model_id] = (key, model_id)
+        
+        # Prepend to routing maps for high priority
+        for capability in self.DEFAULT_ROUTING_MAP:
+            if key not in self.DEFAULT_ROUTING_MAP[capability]:
+                self.DEFAULT_ROUTING_MAP[capability].insert(0, key)
+            else:
+                # Move to front
+                self.DEFAULT_ROUTING_MAP[capability].remove(key)
+                self.DEFAULT_ROUTING_MAP[capability].insert(0, key)
+
+        logger.info(f"[ModelRouter] Successfully registered custom model '{model_id}' under provider '{key}' (base_url: {base_url})")
+        return provider
 
     def set_paid_allowed(self, allowed: bool):
         self.paid_allowed = allowed
@@ -201,6 +285,7 @@ class ModelRouter:
                                 response.model_name, refusal
                             )
                         logger.warning(f"Model refusal from {provider_name}: {response.refusal_reason}. Fallback...")
+                        asyncio.create_task(_notify_fallback(provider_name, refusal or "Model Refusal / Quota Limit"))
                         continue
 
                     if response.estimated_cost_usd > 0:
@@ -214,6 +299,7 @@ class ModelRouter:
                     if quota_manager.detect_quota_error(error_str):
                         quota_manager.record_quota_exhaustion(provider_name, error_str)
                     logger.error(f"Error calling provider {provider_name}: {error_str}. Fallback...")
+                    asyncio.create_task(_notify_fallback(provider_name, error_str))
                     continue
 
         logger.info("Using offline mock provider fallback.")

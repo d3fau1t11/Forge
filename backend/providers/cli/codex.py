@@ -76,6 +76,7 @@ class AgentRouterCodexProvider(BaseCLIProvider):
         cmd = [
             executable,
             "exec",
+            "--skip-git-repo-check",
             "--model", model_to_use,
             prompt
         ]
@@ -90,6 +91,7 @@ class AgentRouterCodexProvider(BaseCLIProvider):
                 *cmd,
                 cwd=temp_dir,
                 env=sub_env,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
@@ -132,34 +134,35 @@ class AgentRouterCodexProvider(BaseCLIProvider):
         clean_stdout = redact_secrets(raw_stdout, [api_key])
         clean_stderr = redact_secrets(raw_stderr, [api_key])
 
+        combined_output = f"{clean_stdout}\n{clean_stderr}".strip()
+        
         # Check for AgentRouter quota exhaustion (402)
-        if "402" in clean_stderr or "quota" in clean_stderr.lower() or "budget pool" in clean_stderr.lower():
+        if "402" in combined_output or "quota" in combined_output.lower() or "budget pool" in combined_output.lower():
             return ProviderResponse(
                 provider_name=self.name,
                 model_name=model_to_use,
                 content="",
                 is_refusal=True,
-                refusal_reason=f"AgentRouter Quota Exhausted (402): {clean_stderr[:200]}"
+                refusal_reason=f"AgentRouter Quota Exhausted (402): {combined_output[:200]}"
             )
 
         # Check for authentication errors
-        if "401" in clean_stderr or "unauthorized" in clean_stderr.lower() or "unauthenticated" in clean_stderr.lower():
+        if "401" in combined_output or "unauthorized" in combined_output.lower() or "unauthenticated" in combined_output.lower():
             return ProviderResponse(
                 provider_name=self.name,
                 model_name=model_to_use,
                 content="",
                 is_refusal=True,
-                refusal_reason=f"AgentRouter Authentication Refusal (401): {clean_stderr[:200]}"
+                refusal_reason=f"AgentRouter Authentication Refusal (401): {combined_output[:200]}"
             )
 
-        if exit_code != 0 and not clean_stdout.strip():
-
+        if exit_code != 0 and (not clean_stdout.strip() or "error" in clean_stdout.lower()):
             return ProviderResponse(
                 provider_name=self.name,
                 model_name=model_to_use,
                 content="",
                 is_refusal=True,
-                refusal_reason=f"Codex CLI exited with code {exit_code}: {clean_stderr[:200]}"
+                refusal_reason=f"Codex CLI exited with code {exit_code}: {combined_output[:200]}"
             )
 
         return ProviderResponse(

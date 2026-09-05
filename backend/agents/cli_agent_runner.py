@@ -104,14 +104,17 @@ class CLIAgentRunner:
             notes_file = os.path.join(working_dir, "MISSION.md")
             mission_prompt = (
                 f"# FORGE AUTONOMOUS CTF MISSION OBJECTIVE\n\n"
-                f"- **Target URL / Host**: {target}\n"
                 f"- **Challenge Name**: {challenge.name}\n"
+                f"- **Platform / Competition**: {challenge.platform_name or 'CTF'}\n"
                 f"- **Category**: {challenge.category}\n"
                 f"- **Difficulty**: {challenge.difficulty}\n"
-                f"- **Description**: {challenge.description or 'Extract the hidden CTF flag from the target.'}\n\n"
+                f"- **Resolved Target**: {target}\n"
+                f"- **Working Directory**: `{working_dir}`\n\n"
+                f"## Challenge Brief & Details\n"
+                f"{challenge.description or 'Extract the hidden CTF flag from the target.'}\n\n"
                 f"## Instructions for Autonomous Agent\n"
                 f"1. You are operating inside the challenge workspace directory `{working_dir}`.\n"
-                f"2. Inspect the target using curl, nmap, dirb/ffuf, or python3 scripts.\n"
+                f"2. Inspect the target and instructions above using curl, nmap, dirb/ffuf, or python3 scripts.\n"
                 f"3. Exploit vulnerabilities, bypass authentications, or reverse engineer files to capture the flag.\n"
                 f"4. Once the flag is found (e.g. `picoCTF{{...}}`, `flag{{...}}`, `CTF{{...}}`), print it clearly in your output.\n"
             )
@@ -150,7 +153,9 @@ class CLIAgentRunner:
 
             # Construct CLI launch arguments
             initial_prompt = (
-                f"Solve CTF challenge '{challenge.name}' for target {target}. "
+                f"Solve CTF challenge '{challenge.name}' ({challenge.category} - {challenge.difficulty}) on {challenge.platform_name or 'CTF'}.\n"
+                f"Target / Scope: {target}\n"
+                f"Challenge Brief: {challenge.description or 'Find and extract the flag.'}\n\n"
                 f"Inspect files in this workspace, scan the target, find vulnerabilities, and extract the CTF flag."
             )
 
@@ -166,6 +171,7 @@ class CLIAgentRunner:
                 cmd_args = [
                     executable,
                     "exec",
+                    "--skip-git-repo-check",
                     "--model", model_arg,
                     initial_prompt
                 ]
@@ -256,10 +262,43 @@ class CLIAgentRunner:
 
             # Finalize Challenge State
             full_output = "".join(accumulated_output)
-            if not captured_flag:
-                match = FLAG_REGEX.search(full_output)
-                if match:
-                    captured_flag = match.group(1)
+            # Check for AgentRouter 402 Quota Exhaustion
+            from backend.providers.quota_manager import quota_manager
+            is_quota_error = quota_manager.detect_quota_error(full_output) or "402" in full_output or "budget pool" in full_output.lower()
+
+            if proc.returncode != 0 and is_quota_error and not captured_flag:
+                failed_model = model or ("claude-opus-5" if agent_type == "claude_code" else "gpt-5.6")
+                quota_manager.record_quota_exhaustion(failed_model, full_output[:200])
+                next_batch = quota_manager.get_next_batch_time_str()
+
+                logger.warning(
+                    f"[CLIAgentRunner] AgentRouter quota EXHAUSTED for '{agent_type}'. "
+                    f"Next replenishment: {next_batch}. Auto-fallback to Autonomous Orchestrator..."
+                )
+
+                await ws_manager.broadcast({
+                    "type": "PROVIDER_FALLBACK_TRIGGERED",
+                    "data": {
+                        "failed_provider": f"{binary_name.upper()} (Claude/GPT Batch Quota Exhausted)",
+                        "reason": f"HTTP 402 Budget pool quota exhausted. Next batch at {next_batch}",
+                        "next_provider": "Autonomous Orchestrator (RapidAPI / DeepSeek)",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                })
+
+                await ws_manager.broadcast({
+                    "event": "LOG_OUTPUT",
+                    "challenge_id": challenge_id,
+                    "command": f"{binary_name} fallback",
+                    "output": f"[QUOTA NOTICE] Claude batch quota exhausted (402). Auto-switching to Autonomous Orchestrator ReAct engine with RapidAPI/DeepSeek...",
+                    "exit_code": 0,
+                    "timestamp": datetime.utcnow().strftime("%H:%M:%S")
+                })
+
+                # Seamlessly hand off to Autonomous Orchestrator without failing
+                from backend.agents.orchestrator_loop import orchestrator_loop
+                await orchestrator_loop.run_autonomous_loop(run_id, challenge_id, target)
+                return
 
             if captured_flag:
                 challenge.flag = captured_flag

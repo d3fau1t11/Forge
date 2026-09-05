@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -15,6 +16,7 @@ from backend.database.models import (
 )
 from backend.environment.detector import environment_detector
 from backend.providers.router import model_router
+from backend.providers.snippet_parser import SnippetParser
 from backend.tools.registry import tool_registry
 from backend.tools.manager import tool_manager
 from backend.api.runner import workflow_runner
@@ -24,13 +26,39 @@ from backend.privilege.manager import privilege_manager
 
 router = APIRouter()
 
+def extract_target_from_text(text: str) -> str:
+    """Intelligently extracts target network endpoint, URL, netcat connection, or artifact from description."""
+    if not text:
+        return ""
+    # Look for http(s) URL
+    url_match = re.search(r'https?://[^\s]+', text, re.IGNORECASE)
+    if url_match:
+        return url_match.group(0).rstrip(".,;)\"'>")
+    # Look for netcat connection: nc <host> <port>
+    nc_match = re.search(r'nc\s+([a-zA-Z0-9.\-_]+)\s+(\d+)', text, re.IGNORECASE)
+    if nc_match:
+        return f"{nc_match.group(1)}:{nc_match.group(2)}"
+    # Look for IP:port or IP
+    ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b', text)
+    if ip_match:
+        return ip_match.group(0)
+    # Look for hostname:port
+    host_match = re.search(r'\b([a-zA-Z0-9-]+\.[a-zA-Z0-9.\-]+:\d+)\b', text)
+    if host_match:
+        return host_match.group(0)
+    # Look for artifact or file path
+    file_match = re.search(r'(?:[a-zA-Z]:[\\/]|(?:\/|~\/|\.\/))[^\s]+?\.(?:pcap|zip|bin|elf|tar|gz|py|c|exe|txt|raw)', text, re.IGNORECASE)
+    if file_match:
+        return file_match.group(0)
+    return ""
+
 # Request Models
 class CreateChallengeRequest(BaseModel):
     name: str
     category: str = "WEB"
     difficulty: str = "MEDIUM"
     description: str = ""
-    target_address: str
+    target_address: Optional[str] = ""
     working_directory: Optional[str] = ""
     platform_name: Optional[str] = ""
 
@@ -74,6 +102,23 @@ class UpdateSystemSettingsRequest(BaseModel):
     session_budget_usd: float = 2.00
     paid_model_allowed: bool = True
     default_strategy: str = "EXPLOIT_FIRST"
+
+class ParseSnippetRequest(BaseModel):
+    snippet: str
+
+class RegisterSnippetRequest(BaseModel):
+    snippet: Optional[str] = None
+    provider_name: Optional[str] = "nvidia"
+    api_key: Optional[str] = None
+    model_id: Optional[str] = None
+    base_url: Optional[str] = None
+    test_connection: bool = True
+
+class UpdateProviderKeyRequest(BaseModel):
+    provider_name: str
+    api_key: str
+    model_id: Optional[str] = None
+    base_url: Optional[str] = None
 
 # ----------------------------------------------------
 # SYSTEM & ENVIRONMENT
@@ -136,12 +181,18 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
     db.commit()
     db.refresh(challenge)
 
-    multi_targets = [t.strip() for t in req.target_address.replace("+", ",").split(",") if t.strip()]
-    first_target = multi_targets[0] if multi_targets else req.target_address
+    resolved_target = (req.target_address or "").strip()
+    if not resolved_target:
+        resolved_target = extract_target_from_text(req.description)
+    if not resolved_target:
+        resolved_target = f"{name.lower().replace(' ', '_')}.ctf"
+
+    multi_targets = [t.strip() for t in resolved_target.replace("+", ",").split(",") if t.strip()]
+    first_target = multi_targets[0] if multi_targets else resolved_target
     is_file = os.path.exists(first_target) or len(multi_targets) > 1
     target = TargetProfileModel(
         challenge_id=challenge.id,
-        current_address=req.target_address,
+        current_address=resolved_target,
         hostname=os.path.basename(first_target) if (is_file and os.path.exists(first_target)) else f"{name.lower()}.ctf",
         verification_status="verified_file" if is_file else "verified_network"
     )
@@ -158,7 +209,7 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
     db.commit()
     db.refresh(run)
 
-    workflow_runner.start_run(run.id, challenge.id, req.target_address)
+    workflow_runner.start_run(run.id, challenge.id, resolved_target)
 
     # Initialize Challenge Dedicated Log File
     logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
@@ -480,11 +531,97 @@ def get_providers_health():
                 "name": p.name,
                 "is_paid": p.is_paid,
                 "status": "healthy",
+                "default_model": getattr(p, "default_model", ""),
                 "latency_ms": 120 if "cerebras" in p.name else 420
             }
             for p in model_router.providers.values()
         ]
     }
+
+@router.post("/providers/parse-snippet")
+def parse_provider_snippet(req: ParseSnippetRequest):
+    result = SnippetParser.parse_snippet(req.snippet)
+    return result
+
+@router.post("/providers/register-snippet")
+async def register_provider_snippet(req: RegisterSnippetRequest):
+    if req.snippet:
+        parsed = SnippetParser.parse_snippet(req.snippet)
+        if not parsed.get("success"):
+            raise HTTPException(status_code=400, detail="Could not parse API key or model from snippet.")
+        api_key = parsed.get("api_key")
+        model_id = parsed.get("model") or req.model_id or "default"
+        base_url = parsed.get("base_url") or req.base_url or "https://integrate.api.nvidia.com/v1"
+        provider_name = parsed.get("provider_name") or req.provider_name or "nvidia"
+    else:
+        if not req.api_key:
+            raise HTTPException(status_code=400, detail="API key is required.")
+        api_key = req.api_key
+        model_id = req.model_id or "default"
+        base_url = req.base_url or "https://integrate.api.nvidia.com/v1"
+        provider_name = req.provider_name or "nvidia"
+
+    # Register in router
+    provider = model_router.register_custom_model(
+        provider_name=provider_name,
+        api_key=api_key,
+        model_id=model_id,
+        base_url=base_url
+    )
+
+    test_status = "untested"
+    latency_ms = 0
+    test_response = ""
+
+    if req.test_connection:
+        start_time = asyncio.get_event_loop().time()
+        try:
+            res = await provider.generate_response(
+                prompt="Say 'pong'",
+                model=model_id,
+                capability="general_reasoning"
+            )
+            latency_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            if res.is_refusal:
+                test_status = "failed"
+                test_response = res.refusal_reason or "Refusal"
+            else:
+                test_status = "healthy"
+                test_response = res.content[:200]
+        except Exception as e:
+            test_status = "failed"
+            test_response = str(e)
+
+    return {
+        "success": True,
+        "provider_name": provider_name,
+        "model_id": model_id,
+        "base_url": base_url,
+        "api_key_masked": api_key[:8] + "..." + api_key[-4:] if len(api_key) > 12 else "***",
+        "test_status": test_status,
+        "latency_ms": latency_ms,
+        "test_response": test_response
+    }
+
+@router.post("/providers/update-key")
+async def update_provider_key(req: UpdateProviderKeyRequest):
+    p_name = req.provider_name.lower()
+    if p_name in model_router.providers:
+        prov = model_router.providers[p_name]
+        if hasattr(prov, 'api_key'):
+            prov.api_key = req.api_key
+        if req.model_id and hasattr(prov, 'default_model'):
+            prov.default_model = req.model_id
+        if req.base_url and hasattr(prov, 'base_url'):
+            prov.base_url = req.base_url.rstrip("/")
+    else:
+        model_router.register_custom_model(
+            provider_name=p_name,
+            api_key=req.api_key,
+            model_id=req.model_id or "default",
+            base_url=req.base_url or "https://integrate.api.nvidia.com/v1"
+        )
+    return {"success": True, "provider_name": req.provider_name, "status": "updated"}
 
 # ----------------------------------------------------
 # EVIDENCE, FINDINGS, REPORTS & KNOWLEDGE

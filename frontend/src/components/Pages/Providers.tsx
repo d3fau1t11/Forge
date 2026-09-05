@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Server, 
   RefreshCw, 
@@ -11,14 +11,31 @@ import {
   X,
   AlertTriangle,
   Clock,
-  ArrowRightLeft
+  ArrowRightLeft,
+  Code2,
+  Cpu,
+  Globe,
+  Sparkles
 } from 'lucide-react';
 import { ProviderInfo } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
+import { apiService } from '../../services/api';
 
 interface ProvidersProps {
   providers: ProviderInfo[];
   onTestConnection: (providerName: string) => void;
+}
+
+interface ParsedSnippetResult {
+  success: boolean;
+  provider_name?: string;
+  api_key?: string;
+  api_key_masked?: string;
+  model?: string;
+  base_url?: string;
+  invoke_url?: string;
+  parameters?: Record<string, any>;
+  error?: string;
 }
 
 export const Providers: React.FC<ProvidersProps> = ({
@@ -29,9 +46,55 @@ export const Providers: React.FC<ProvidersProps> = ({
   const [testResult, setTestResult] = useState<{ provider: string; status: 'SUCCESS' | 'FAILED'; details: string } | null>(null);
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [showUsageModal, setShowUsageModal] = useState(false);
-  const [selectedProviderToConfig, setSelectedProviderToConfig] = useState<string>('Gemini');
+  const [configTab, setConfigTab] = useState<'SNIPPET' | 'MANUAL'>('SNIPPET');
+
+  // Snippet parser state
+  const [snippetInput, setSnippetInput] = useState('');
+  const [parsedResult, setParsedResult] = useState<ParsedSnippetResult | null>(null);
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [registerResult, setRegisterResult] = useState<{
+    success: boolean;
+    statusText: string;
+    details?: string;
+  } | null>(null);
+
+  // Manual key state
+  const [selectedProviderToConfig, setSelectedProviderToConfig] = useState<string>('NVIDIA');
   const [apiKeyInput, setApiKeyInput] = useState('');
+  const [modelIdInput, setModelIdInput] = useState('');
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
+
+  // Auto-parse snippet in real-time as user pastes or types
+  useEffect(() => {
+    if (!snippetInput.trim()) {
+      setParsedResult(null);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      try {
+        const res = await apiService.parseProviderSnippet(snippetInput);
+        setParsedResult(res);
+      } catch (e) {
+        // Fallback local regex parsing
+        const keyMatch = snippetInput.match(/nvapi-[a-zA-Z0-9_\-]{30,}|Bearer\s+([a-zA-Z0-9_\-\.]{15,})/i);
+        const modelMatch = snippetInput.match(/["']model["']\s*:\s*["']([^"']+)["']/i);
+        if (keyMatch || modelMatch) {
+          const key = keyMatch ? (keyMatch[1] || keyMatch[0]) : '';
+          setParsedResult({
+            success: true,
+            provider_name: key.startsWith('nvapi-') ? 'nvidia' : 'custom',
+            api_key: key,
+            api_key_masked: key ? `${key.substring(0, 8)}...${key.substring(key.length - 4)}` : '',
+            model: modelMatch ? modelMatch[1] : 'moonshotai/kimi-k3',
+            base_url: 'https://integrate.api.nvidia.com/v1'
+          });
+        }
+      }
+    }, 250);
+
+    return () => clearTimeout(timer);
+  }, [snippetInput]);
 
   const handleTest = (name: string) => {
     soundEngine.playClick();
@@ -54,15 +117,65 @@ export const Providers: React.FC<ProvidersProps> = ({
     handleTest('ALL');
   };
 
-  const handleSaveApiKey = (e: React.FormEvent) => {
+  const handleRegisterSnippet = async (e: React.FormEvent) => {
     e.preventDefault();
-    soundEngine.playFanfare();
-    setSaveNotice(`API Key updated successfully for ${selectedProviderToConfig}`);
-    setTimeout(() => {
-      setSaveNotice(null);
-      setShowConfigModal(false);
-      setApiKeyInput('');
-    }, 2000);
+    if (!snippetInput.trim() && !parsedResult?.api_key) return;
+
+    soundEngine.playClick();
+    setIsRegistering(true);
+    setRegisterResult(null);
+
+    try {
+      const res = await apiService.registerProviderSnippet({
+        snippet: snippetInput,
+        test_connection: true
+      });
+
+      setIsRegistering(false);
+      if (res.success) {
+        soundEngine.playFanfare();
+        setRegisterResult({
+          success: true,
+          statusText: `Activated ${res.model_id} on ${res.provider_name.toUpperCase()}!`,
+          details: `Status: ${res.test_status} • Latency: ${res.latency_ms}ms • Router priority updated`
+        });
+        setTimeout(() => {
+          setShowConfigModal(false);
+          setRegisterResult(null);
+          setSnippetInput('');
+        }, 2200);
+      }
+    } catch (err: any) {
+      setIsRegistering(false);
+      soundEngine.playClick();
+      setRegisterResult({
+        success: false,
+        statusText: 'Failed to activate snippet',
+        details: err.message || 'Check snippet format or network connection.'
+      });
+    }
+  };
+
+  const handleSaveManualApiKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    soundEngine.playClick();
+    try {
+      await apiService.updateProviderKey({
+        provider_name: selectedProviderToConfig.toLowerCase(),
+        api_key: apiKeyInput,
+        model_id: modelIdInput.trim() || undefined
+      });
+      soundEngine.playFanfare();
+      setSaveNotice(`API Key updated successfully for ${selectedProviderToConfig}`);
+      setTimeout(() => {
+        setSaveNotice(null);
+        setShowConfigModal(false);
+        setApiKeyInput('');
+        setModelIdInput('');
+      }, 1800);
+    } catch (err: any) {
+      setSaveNotice(`Error: ${err.message}`);
+    }
   };
 
   return (
@@ -75,7 +188,7 @@ export const Providers: React.FC<ProvidersProps> = ({
             <span>AI INFRASTRUCTURE CONTROL CENTER</span>
           </h1>
           <p className="text-xs text-slate-400 mt-1">
-            Manage provider routing, API keys, fallback priorities, API transports, and AgentRouter CLI wrappers.
+            Manage provider routing, auto-import code snippets, API keys, and custom model endpoints.
           </p>
         </div>
 
@@ -85,7 +198,7 @@ export const Providers: React.FC<ProvidersProps> = ({
             className="px-4 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all uppercase"
           >
             <Key className="w-4 h-4" />
-            <span>MANAGE API KEYS</span>
+            <span>MANAGE / IMPORT KEYS</span>
           </button>
           <button
             onClick={handleRefresh}
@@ -252,6 +365,7 @@ export const Providers: React.FC<ProvidersProps> = ({
                 onClick={() => {
                   soundEngine.playClick();
                   setSelectedProviderToConfig(p.name);
+                  setConfigTab('SNIPPET');
                   setShowConfigModal(true);
                 }}
                 className="py-2 px-3 rounded-lg bg-obsidian-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-bold flex items-center space-x-1 transition-colors"
@@ -264,77 +378,227 @@ export const Providers: React.FC<ProvidersProps> = ({
         ))}
       </div>
 
-      {/* MODAL 1: API KEY MANAGER & CONFIGURATION */}
+      {/* MODAL 1: API KEY MANAGER & AUTO-SNIPPET IMPORTER */}
       {showConfigModal && (
-        <div className="fixed inset-0 bg-obsidian-950/80 backdrop-blur-md flex items-center justify-center p-4 z-50">
-          <div className="glass-panel border-2 border-cyber-cyan/60 rounded-xl max-w-lg w-full p-6 space-y-5 shadow-[0_0_40px_rgba(0,240,255,0.25)] cyber-corner">
+        <div className="fixed inset-0 bg-obsidian-950/85 backdrop-blur-md flex items-center justify-center p-4 z-50">
+          <div className="glass-panel border-2 border-cyber-cyan/60 rounded-xl max-w-xl w-full p-6 space-y-5 shadow-[0_0_40px_rgba(0,240,255,0.25)] cyber-corner font-mono">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center space-x-2">
                 <Key className="w-5 h-5 text-cyber-cyan" />
                 <h2 className="text-sm font-display font-bold text-slate-100 uppercase neon-text-cyan">
-                  API KEY & PROVIDER CONFIGURATION
+                  PROVIDER & MODEL CONFIGURATION
                 </h2>
               </div>
-              <button onClick={() => setShowConfigModal(false)} className="text-slate-400 hover:text-slate-100 font-bold">
+              <button 
+                onClick={() => setShowConfigModal(false)} 
+                className="text-slate-400 hover:text-slate-100 font-bold p-1 rounded hover:bg-slate-800"
+              >
                 ✕
               </button>
             </div>
 
-            {saveNotice && (
-              <div className="p-3 rounded-lg bg-emerald-950/80 border border-cyber-emerald text-cyber-emerald text-xs font-bold flex items-center space-x-2">
-                <CheckCircle2 className="w-4 h-4" />
-                <span>{saveNotice}</span>
-              </div>
+            {/* TAB SELECTOR */}
+            <div className="flex space-x-2 border-b border-slate-800 pb-2">
+              <button
+                type="button"
+                onClick={() => { soundEngine.playClick(); setConfigTab('SNIPPET'); }}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-bold flex items-center space-x-1.5 transition-all ${
+                  configTab === 'SNIPPET'
+                    ? 'bg-cyber-cyan text-obsidian-950 shadow-[0_0_12px_rgba(0,240,255,0.3)]'
+                    : 'bg-obsidian-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>PASTE CODE SNIPPET (AUTO-DETECT)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => { soundEngine.playClick(); setConfigTab('MANUAL'); }}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-bold flex items-center space-x-1.5 transition-all ${
+                  configTab === 'MANUAL'
+                    ? 'bg-cyber-cyan text-obsidian-950 shadow-[0_0_12px_rgba(0,240,255,0.3)]'
+                    : 'bg-obsidian-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                }`}
+              >
+                <Sliders className="w-3.5 h-3.5" />
+                <span>MANUAL KEY INPUT</span>
+              </button>
+            </div>
+
+            {/* TAB 1: CODE SNIPPET AUTO-PARSER */}
+            {configTab === 'SNIPPET' && (
+              <form onSubmit={handleRegisterSnippet} className="space-y-4 text-xs font-mono">
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-slate-300 font-bold flex items-center space-x-1.5">
+                      <Code2 className="w-4 h-4 text-cyber-cyan" />
+                      <span>Paste Python, cURL, or JSON Snippet from NVIDIA / Model Catalog:</span>
+                    </label>
+                    <span className="text-[10px] text-cyber-emerald font-bold uppercase">
+                      Auto-Extracts Key & Model
+                    </span>
+                  </div>
+
+                  <textarea
+                    rows={6}
+                    value={snippetInput}
+                    onChange={(e) => setSnippetInput(e.target.value)}
+                    placeholder={`import requests\n\ninvoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"\nheaders = {"Authorization": "Bearer nvapi-..."}\npayload = {"model": "moonshotai/kimi-k3", ...}`}
+                    className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-3 text-slate-100 font-mono text-[11px] focus:outline-none focus:border-cyber-cyan placeholder:text-slate-600 leading-relaxed"
+                  />
+                </div>
+
+                {/* LIVE EXTRACTION PREVIEW CARD */}
+                {parsedResult && parsedResult.success && (
+                  <div className="p-3.5 bg-obsidian-950 border border-cyber-cyan/50 rounded-xl space-y-2.5 shadow-[0_0_15px_rgba(0,240,255,0.1)]">
+                    <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
+                      <span className="text-[11px] font-bold text-cyber-cyan uppercase flex items-center space-x-1">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-cyber-emerald" />
+                        <span>Snippet Parsed Successfully</span>
+                      </span>
+                      <span className="text-[10px] uppercase font-bold px-2 py-0.5 bg-cyan-950 border border-cyber-cyan text-cyber-cyan rounded">
+                        {parsedResult.provider_name}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 text-[11px]">
+                      <div className="flex flex-col space-y-0.5">
+                        <span className="text-slate-500 text-[10px]">DETECTED MODEL:</span>
+                        <span className="text-cyber-emerald font-bold truncate flex items-center space-x-1">
+                          <Cpu className="w-3 h-3 flex-shrink-0" />
+                          <span>{parsedResult.model}</span>
+                        </span>
+                      </div>
+
+                      <div className="flex flex-col space-y-0.5">
+                        <span className="text-slate-500 text-[10px]">DETECTED API KEY:</span>
+                        <span className="text-cyber-amber font-bold truncate flex items-center space-x-1">
+                          <Key className="w-3 h-3 flex-shrink-0" />
+                          <span>{parsedResult.api_key_masked || 'nvapi-***'}</span>
+                        </span>
+                      </div>
+
+                      <div className="col-span-2 flex flex-col space-y-0.5">
+                        <span className="text-slate-500 text-[10px]">ENDPOINT BASE URL:</span>
+                        <span className="text-slate-300 font-bold truncate flex items-center space-x-1">
+                          <Globe className="w-3 h-3 flex-shrink-0" />
+                          <span>{parsedResult.base_url}</span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* REGISTRATION RESULT ALERT */}
+                {registerResult && (
+                  <div className={`p-3 rounded-lg border text-xs font-bold flex items-start space-x-2.5 ${
+                    registerResult.success
+                      ? 'bg-emerald-950/80 border-cyber-emerald text-cyber-emerald'
+                      : 'bg-red-950/80 border-red-500 text-red-400'
+                  }`}>
+                    {registerResult.success ? (
+                      <CheckCircle2 className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                    ) : (
+                      <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                    )}
+                    <div>
+                      <div>{registerResult.statusText}</div>
+                      {registerResult.details && (
+                        <div className="text-[11px] font-normal text-slate-300 mt-0.5">
+                          {registerResult.details}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-end space-x-3 pt-3 border-t border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setShowConfigModal(false)}
+                    className="px-4 py-2 rounded-lg bg-obsidian-900 border border-slate-700 text-slate-300 font-bold hover:bg-slate-800 transition-colors"
+                  >
+                    CANCEL
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={!snippetInput.trim() || isRegistering}
+                    className="px-6 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 disabled:opacity-50 text-obsidian-950 font-display font-bold shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all uppercase flex items-center space-x-2"
+                  >
+                    <Zap className={`w-4 h-4 ${isRegistering ? 'animate-spin' : ''}`} />
+                    <span>{isRegistering ? 'TESTING & ACTIVATING...' : 'TEST & ACTIVATE MODEL'}</span>
+                  </button>
+                </div>
+              </form>
             )}
 
-            <form onSubmit={handleSaveApiKey} className="space-y-4 text-xs font-mono">
-              <div>
-                <label className="block text-slate-300 mb-1 font-bold">Target AI Provider *</label>
-                <select
-                  value={selectedProviderToConfig}
-                  onChange={(e) => setSelectedProviderToConfig(e.target.value)}
-                  className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan"
-                >
-                  <option value="Gemini">Gemini (Google AI Studio / Vertex)</option>
-                  <option value="OpenRouter">OpenRouter (Multi-LLM Aggregator)</option>
-                  <option value="Cerebras">Cerebras (Ultra-Fast Inference)</option>
-                  <option value="NVIDIA">NVIDIA (Nemotron / Code)</option>
-                  <option value="Cloudflare Workers AI">Cloudflare Workers AI</option>
-                  <option value="AgentRouter (Claude Code)">AgentRouter (Claude Code CLI)</option>
-                  <option value="AgentRouter (Codex)">AgentRouter (OpenAI Codex CLI)</option>
-                  <option value="Custom Local LLM">Custom Local LLM (Ollama / vLLM / LocalAI)</option>
-                </select>
-              </div>
+            {/* TAB 2: MANUAL KEY INPUT */}
+            {configTab === 'MANUAL' && (
+              <form onSubmit={handleSaveManualApiKey} className="space-y-4 text-xs font-mono">
+                {saveNotice && (
+                  <div className="p-3 rounded-lg bg-emerald-950/80 border border-cyber-emerald text-cyber-emerald text-xs font-bold flex items-center space-x-2">
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>{saveNotice}</span>
+                  </div>
+                )}
 
-              <div>
-                <label className="block text-slate-300 mb-1 font-bold">API Key / Auth Token *</label>
-                <input
-                  type="password"
-                  required
-                  placeholder="Enter API Key (e.g. AIzaSy... or sk-or-v1-...)"
-                  value={apiKeyInput}
-                  onChange={(e) => setApiKeyInput(e.target.value)}
-                  className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan"
-                />
-                <p className="text-[10px] text-slate-400 mt-1">Keys are securely stored in server-side environment vault (.env).</p>
-              </div>
+                <div>
+                  <label className="block text-slate-300 mb-1 font-bold">Target AI Provider *</label>
+                  <select
+                    value={selectedProviderToConfig}
+                    onChange={(e) => setSelectedProviderToConfig(e.target.value)}
+                    className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan"
+                  >
+                    <option value="NVIDIA">NVIDIA (NIM / Prototype / Custom)</option>
+                    <option value="Gemini">Gemini (Google AI Studio / Vertex)</option>
+                    <option value="OpenRouter">OpenRouter (Multi-LLM Aggregator)</option>
+                    <option value="Cerebras">Cerebras (Ultra-Fast Inference)</option>
+                    <option value="Cloudflare">Cloudflare Workers AI</option>
+                    <option value="AgentRouter">AgentRouter (HTTP / CLI)</option>
+                  </select>
+                </div>
 
-              <div className="flex items-center justify-end space-x-3 pt-3 border-t border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setShowConfigModal(false)}
-                  className="px-4 py-2 rounded-lg bg-obsidian-900 border border-slate-700 text-slate-300 font-bold hover:bg-slate-800 transition-colors"
-                >
-                  CANCEL
-                </button>
-                <button
-                  type="submit"
-                  className="px-6 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all uppercase"
-                >
-                  SAVE & TEST API KEY
-                </button>
-              </div>
-            </form>
+                <div>
+                  <label className="block text-slate-300 mb-1 font-bold">API Key / Auth Token *</label>
+                  <input
+                    type="password"
+                    required
+                    placeholder="Enter API Key (e.g. nvapi-... or AIzaSy... or sk-or-v1-...)"
+                    value={apiKeyInput}
+                    onChange={(e) => setApiKeyInput(e.target.value)}
+                    className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-slate-300 mb-1 font-bold">Default Model ID (Optional override)</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. moonshotai/kimi-k3 or meta/llama-3.3-70b-instruct"
+                    value={modelIdInput}
+                    onChange={(e) => setModelIdInput(e.target.value)}
+                    className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan"
+                  />
+                </div>
+
+                <div className="flex items-center justify-end space-x-3 pt-3 border-t border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setShowConfigModal(false)}
+                    className="px-4 py-2 rounded-lg bg-obsidian-900 border border-slate-700 text-slate-300 font-bold hover:bg-slate-800 transition-colors"
+                  >
+                    CANCEL
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-6 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all uppercase"
+                  >
+                    SAVE & APPLY
+                  </button>
+                </div>
+              </form>
+            )}
           </div>
         </div>
       )}
@@ -384,4 +648,3 @@ export const Providers: React.FC<ProvidersProps> = ({
     </div>
   );
 };
-

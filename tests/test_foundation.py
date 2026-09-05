@@ -28,7 +28,7 @@ class TestFoundation(unittest.TestCase):
                 capability="directory_enumeration"
             )
         response = asyncio.run(run_async())
-        self.assertIn(response.provider_name, ["mock", "cloudflare", "openrouter", "gemini", "nvidia", "agentrouter_claude_code", "agentrouter_codex"])
+        self.assertIn(response.provider_name, ["mock", "cloudflare", "openrouter", "gemini", "nvidia", "agentrouter_claude_code", "agentrouter_codex", "rapidapi_gpt55", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "rapidapi_gpt5_nano"])
         self.assertFalse(response.is_refusal)
         self.assertTrue(len(response.content) > 0)
 

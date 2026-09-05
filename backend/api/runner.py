@@ -45,14 +45,18 @@ class WorkflowRunner:
         selected_engine = engine_type or "auto"
 
         if selected_engine == "auto":
-            # If Claude Code or Codex CLI is available on system, pick CLI agent
+            from backend.providers.quota_manager import quota_manager
             has_claude = bool(shutil.which("claude") or shutil.which("claude.cmd") or os.environ.get("CLAUDE_CODE_PATH"))
             has_codex = bool(shutil.which("codex") or shutil.which("codex.cmd") or os.environ.get("CODEX_PATH"))
 
-            if has_claude:
+            claude_exhausted = quota_manager.is_model_exhausted("claude-opus-5") or quota_manager.should_skip_quota_limited_models()
+
+            if has_claude and not claude_exhausted:
                 selected_engine = "claude_code"
             elif has_codex:
                 selected_engine = "codex"
+                if not model:
+                    model = "deepseek-v4-flash"
             else:
                 selected_engine = "react_loop"
 

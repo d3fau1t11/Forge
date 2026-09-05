@@ -40,11 +40,12 @@ export const Challenges: React.FC<ChallengesProps> = ({
 
   // Form states
   const [name, setName] = useState('');
-  const [platformName, setPlatformName] = useState('');
+  const [platformName, setPlatformName] = useState('PicoCTF');
   const [category, setCategory] = useState<string>('WEB');
   const [difficulty, setDifficulty] = useState<'EASY' | 'MEDIUM' | 'HARD' | 'INSANE'>('MEDIUM');
-  const [target, setTarget] = useState('');
   const [description, setDescription] = useState('');
+  const [customTargetOverride, setCustomTargetOverride] = useState('');
+  const [showTargetOverride, setShowTargetOverride] = useState(false);
   const [workingDirectory, setWorkingDirectory] = useState('');
 
   const extractFolderName = (pathStr: string): string => {
@@ -52,6 +53,29 @@ export const Challenges: React.FC<ChallengesProps> = ({
     const parts = pathStr.split(/[/\\]/).filter(Boolean);
     return parts.length > 0 ? parts[parts.length - 1] : pathStr;
   };
+
+  const extractTargetFromText = (text: string): string => {
+    if (!text) return '';
+    // Match URL
+    const urlMatch = text.match(/https?:\/\/[^\s]+/i);
+    if (urlMatch) return urlMatch[0].replace(/[.,;)"'>]+$/, '');
+    // Match nc <host> <port>
+    const ncMatch = text.match(/nc\s+([a-zA-Z0-9.\-_]+)\s+(\d+)/i);
+    if (ncMatch) return `${ncMatch[1]}:${ncMatch[2]}`;
+    // Match IP:port or IP
+    const ipMatch = text.match(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/);
+    if (ipMatch) return ipMatch[0];
+    // Match hostname:port
+    const hostPortMatch = text.match(/\b([a-zA-Z0-9-]+\.[a-zA-Z0-9.\-]+:\d+)\b/);
+    if (hostPortMatch) return hostPortMatch[0];
+    // Match file path
+    const fileMatch = text.match(/(?:[a-zA-Z]:[\\/]|(?:\/|~\/|\.\/))[^\s]+?\.(?:pcap|zip|bin|elf|tar|gz|py|c|exe|txt|raw)/i);
+    if (fileMatch) return fileMatch[0];
+    return '';
+  };
+
+  const detectedTarget = extractTargetFromText(description);
+  const effectiveTarget = customTargetOverride.trim() || detectedTarget || (name.trim() ? `${name.trim().toLowerCase().replace(/\s+/g, '_')}.ctf` : '127.0.0.1');
 
   const handleWorkingDirectoryChange = (val: string) => {
     setWorkingDirectory(val);
@@ -65,13 +89,22 @@ export const Challenges: React.FC<ChallengesProps> = ({
     e.preventDefault();
     const folderName = extractFolderName(workingDirectory);
     const finalName = name.trim() || folderName || 'NEW_CHALLENGE';
-    if (!target) return;
+    const targetToUse = effectiveTarget;
     soundEngine.playSuccess();
-    onCreateChallenge({ name: finalName, category, difficulty, target, description, workingDirectory, platformName });
+    onCreateChallenge({
+      name: finalName,
+      category,
+      difficulty,
+      target: targetToUse,
+      description,
+      workingDirectory,
+      platformName: platformName.trim() || 'PicoCTF'
+    });
     setName('');
-    setPlatformName('');
-    setTarget('');
+    setPlatformName('PicoCTF');
     setDescription('');
+    setCustomTargetOverride('');
+    setShowTargetOverride(false);
     setWorkingDirectory('');
     setShowModal(false);
   };
@@ -421,29 +454,52 @@ export const Challenges: React.FC<ChallengesProps> = ({
                 </div>
 
                 <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
-                    <span>Target IP(s) / Web URL(s) / File Artifact(s)</span>
-                    <span className="text-[10px] text-cyber-cyan font-normal">(use '+' sign for multi-target / multiple files)</span>
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g. http://10.10.14.23:8000 + /tmp/artifact.pcap + 192.168.1.50"
-                    value={target}
-                    onChange={(e) => setTarget(e.target.value)}
-                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold">Description / Rules</label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-slate-400 uppercase font-bold flex items-center space-x-1.5">
+                      <span>Challenge Brief, Targets & Files</span>
+                      <span className="text-[10px] text-cyber-cyan font-normal">(URLs, IPs, netcat ports, files, hints)</span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setShowTargetOverride(!showTargetOverride)}
+                      className="text-[10px] text-cyber-cyan hover:underline"
+                    >
+                      {showTargetOverride ? 'Auto Target Mode' : 'Custom Target Override'}
+                    </button>
+                  </div>
                   <textarea
-                    rows={3}
-                    placeholder="Target details, scope boundaries, platform rules..."
+                    rows={4}
+                    required
+                    placeholder={`Paste the entire challenge brief or target details here:\n- Description / Story / Hints\n- Target URL (e.g. http://instance.picoctf.net:12345/ or nc host 1337)\n- Local or downloaded files (e.g. /home/user/downloads/chall.bin)`}
                     value={description}
                     onChange={(e) => setDescription(e.target.value)}
-                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
+                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono text-xs leading-relaxed"
                   ></textarea>
+
+                  {/* Auto-detected target display badge */}
+                  <div className="mt-2 flex items-center justify-between bg-obsidian-950 p-2.5 rounded border border-slate-800 text-[11px]">
+                    <span className="text-slate-400 flex items-center space-x-1.5">
+                      <TargetIcon className="w-3.5 h-3.5 text-cyber-cyan" />
+                      <span>RESOLVED TARGET SCOPE:</span>
+                    </span>
+                    <span className="font-bold font-mono text-cyber-cyan truncate max-w-[280px]">
+                      {effectiveTarget}
+                    </span>
+                  </div>
+
+                  {/* Optional Custom Target Override */}
+                  {showTargetOverride && (
+                    <div className="mt-2 p-2.5 rounded bg-obsidian-900 border border-cyber-cyan/30 space-y-1">
+                      <label className="block text-slate-400 text-[10px] uppercase font-bold">Manual Target Override (Optional)</label>
+                      <input
+                        type="text"
+                        placeholder="e.g. http://10.10.14.23:8000"
+                        value={customTargetOverride}
+                        onChange={(e) => setCustomTargetOverride(e.target.value)}
+                        className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan"
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
 

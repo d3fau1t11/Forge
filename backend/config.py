@@ -31,6 +31,7 @@ try:
         MISTRAL_API_KEY: str = ""
         COHERE_API_KEY: str = ""
         GROQ_API_KEY: str = ""
+        RAPIDAPI_KEY: str = ""
 
         # AgentRouter Per-Model Keys
         AGENTROUTER_CLAUDE_OPUS_5_KEY: str = ""

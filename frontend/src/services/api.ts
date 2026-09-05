@@ -450,6 +450,48 @@ export class ApiService {
       ]
     };
   }
+
+  public async parseProviderSnippet(snippet: string) {
+    const res = await fetch(`${API_BASE_URL}/providers/parse-snippet`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snippet })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async registerProviderSnippet(data: {
+    snippet?: string;
+    provider_name?: string;
+    api_key?: string;
+    model_id?: string;
+    base_url?: string;
+    test_connection?: boolean;
+  }) {
+    const res = await fetch(`${API_BASE_URL}/providers/register-snippet`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async updateProviderKey(data: {
+    provider_name: string;
+    api_key: string;
+    model_id?: string;
+    base_url?: string;
+  }) {
+    const res = await fetch(`${API_BASE_URL}/providers/update-key`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
 }
 
 export const apiService = new ApiService();

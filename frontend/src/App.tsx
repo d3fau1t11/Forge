@@ -34,6 +34,8 @@ import { Providers } from './components/Pages/Providers';
 import { SystemView } from './components/Pages/SystemView';
 import { ChallengeWorkspace } from './components/Pages/ChallengeWorkspace';
 import { apiService } from './services/api';
+import { AlertTriangle, X } from 'lucide-react';
+import { soundEngine } from './utils/soundEngine';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('command');
@@ -41,6 +43,12 @@ export default function App() {
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [showModalKillSwitch, setShowModalKillSwitch] = useState(false);
   const [operationalMode, setOperationalMode] = useState<string>('CTF_OFFENSIVE_CONTROLLED');
+  const [fallbackNotice, setFallbackNotice] = useState<{
+    failedProvider: string;
+    reason: string;
+    nextProvider: string;
+    timestamp: string;
+  } | null>(null);
 
   // Application Data States
   const [challenges, setChallenges] = useState<Challenge[]>(INITIAL_CHALLENGES);
@@ -186,6 +194,16 @@ export default function App() {
             ]);
           } else if (data.event === 'ROOT_PERMISSION_RESULT') {
             setRootRequests((prev) => prev.filter((r) => r.requestId !== data.request_id));
+          } else if (data.type === 'PROVIDER_FALLBACK_TRIGGERED' || data.event === 'PROVIDER_FALLBACK_TRIGGERED') {
+            const fallbackData = data.data || data;
+            setFallbackNotice({
+              failedProvider: fallbackData.failed_provider || 'Provider',
+              reason: fallbackData.reason || 'Quota Exceeded / Endpoint Error',
+              nextProvider: fallbackData.next_provider || 'Auto-Fallback Candidate',
+              timestamp: new Date().toLocaleTimeString()
+            });
+            try { soundEngine.playWarning(); } catch (e) {}
+            setTimeout(() => setFallbackNotice(null), 8000);
           }
         } catch (err) {
           console.error('WS Parse Error', err);
@@ -466,6 +484,32 @@ export default function App() {
 
         {/* 3. Page Router Body */}
         <main className="flex-1 overflow-y-auto p-5 bg-[#06090e]">
+          {/* LIVE PROVIDER FALLBACK NOTIFICATION BANNER */}
+          {fallbackNotice && (
+            <div className="mb-4 p-3.5 bg-obsidian-950/95 border-2 border-cyber-amber text-slate-100 rounded-xl text-xs flex items-center justify-between shadow-[0_0_25px_rgba(245,158,11,0.35)] animate-pulse font-mono">
+              <div className="flex items-center space-x-3">
+                <AlertTriangle className="w-5 h-5 text-cyber-amber flex-shrink-0" />
+                <div>
+                  <div className="flex items-center space-x-2">
+                    <span className="font-bold text-cyber-amber uppercase tracking-wider">
+                      PROVIDER NOTICE: [{fallbackNotice.failedProvider}]
+                    </span>
+                    <span className="text-[10px] text-slate-400">({fallbackNotice.timestamp})</span>
+                  </div>
+                  <p className="text-[11px] text-slate-300 mt-0.5">
+                    {fallbackNotice.reason} • <strong className="text-cyber-emerald">Auto-cascading to {fallbackNotice.nextProvider}</strong>
+                  </p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setFallbackNotice(null)} 
+                className="text-slate-400 hover:text-slate-100 p-1 rounded hover:bg-slate-800"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
           {/* IF DEDICATED CHALLENGE WORKSPACE IS ACTIVE */}
           {activeChallenge ? (
             <ChallengeWorkspace

@@ -86,12 +86,20 @@ class OpenAISpecProvider(HTTPBaseProvider):
         if not await self.is_available():
             return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="API Key unconfigured")
 
-        url = f"{self.base_url}/chat/completions"
+        if self.base_url.endswith("/chat/completions"):
+            url = self.base_url
+        elif "deepseek-v31.p.rapidapi.com" in self.base_url:
+            url = self.base_url if self.base_url.endswith("/") else f"{self.base_url}/"
+        else:
+            url = f"{self.base_url}/chat/completions"
+
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             **self.extra_headers
         }
+        if "x-rapidapi-key" not in [k.lower() for k in headers.keys()] and self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
         messages = []
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})

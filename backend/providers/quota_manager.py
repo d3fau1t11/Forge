@@ -98,31 +98,22 @@ class AgentRouterQuotaManager:
         if not any(m in QUOTA_LIMITED_MODELS for m in self._exhaustion_timestamps):
             self._quota_exhausted_globally = False
 
-    def is_model_exhausted(self, model: str, stale_threshold_seconds: float = 1800) -> bool:
+    def is_model_exhausted(self, model: str) -> bool:
         """
         Check if a model is currently considered quota-exhausted.
 
         A model is considered exhausted if:
-        - It received a 402 within the last `stale_threshold_seconds` (default 30 min)
-        - AND no batch replenishment has occurred since the last 402
-
-        Args:
-            model: The model identifier
-            stale_threshold_seconds: How long a 402 observation stays relevant (default 30 min)
+        - It received a 402 error during the current batch period
+        - AND no scheduled batch replenishment (UTC 23:00 or 11:00) has occurred since
         """
         if model not in self._exhaustion_timestamps:
             return False
 
         last_402_ts = self._exhaustion_timestamps[model]
-        now = time.time()
 
-        # If the 402 is older than the threshold, consider it stale
-        if (now - last_402_ts) > stale_threshold_seconds:
-            return False
-
-        # Check if a batch replenishment has happened since the 402
+        # Check if a batch replenishment (UTC 23:00 or 11:00) has happened since the 402
         if self._has_batch_replenished_since(last_402_ts):
-            # Quota likely refilled — clear the exhaustion record
+            # Quota refilled in new batch — clear the exhaustion record
             self.record_successful_request(model)
             return False
 
@@ -130,21 +121,18 @@ class AgentRouterQuotaManager:
 
     def should_skip_quota_limited_models(self) -> bool:
         """
-        Check if the router should proactively skip ALL quota-limited models.
-        Returns True if global quota exhaustion was recently observed.
+        Check if the router should proactively skip ALL quota-limited models (Claude/GPT).
+        Returns True if batch quota exhaustion was observed and next batch has not arrived.
         """
         if not self._quota_exhausted_globally:
             return False
 
-        now = time.time()
-        # If last global exhaustion was within 30 minutes, skip quota-limited models
-        if (now - self._last_global_exhaustion_ts) < 1800:
-            if not self._has_batch_replenished_since(self._last_global_exhaustion_ts):
-                return True
+        if self._has_batch_replenished_since(self._last_global_exhaustion_ts):
+            # Quota refilled
+            self._quota_exhausted_globally = False
+            return False
 
-        # Stale, reset
-        self._quota_exhausted_globally = False
-        return False
+        return True
 
     def get_fallback_model(self, exhausted_model: str) -> Optional[str]:
         """Get the recommended always-available fallback for a quota-exhausted model."""
