@@ -6,6 +6,7 @@ from backend.providers.mock import MockProvider
 from backend.providers.real_providers import GeminiProvider, OpenAISpecProvider, HuggingFaceProvider, CloudflareProvider
 from backend.providers.cli.claude_code import AgentRouterClaudeCodeProvider
 from backend.providers.cli.codex import AgentRouterCodexProvider
+from backend.providers.quota_manager import quota_manager
 
 logger = logging.getLogger("forge.router")
 
@@ -98,6 +99,10 @@ class ModelRouter:
     def set_paid_allowed(self, allowed: bool):
         self.paid_allowed = allowed
 
+    def get_quota_status(self) -> Dict:
+        """Get current AgentRouter quota status summary."""
+        return quota_manager.get_quota_status_summary()
+
     async def route_request(
         self,
         prompt: str,
@@ -109,6 +114,17 @@ class ModelRouter:
 
         # 1. Direct Model Request (e.g. claude-opus-5, gpt-5.6)
         if target_model and target_model in self.MODEL_PROVIDER_MAP:
+            # Check if this model's quota is currently exhausted
+            if quota_manager.is_model_exhausted(target_model):
+                fallback_model = quota_manager.get_fallback_model(target_model)
+                next_batch = quota_manager.get_next_batch_time_str()
+                logger.warning(
+                    f"[ModelRouter] AgentRouter quota exhausted for '{target_model}'. "
+                    f"Auto-falling back to '{fallback_model}'. Next batch: {next_batch}"
+                )
+                if fallback_model and fallback_model in self.MODEL_PROVIDER_MAP:
+                    target_model = fallback_model
+
             provider_name, cli_type = self.MODEL_PROVIDER_MAP[target_model]
             provider = self.providers.get(provider_name)
             if provider and await provider.is_available():
@@ -121,10 +137,38 @@ class ModelRouter:
                     **kwargs
                 )
                 if not res.is_refusal:
+                    quota_manager.record_successful_request(target_model)
                     return res
+
+                # Detect AgentRouter 402 quota exhaustion from refusal reason
+                refusal = res.refusal_reason or ""
+                if quota_manager.detect_quota_error(refusal):
+                    quota_manager.record_quota_exhaustion(target_model, refusal)
+                    # Attempt auto-fallback to always-available model
+                    fallback_model = quota_manager.get_fallback_model(target_model)
+                    if fallback_model and fallback_model in self.MODEL_PROVIDER_MAP:
+                        logger.info(
+                            f"[ModelRouter] Quota 402 detected for '{target_model}'. "
+                            f"Retrying with fallback model '{fallback_model}'..."
+                        )
+                        fb_provider_name, _ = self.MODEL_PROVIDER_MAP[fallback_model]
+                        fb_provider = self.providers.get(fb_provider_name)
+                        if fb_provider and await fb_provider.is_available():
+                            fb_res = await fb_provider.generate_response(
+                                prompt=prompt,
+                                system_instruction=system_instruction,
+                                capability=capability,
+                                model=fallback_model,
+                                **kwargs
+                            )
+                            if not fb_res.is_refusal:
+                                quota_manager.record_successful_request(fallback_model)
+                                return fb_res
+
                 logger.warning(f"CLI Provider '{provider_name}' failed for model '{target_model}': {res.refusal_reason}. Falling back...")
 
         # 2. Capability Candidates Fallback Chain
+        skip_quota_limited = quota_manager.should_skip_quota_limited_models()
         candidates = self.DEFAULT_ROUTING_MAP.get(capability, ["cloudflare", "openrouter", "gemini", "mock"])
 
         for provider_name in candidates:
@@ -150,15 +194,26 @@ class ModelRouter:
                     )
                     
                     if response.is_refusal:
+                        # Check for quota exhaustion in refusal
+                        refusal = response.refusal_reason or ""
+                        if quota_manager.detect_quota_error(refusal):
+                            quota_manager.record_quota_exhaustion(
+                                response.model_name, refusal
+                            )
                         logger.warning(f"Model refusal from {provider_name}: {response.refusal_reason}. Fallback...")
                         continue
 
                     if response.estimated_cost_usd > 0:
                         self.current_spent_usd += response.estimated_cost_usd
 
+                    quota_manager.record_successful_request(response.model_name)
                     return response
                 except Exception as e:
-                    logger.error(f"Error calling provider {provider_name}: {str(e)}. Fallback...")
+                    error_str = str(e)
+                    # Detect 402 quota errors from exceptions too
+                    if quota_manager.detect_quota_error(error_str):
+                        quota_manager.record_quota_exhaustion(provider_name, error_str)
+                    logger.error(f"Error calling provider {provider_name}: {error_str}. Fallback...")
                     continue
 
         logger.info("Using offline mock provider fallback.")

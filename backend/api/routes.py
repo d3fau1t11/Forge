@@ -842,3 +842,20 @@ async def open_native_folder_dialog():
     if selected_path:
         return {"status": "SUCCESS", "selected_path": selected_path}
     return {"status": "CANCELLED", "selected_path": ""}
+
+# ----------------------------------------------------
+# AGENTROUTER QUOTA STATUS
+# ----------------------------------------------------
+
+@router.get("/providers/quota-status")
+def get_agentrouter_quota_status():
+    """
+    Returns the current AgentRouter quota status.
+
+    AgentRouter provides Claude & GPT models on a limited daily quota,
+    released in 2 batches per day (Beijing 07:00/19:00, UTC 23:00/11:00).
+    When a batch is exhausted, HTTP 402 is returned.
+    DeepSeek & GLM models are always available (no quota limit).
+    """
+    return model_router.get_quota_status()
+

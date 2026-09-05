@@ -8,7 +8,10 @@ import {
   ShieldCheck,
   Key,
   CheckCircle2,
-  X
+  X,
+  AlertTriangle,
+  Clock,
+  ArrowRightLeft
 } from 'lucide-react';
 import { ProviderInfo } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
@@ -142,10 +145,20 @@ export const Providers: React.FC<ProvidersProps> = ({
             <div>
               <div className="flex items-center justify-between mb-3 border-b border-slate-800/80 pb-3">
                 <div className="flex items-center space-x-2">
-                  <span className={`w-2.5 h-2.5 rounded-full ${p.status === 'HEALTHY' ? 'bg-cyber-emerald animate-ping' : 'bg-cyber-amber'}`}></span>
+                  <span className={`w-2.5 h-2.5 rounded-full ${
+                    p.status === 'HEALTHY' ? 'bg-cyber-emerald animate-ping' 
+                    : p.status === 'QUOTA_EXHAUSTED' ? 'bg-red-500 animate-pulse'
+                    : 'bg-cyber-amber'
+                  }`}></span>
                   <h2 className="font-display font-bold text-slate-100 text-sm">{p.name}</h2>
                 </div>
-                <span className="px-2.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-800 text-cyber-emerald text-[10px] font-bold">
+                <span className={`px-2.5 py-0.5 rounded border text-[10px] font-bold ${
+                  p.status === 'HEALTHY' 
+                    ? 'bg-emerald-950/80 border-emerald-800 text-cyber-emerald'
+                    : p.status === 'QUOTA_EXHAUSTED'
+                      ? 'bg-red-950/80 border-red-800 text-red-400'
+                      : 'bg-amber-950/80 border-amber-800 text-cyber-amber'
+                }`}>
                   {p.status}
                 </span>
               </div>
@@ -154,6 +167,34 @@ export const Providers: React.FC<ProvidersProps> = ({
                 <p className="text-[11px] text-cyber-cyan bg-cyan-950/40 p-2.5 rounded-lg border border-cyber-cyan/30 mb-3 leading-relaxed font-mono">
                   {p.routerNote}
                 </p>
+              )}
+
+              {/* Quota Status Badge */}
+              {p.quotaLimited !== undefined && (
+                <div className={`flex items-center space-x-2 p-2.5 rounded-lg border mb-3 text-[11px] font-bold ${
+                  p.quotaExhausted
+                    ? 'bg-red-950/40 border-red-500/40 text-red-400'
+                    : p.quotaLimited
+                      ? 'bg-amber-950/40 border-cyber-amber/40 text-cyber-amber'
+                      : 'bg-emerald-950/40 border-cyber-emerald/40 text-cyber-emerald'
+                }`}>
+                  {p.quotaExhausted ? (
+                    <>
+                      <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+                      <span>QUOTA EXHAUSTED — Wait for next batch or switch to DeepSeek / GLM</span>
+                    </>
+                  ) : p.quotaLimited ? (
+                    <>
+                      <Clock className="w-3.5 h-3.5 flex-shrink-0" />
+                      <span>BATCH QUOTA: Refills daily at 07:00 & 19:00 Beijing (UTC 23:00 & 11:00)</span>
+                    </>
+                  ) : (
+                    <>
+                      <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0" />
+                      <span>NO QUOTA LIMIT — Always available</span>
+                    </>
+                  )}
+                </div>
               )}
 
               <div className="space-y-2 text-xs font-mono text-slate-300">
@@ -177,8 +218,19 @@ export const Providers: React.FC<ProvidersProps> = ({
                 </div>
                 <div className="flex justify-between border-b border-slate-800/60 pb-1">
                   <span className="text-slate-500">Quota Remaining:</span>
-                  <span className="text-cyber-cyan font-bold">{p.quota}</span>
+                  <span className={`font-bold ${
+                    p.quotaExhausted ? 'text-red-400' : p.quotaLimited ? 'text-cyber-amber' : 'text-cyber-cyan'
+                  }`}>{p.quota}</span>
                 </div>
+                {p.quotaFallbackModel && (
+                  <div className="flex justify-between border-b border-slate-800/60 pb-1">
+                    <span className="text-slate-500 flex items-center space-x-1">
+                      <ArrowRightLeft className="w-3 h-3" />
+                      <span>Fallback:</span>
+                    </span>
+                    <span className="text-cyber-emerald font-bold">{p.quotaFallbackModel}</span>
+                  </div>
+                )}
                 <div className="flex justify-between">
                   <span className="text-slate-500">Fallback Priority:</span>
                   <span className="text-cyber-amber font-bold">Priority #{p.fallbackPriority}</span>

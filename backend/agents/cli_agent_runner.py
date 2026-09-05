@@ -296,7 +296,8 @@ class CLIAgentRunner:
             db.commit()
 
             # Generate final markdown report
-            report_generator.generate_final_report(challenge.id, db)
+            output_dir = getattr(challenge, 'working_directory', '') or 'reports'
+            report_generator.generate_readme(db=db, challenge_id=challenge.id, output_dir=output_dir)
 
             await ws_manager.broadcast({
                 "event": "RUN_COMPLETED",

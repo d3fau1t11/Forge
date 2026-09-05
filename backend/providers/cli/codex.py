@@ -132,7 +132,28 @@ class AgentRouterCodexProvider(BaseCLIProvider):
         clean_stdout = redact_secrets(raw_stdout, [api_key])
         clean_stderr = redact_secrets(raw_stderr, [api_key])
 
+        # Check for AgentRouter quota exhaustion (402)
+        if "402" in clean_stderr or "quota" in clean_stderr.lower() or "budget pool" in clean_stderr.lower():
+            return ProviderResponse(
+                provider_name=self.name,
+                model_name=model_to_use,
+                content="",
+                is_refusal=True,
+                refusal_reason=f"AgentRouter Quota Exhausted (402): {clean_stderr[:200]}"
+            )
+
+        # Check for authentication errors
+        if "401" in clean_stderr or "unauthorized" in clean_stderr.lower() or "unauthenticated" in clean_stderr.lower():
+            return ProviderResponse(
+                provider_name=self.name,
+                model_name=model_to_use,
+                content="",
+                is_refusal=True,
+                refusal_reason=f"AgentRouter Authentication Refusal (401): {clean_stderr[:200]}"
+            )
+
         if exit_code != 0 and not clean_stdout.strip():
+
             return ProviderResponse(
                 provider_name=self.name,
                 model_name=model_to_use,

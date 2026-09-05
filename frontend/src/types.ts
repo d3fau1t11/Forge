@@ -131,7 +131,7 @@ export interface TerminalLog {
 
 export interface ProviderInfo {
   name: string;
-  status: 'HEALTHY' | 'DEGRADED' | 'OFFLINE';
+  status: 'HEALTHY' | 'DEGRADED' | 'OFFLINE' | 'QUOTA_EXHAUSTED';
   model: string;
   transport: 'API' | 'CLI' | 'LOCAL';
   latency: string;
@@ -140,6 +140,10 @@ export interface ProviderInfo {
   lastError: string;
   fallbackPriority: number;
   routerNote?: string;
+  quotaLimited?: boolean;         // True if model is subject to AgentRouter batch quota
+  quotaExhausted?: boolean;       // True if current batch quota is exhausted (402)
+  quotaFallbackModel?: string;    // Always-available fallback model (e.g. deepseek-v4-flash)
+  nextBatchTime?: string;         // Next quota batch replenishment time
 }
 
 export interface CheckpointItem {

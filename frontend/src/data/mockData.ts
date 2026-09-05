@@ -479,26 +479,62 @@ export const INITIAL_PROVIDERS: ProviderInfo[] = [
   {
     name: 'AgentRouter (Claude Code)',
     status: 'HEALTHY',
-    model: 'Claude 3.5 Sonnet (CLI Mode)',
+    model: 'Claude Opus 5 / 4.8 (CLI Mode)',
     transport: 'CLI',
     latency: '890ms',
     requests: 0,
-    quota: '100% Available',
+    quota: 'Batch Quota (07:00 & 19:00 Beijing)',
     lastError: 'None',
     fallbackPriority: 5,
-    routerNote: 'CLI → AgentRouter wrapper for interactive command execution'
+    routerNote: 'CLI → AgentRouter wrapper. QUOTA LIMITED: Claude models use batch quotas released at Beijing 07:00 & 19:00 (UTC 23:00 & 11:00). Auto-falls back to DeepSeek when exhausted.',
+    quotaLimited: true,
+    quotaExhausted: false,
+    quotaFallbackModel: 'deepseek-v4-flash',
+    nextBatchTime: ''
   },
   {
-    name: 'AgentRouter (Codex)',
+    name: 'AgentRouter (Codex – GPT)',
     status: 'HEALTHY',
-    model: 'OpenAI Codex (CLI Mode)',
+    model: 'GPT-5.6 / GPT-5.6-SOL (CLI Mode)',
     transport: 'CLI',
     latency: '740ms',
     requests: 0,
-    quota: '100% Available',
+    quota: 'Batch Quota (07:00 & 19:00 Beijing)',
     lastError: 'None',
     fallbackPriority: 6,
-    routerNote: 'CLI → AgentRouter wrapper for binary/script patch execution'
+    routerNote: 'CLI → AgentRouter wrapper. QUOTA LIMITED: GPT models use batch quotas released at Beijing 07:00 & 19:00 (UTC 23:00 & 11:00). Auto-falls back to DeepSeek / GLM when exhausted.',
+    quotaLimited: true,
+    quotaExhausted: false,
+    quotaFallbackModel: 'deepseek-v4-flash',
+    nextBatchTime: ''
+  },
+  {
+    name: 'AgentRouter (Codex – DeepSeek)',
+    status: 'HEALTHY',
+    model: 'DeepSeek V4 Flash (CLI Mode)',
+    transport: 'CLI',
+    latency: '680ms',
+    requests: 0,
+    quota: '∞ Always Available',
+    lastError: 'None',
+    fallbackPriority: 7,
+    routerNote: 'CLI → AgentRouter wrapper. NO QUOTA LIMIT: DeepSeek models are always available, unaffected by batch quota system.',
+    quotaLimited: false,
+    quotaExhausted: false
+  },
+  {
+    name: 'AgentRouter (Codex – GLM)',
+    status: 'HEALTHY',
+    model: 'GLM-5.3 (CLI Mode)',
+    transport: 'CLI',
+    latency: '720ms',
+    requests: 0,
+    quota: '∞ Always Available',
+    lastError: 'None',
+    fallbackPriority: 8,
+    routerNote: 'CLI → AgentRouter wrapper. NO QUOTA LIMIT: GLM models are always available, unaffected by batch quota system.',
+    quotaLimited: false,
+    quotaExhausted: false
   }
 ];
 
