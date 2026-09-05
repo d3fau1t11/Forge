@@ -77,7 +77,7 @@ class AgentRouterCodexProvider(BaseCLIProvider):
             executable,
             "exec",
             "--model", model_to_use,
-            "--prompt", prompt
+            prompt
         ]
 
         start_time = time.time()

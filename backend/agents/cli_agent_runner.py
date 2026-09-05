@@ -167,7 +167,7 @@ class CLIAgentRunner:
                     executable,
                     "exec",
                     "--model", model_arg,
-                    "--prompt", initial_prompt
+                    initial_prompt
                 ]
 
             await ws_manager.broadcast({
@@ -269,11 +269,14 @@ class CLIAgentRunner:
 
                 finding = FindingModel(
                     challenge_id=challenge.id,
+                    agent=agent_type.lower(),
                     title=f"Flag Extracted via {binary_name.upper()}",
+                    description=f"Flag extracted by autonomous {binary_name} execution: {captured_flag}",
+                    vulnerability_class="Flag Extraction",
                     severity="CRITICAL",
                     endpoint=target,
-                    status="VERIFIED",
-                    description=f"Flag extracted by autonomous {binary_name} execution: {captured_flag}"
+                    verified=True,
+                    confidence=1.0
                 )
                 db.add(finding)
             else:
@@ -283,12 +286,11 @@ class CLIAgentRunner:
             # Store full session evidence
             evidence = EvidenceModel(
                 challenge_id=challenge.id,
-                agent_name=agent_type.upper(),
-                evidence_type="cli_autonomous_session",
+                agent=agent_type.lower(),
+                evidence_type="command_output",
                 source=binary_name,
-                description=f"Autonomous {binary_name} session output for {challenge.name}",
-                content_preview=full_output[:1000],
-                full_content_hash=f"sha256-{int(time.time())}"
+                content=f"### Autonomous {binary_name} Session Output\n\n{full_output[:10000]}",
+                confidence=1.0
             )
             db.add(evidence)
             db.commit()

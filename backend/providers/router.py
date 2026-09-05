@@ -13,14 +13,14 @@ class ModelRouter:
     """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
 
     DEFAULT_ROUTING_MAP = {
-        "recon": ["nvidia", "agentrouter", "openrouter", "gemini", "cloudflare", "mock"],
-        "directory_enumeration": ["nvidia", "agentrouter", "openrouter", "gemini", "cloudflare", "mock"],
-        "web_analysis": ["nvidia", "agentrouter", "openrouter", "gemini", "cloudflare", "mock"],
-        "code_analysis": ["nvidia", "agentrouter", "openrouter", "gemini", "cloudflare", "agentrouter_claude_code", "mock"],
-        "reverse_engineering": ["nvidia", "agentrouter", "openrouter", "gemini", "cloudflare", "agentrouter_claude_code", "mock"],
-        "fast_reasoning": ["nvidia", "agentrouter", "openrouter", "gemini", "cloudflare", "mock"],
-        "general_reasoning": ["nvidia", "agentrouter", "openrouter", "gemini", "cloudflare", "mock"],
-        "verification": ["nvidia", "agentrouter", "openrouter", "gemini", "cloudflare", "mock"]
+        "recon": ["nvidia", "agentrouter_codex", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
+        "directory_enumeration": ["nvidia", "agentrouter_codex", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
+        "web_analysis": ["nvidia", "agentrouter_claude_code", "agentrouter_codex", "openrouter", "gemini", "cloudflare", "mock"],
+        "code_analysis": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
+        "reverse_engineering": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
+        "fast_reasoning": ["agentrouter_codex", "nvidia", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
+        "general_reasoning": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
+        "verification": ["agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"]
     }
 
     # Model to Provider/CLI Transport Mapping

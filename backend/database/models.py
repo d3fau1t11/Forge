@@ -135,6 +135,8 @@ class FindingModel(Base):
     title = Column(String, nullable=False)
     description = Column(Text, default="")
     vulnerability_class = Column(String, default="recon")
+    severity = Column(String, default="HIGH")
+    endpoint = Column(String, default="")
     verified = Column(Boolean, default=False)
     confidence = Column(Float, default=0.5)
     created_at = Column(DateTime, default=datetime.utcnow)
