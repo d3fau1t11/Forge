@@ -36,6 +36,8 @@ logs/
 scratch/
 .serena/
 .agents/
+backend/knowledge/playbooks/**
+!backend/knowledge/playbooks/.gitkeep
 
 # Environment variables
 .env

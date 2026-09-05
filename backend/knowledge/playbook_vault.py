@@ -10,6 +10,29 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("forge.playbook_vault")
 
+
+def _broadcast_knowledge_event(event_type: str, playbook_id: str, category: str, extra: Dict = None):
+    """Fire-and-forget WebSocket broadcast for knowledge updates."""
+    try:
+        import asyncio
+        from backend.websocket.manager import ws_manager
+        payload = {
+            "event": "KNOWLEDGE_UPDATED",
+            "type": event_type,
+            "playbook_id": playbook_id,
+            "category": category,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        if extra:
+            payload.update(extra)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(ws_manager.broadcast(payload))
+        except RuntimeError:
+            pass  # No event loop running (CLI context) — skip WS broadcast
+    except Exception:
+        pass  # Non-critical — never break vault operations for WS
+
 PLAYBOOKS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "playbooks"))
 CATEGORIES = ["web", "pwn", "crypto", "reverse", "forensics", "osint", "auto_generated", "pending_review"]
 
@@ -89,6 +112,7 @@ class PlaybookVault:
 
         self._index_single_playbook(playbook)
         logger.info(f"Saved playbook `{playbook.id}` in `{target_dir}` (searchable={self._is_searchable(playbook)})")
+        _broadcast_knowledge_event("PLAYBOOK_SAVED", playbook.id, playbook.category)
         return file_path
 
     def _index_single_playbook(self, playbook: PlaybookSchema):
@@ -305,6 +329,10 @@ class PlaybookVault:
             logger.info(f"[Flywheel] Auto-promoting playbook `{pb.id}` to primary searchable vault! (uses={pb.times_used}, conf={pb.confidence_score})")
 
         self.save_playbook(pb)
+        _broadcast_knowledge_event(
+            "PLAYBOOK_STATS_UPDATED", pb.id, pb.category,
+            {"is_promoted": pb.is_promoted, "confidence": pb.confidence_score}
+        )
 
     async def ingest_writeup(self, text_or_markdown: str, category: str = "web", auto_approve: bool = False) -> Optional[PlaybookSchema]:
         """Ingestion pipeline: extract structured playbook from raw writeup text using fast provider tier."""

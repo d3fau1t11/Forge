@@ -34,6 +34,7 @@ import { TerminalView } from './components/Pages/TerminalView';
 import { Providers } from './components/Pages/Providers';
 import { SystemView } from './components/Pages/SystemView';
 import { ChallengeWorkspace } from './components/Pages/ChallengeWorkspace';
+import { KnowledgeCoverage } from './components/Pages/KnowledgeCoverage';
 import { apiService } from './services/api';
 import { AlertTriangle, X } from 'lucide-react';
 import { soundEngine } from './utils/soundEngine';
@@ -67,6 +68,7 @@ export default function App() {
   const [workflowNodes] = useState<WorkflowNode[]>(INITIAL_WORKFLOW_PIPELINE);
   const [packageRequests, setPackageRequests] = useState<PackageInstallRequest[]>([]);
   const [rootRequests, setRootRequests] = useState<RootPermissionRequest[]>([]);
+  const [knowledgeRefreshTrigger, setKnowledgeRefreshTrigger] = useState(0);
 
   useEffect(() => {
     fetchBackendData();
@@ -205,6 +207,8 @@ export default function App() {
             });
             try { soundEngine.playWarning(); } catch (e) {}
             setTimeout(() => setFallbackNotice(null), 8000);
+          } else if (data.event === 'KNOWLEDGE_UPDATED' || data.event === 'KNOWLEDGE_BULK_INGESTED') {
+            setKnowledgeRefreshTrigger((prev) => prev + 1);
           }
         } catch (err) {
           console.error('WS Parse Error', err);
@@ -574,6 +578,10 @@ export default function App() {
 
               {activeTab === 'playbooks' && (
                 <PlaybooksVault />
+              )}
+
+              {activeTab === 'knowledge' && (
+                <KnowledgeCoverage refreshTrigger={knowledgeRefreshTrigger} />
               )}
 
               {activeTab === 'evidence' && (

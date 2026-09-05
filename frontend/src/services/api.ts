@@ -538,6 +538,20 @@ export class ApiService {
     }
     return await res.json();
   }
+
+  // ----------------------------------------------------
+  // KNOWLEDGE COVERAGE
+  // ----------------------------------------------------
+
+  public async getKnowledgeCoverage() {
+    try {
+      const res = await fetch(`${API_BASE_URL}/knowledge/coverage`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return { grand_total: 0, categories: [] };
+    }
+  }
 }
 
 export const apiService = new ApiService();

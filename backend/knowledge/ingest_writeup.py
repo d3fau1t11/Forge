@@ -36,7 +36,10 @@ def parse_writeup_content(content: str, category: str = "web", title: Optional[s
 
     # Generate clean ID
     clean_title = re.sub(r'[^a-zA-Z0-9]+', '-', title.lower()).strip('-')
-    clean_id = f"{category.lower()}-{clean_title[:40]}"
+    # Append content hash to prevent ID collisions from truncated titles
+    import hashlib
+    content_hash = hashlib.md5(content[:500].encode("utf-8", errors="ignore")).hexdigest()[:6]
+    clean_id = f"{category.lower()}-{clean_title[:40]}-{content_hash}"
 
     # Extract code blocks
     code_blocks = re.findall(r"```(?:python|bash|sh|c|cpp|sql|html)?\n(.*?)```", content, re.DOTALL)

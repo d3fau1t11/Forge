@@ -1073,3 +1073,108 @@ def list_playbooks():
                 except Exception:
                     pass
     return {"count": len(all_pbs), "playbooks": all_pbs}
+
+
+# -------------------------------------------------------------------
+# KNOWLEDGE COVERAGE OBSERVABILITY
+# -------------------------------------------------------------------
+
+COVERAGE_CATEGORIES = [
+    "web", "pwn", "reverse", "crypto", "forensics",
+    "osint", "network", "mobile", "cloud", "hardware", "ai_llm", "misc"
+]
+
+CATEGORY_ALIASES = {
+    "web": "web", "pwn": "pwn", "binary": "pwn", "bof": "pwn",
+    "reverse": "reverse", "rev": "reverse", "reversing": "reverse",
+    "crypto": "crypto", "cryptography": "crypto",
+    "forensics": "forensics", "stego": "forensics", "steganography": "forensics", "memory": "forensics",
+    "osint": "osint", "recon": "osint",
+    "network": "network", "pcap": "network", "wireshark": "network",
+    "mobile": "mobile", "android": "mobile", "ios": "mobile",
+    "cloud": "cloud", "aws": "cloud", "azure": "cloud", "gcp": "cloud",
+    "hardware": "hardware", "iot": "hardware", "embedded": "hardware",
+    "ai_llm": "ai_llm", "ai": "ai_llm", "llm": "ai_llm", "ml": "ai_llm",
+    "misc": "misc", "auto_generated": "misc", "pending_review": "misc"
+}
+
+def _normalize_category(raw_cat: str) -> str:
+    return CATEGORY_ALIASES.get(raw_cat.lower().strip(), "misc")
+
+
+@router.get("/knowledge/coverage")
+def get_knowledge_coverage():
+    """Returns per-category coverage stats for the Knowledge Coverage observability view."""
+    import yaml as _yaml
+    from backend.knowledge.playbook_vault import playbook_vault
+
+    # Initialize empty stats for all 12 categories
+    stats = {}
+    for cat in COVERAGE_CATEGORIES:
+        stats[cat] = {
+            "category": cat,
+            "total": 0,
+            "by_source": {},
+            "by_confidence_tier": {"pending": 0, "low": 0, "trusted": 0},
+            "tags": {},  # tag -> count
+        }
+
+    # Scan all playbook YAML files
+    for root, _, files in os.walk(playbook_vault.base_dir):
+        for file in files:
+            if not (file.endswith(".yaml") or file.endswith(".yml")):
+                continue
+            file_path = os.path.join(root, file)
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = _yaml.safe_load(f)
+                if not isinstance(data, dict) or "id" not in data:
+                    continue
+
+                raw_cat = data.get("category", "misc")
+                cat = _normalize_category(raw_cat)
+                source = data.get("source", "ingested")
+                conf = float(data.get("confidence_score", 0.5))
+                tags = data.get("tags", [])
+
+                bucket = stats[cat]
+                bucket["total"] += 1
+
+                # Source breakdown
+                bucket["by_source"][source] = bucket["by_source"].get(source, 0) + 1
+
+                # Confidence tier
+                if conf < 0.5:
+                    bucket["by_confidence_tier"]["pending"] += 1
+                elif conf < 0.8:
+                    bucket["by_confidence_tier"]["low"] += 1
+                else:
+                    bucket["by_confidence_tier"]["trusted"] += 1
+
+                # Tag frequency
+                if isinstance(tags, list):
+                    for tag in tags:
+                        tag_str = str(tag).lower().strip()
+                        if tag_str:
+                            bucket["tags"][tag_str] = bucket["tags"].get(tag_str, 0) + 1
+            except Exception:
+                continue
+
+    # Build sorted response (lowest coverage first)
+    categories_list = sorted(stats.values(), key=lambda c: c["total"])
+
+    # Convert tag dicts to sorted lists for frontend
+    for cat_data in categories_list:
+        tag_dict = cat_data.pop("tags")
+        cat_data["distinct_tags"] = sorted(
+            [{"tag": t, "count": c} for t, c in tag_dict.items()],
+            key=lambda x: x["count"],
+            reverse=True
+        )
+
+    grand_total = sum(c["total"] for c in categories_list)
+
+    return {
+        "grand_total": grand_total,
+        "categories": categories_list
+    }
