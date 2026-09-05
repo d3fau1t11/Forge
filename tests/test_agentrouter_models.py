@@ -36,7 +36,8 @@ class TestAgentRouterModels(unittest.TestCase):
         res_dict = asyncio.run(run_tests())
         print("\n--- AGENTROUTER SPECIFIC MODEL TEST RESULTS ---")
         for m, status in res_dict.items():
-            print(f"Model [{m}]: {status}")
+            safe_status = status.encode('ascii', errors='backslashreplace').decode('ascii')
+            print(f"Model [{m}]: {safe_status}")
         print("-----------------------------------------------\n")
 
 if __name__ == "__main__":
