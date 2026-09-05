@@ -6,8 +6,8 @@ from backend.providers.base import BaseProvider, ProviderResponse
 logger = logging.getLogger("forge.providers")
 
 class HTTPBaseProvider(BaseProvider):
-    def __init__(self, name: str, is_paid: bool, api_key: str, default_model: str, base_url: str):
-        super().__init__(name=name, is_paid=is_paid)
+    def __init__(self, name: str, is_paid: bool, api_key: str, default_model: str, base_url: str, speed_tier: str = "fast"):
+        super().__init__(name=name, is_paid=is_paid, speed_tier=speed_tier)
         self.api_key = api_key.strip()
         self.default_model = default_model
         self.base_url = base_url.rstrip("/")
@@ -75,8 +75,8 @@ class GeminiProvider(HTTPBaseProvider):
 
 class OpenAISpecProvider(HTTPBaseProvider):
     """Generic Provider for OpenAI-compatible REST APIs (OpenRouter, NVIDIA NIM, Cerebras, AgentRouter, Groq, Mistral)."""
-    def __init__(self, name: str, is_paid: bool, api_key: str, default_model: str, base_url: str, extra_headers: Optional[Dict[str, str]] = None):
-        super().__init__(name=name, is_paid=is_paid, api_key=api_key, default_model=default_model, base_url=base_url)
+    def __init__(self, name: str, is_paid: bool, api_key: str, default_model: str, base_url: str, extra_headers: Optional[Dict[str, str]] = None, speed_tier: str = "fast"):
+        super().__init__(name=name, is_paid=is_paid, api_key=api_key, default_model=default_model, base_url=base_url, speed_tier=speed_tier)
         self.extra_headers = extra_headers or {}
 
     async def generate_response(

@@ -318,9 +318,13 @@ class CLIAgentRunner:
                     confidence=1.0
                 )
                 db.add(finding)
+            elif proc.returncode == 0:
+                challenge.status = "AWAITING_FLAG"
+                challenge.progress = 80
+                logger.info(f"[CLIAgentRunner] {binary_name} exited with code 0 but no flag was captured. Setting status to AWAITING_FLAG and cascading to Orchestrator...")
             else:
-                challenge.status = "COMPLETED" if proc.returncode == 0 else "FAILED"
-                challenge.progress = 80 if proc.returncode == 0 else 30
+                challenge.status = "FAILED"
+                challenge.progress = 30
 
             # Store full session evidence
             evidence = EvidenceModel(
@@ -334,17 +338,23 @@ class CLIAgentRunner:
             db.add(evidence)
             db.commit()
 
-            # Generate final markdown report
+            # Generate markdown report
             output_dir = getattr(challenge, 'working_directory', '') or 'reports'
             report_generator.generate_readme(db=db, challenge_id=challenge.id, output_dir=output_dir)
 
             await ws_manager.broadcast({
-                "event": "RUN_COMPLETED",
+                "event": "RUN_COMPLETED" if captured_flag else "RUN_AWAITING_FLAG",
                 "run_id": run_id,
                 "challenge_id": challenge_id,
                 "status": challenge.status,
                 "flag": captured_flag
             })
+
+            # If CLI agent finished clean (exit 0) but didn't extract flag, automatically cascade to orchestrator to continue hunting
+            if not captured_flag and proc.returncode == 0:
+                from backend.agents.orchestrator_loop import orchestrator_loop
+                await orchestrator_loop.run_autonomous_loop(run_id, challenge_id, target)
+                return
 
         except Exception as e:
             logger.error(f"Error in CLI agent loop: {e}", exc_info=True)

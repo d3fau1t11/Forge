@@ -15,9 +15,10 @@ class ProviderResponse(BaseModel):
     refusal_reason: Optional[str] = None
 
 class BaseProvider(ABC):
-    def __init__(self, name: str, is_paid: bool = False):
+    def __init__(self, name: str, is_paid: bool = False, speed_tier: str = "fast"):
         self.name = name
         self.is_paid = is_paid
+        self.speed_tier = speed_tier  # "fast" | "deep"
 
     @abstractmethod
     async def is_available(self) -> bool:

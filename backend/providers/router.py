@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from backend.config import settings
 from backend.providers.base import BaseProvider, ProviderResponse
@@ -23,7 +23,7 @@ async def _notify_fallback(failed_provider: str, reason: str, next_candidate: Op
                 "failed_provider": failed_provider,
                 "reason": str(reason)[:160],
                 "next_provider": next_candidate or "Next available candidate",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         })
     except Exception as e:
@@ -82,7 +82,8 @@ class ModelRouter:
                 api_key=rapidapi_key,
                 default_model="GPT-5.5",
                 base_url="https://gpt-5-5.p.rapidapi.com",
-                extra_headers={"x-rapidapi-host": "gpt-5-5.p.rapidapi.com", "x-rapidapi-key": rapidapi_key}
+                extra_headers={"x-rapidapi-host": "gpt-5-5.p.rapidapi.com", "x-rapidapi-key": rapidapi_key},
+                speed_tier="deep"
             ))
             self.register_provider("rapidapi_gpt54_mini", OpenAISpecProvider(
                 name="rapidapi_gpt54_mini",
@@ -90,7 +91,8 @@ class ModelRouter:
                 api_key=rapidapi_key,
                 default_model="gpt-5.4-mini",
                 base_url="https://gpt-5-4-mini.p.rapidapi.com",
-                extra_headers={"x-rapidapi-host": "gpt-5-4-mini.p.rapidapi.com", "x-rapidapi-key": rapidapi_key}
+                extra_headers={"x-rapidapi-host": "gpt-5-4-mini.p.rapidapi.com", "x-rapidapi-key": rapidapi_key},
+                speed_tier="fast"
             ))
             self.register_provider("rapidapi_deepseek_v32", OpenAISpecProvider(
                 name="rapidapi_deepseek_v32",
@@ -98,7 +100,8 @@ class ModelRouter:
                 api_key=rapidapi_key,
                 default_model="DeepSeek-V3.2",
                 base_url="https://deepseek-v31.p.rapidapi.com/",
-                extra_headers={"x-rapidapi-host": "deepseek-v31.p.rapidapi.com", "x-rapidapi-key": rapidapi_key}
+                extra_headers={"x-rapidapi-host": "deepseek-v31.p.rapidapi.com", "x-rapidapi-key": rapidapi_key},
+                speed_tier="fast"
             ))
             self.register_provider("rapidapi_gpt5_nano", OpenAISpecProvider(
                 name="rapidapi_gpt5_nano",
@@ -106,7 +109,8 @@ class ModelRouter:
                 api_key=rapidapi_key,
                 default_model="GPT-5-nano",
                 base_url="https://gpt-5-nano.p.rapidapi.com",
-                extra_headers={"x-rapidapi-host": "gpt-5-nano.p.rapidapi.com", "x-rapidapi-key": rapidapi_key}
+                extra_headers={"x-rapidapi-host": "gpt-5-nano.p.rapidapi.com", "x-rapidapi-key": rapidapi_key},
+                speed_tier="fast"
             ))
         if settings.GEMINI_API_KEY:
             self.register_provider("gemini", GeminiProvider(api_key=settings.GEMINI_API_KEY))
@@ -193,6 +197,7 @@ class ModelRouter:
         capability: str = "general_reasoning",
         system_instruction: Optional[str] = None,
         target_model: Optional[str] = None,
+        speed_tier: Optional[str] = None,
         **kwargs
     ) -> ProviderResponse:
 
@@ -253,7 +258,11 @@ class ModelRouter:
 
         # 2. Capability Candidates Fallback Chain
         skip_quota_limited = quota_manager.should_skip_quota_limited_models()
-        candidates = self.DEFAULT_ROUTING_MAP.get(capability, ["cloudflare", "openrouter", "gemini", "mock"])
+        candidates = list(self.DEFAULT_ROUTING_MAP.get(capability, ["cloudflare", "openrouter", "gemini", "mock"]))
+
+        if speed_tier:
+            # Sort providers matching requested speed_tier first
+            candidates.sort(key=lambda p_name: 0 if getattr(self.providers.get(p_name), "speed_tier", "fast") == speed_tier else 1)
 
         for provider_name in candidates:
             provider = self.providers.get(provider_name)

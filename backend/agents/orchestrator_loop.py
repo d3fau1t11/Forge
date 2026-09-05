@@ -20,6 +20,9 @@ from backend.database.models import RunModel, ChallengeModel, TargetProfileModel
 from backend.websocket.manager import ws_manager
 from backend.api.runner import workflow_runner
 from backend.reporting.generator import report_generator
+from backend.knowledge.playbook_vault import playbook_vault
+from backend.recon.turbo_recon import turbo_recon
+from backend.agents.stream_condenser import stream_condenser
 
 logger = logging.getLogger("forge.orchestrator")
 
@@ -140,6 +143,29 @@ class AutonomousOrchestrator:
                     "loop_warning": state_memory["repetition_warnings"] > 0
                 }, indent=2)
 
+                # Fetch matching playbooks from Playbook Vault for few-shot guidance
+                playbook_context = ""
+                try:
+                    matching_pbs = playbook_vault.search_playbooks(
+                        f"{challenge.name} {challenge.category} {target}",
+                        category=challenge.category,
+                        top_k=2
+                    )
+                    if matching_pbs:
+                        pb_snippets = []
+                        for pb in matching_pbs:
+                            pb_snippets.append(f"### Playbook: {pb.id} ({pb.category})\nTags: {', '.join(pb.tags)}\nTemplate:\n{pb.exploit_template[:400]}")
+                        playbook_context = "\n\n--- FEW-SHOT CTF EXPLOIT PLAYBOOKS ---\n" + "\n\n".join(pb_snippets)
+                except Exception as pb_err:
+                    logger.debug(f"Playbook vault retrieval skip: {pb_err}")
+
+                # Fetch pre-warmed turbo recon on initial turn
+                turbo_recon_context = ""
+                if turn == 1:
+                    cached_recon = turbo_recon.get_cached_recon(challenge_id)
+                    if cached_recon and cached_recon.get("raw_summary"):
+                        turbo_recon_context = f"\n\n--- PRE-WARMED TURBO RECON (INSTANT) ---\n{cached_recon['raw_summary']}"
+
                 # Construct transparent ReAct System Prompt with Python Execution Mode & OS Context
                 system_instruction = (
                     f"You are FORGE Autonomous CTF Pentest Agent running on {os_distro}.\n"
@@ -150,12 +176,14 @@ class AutonomousOrchestrator:
                     f"Installed Pentest Tools & Python Libraries: {tools_str}, python3, {py_libs_str}\n\n"
                     f"ACTION SELECTION MODES:\n"
                     f"Mode A (CLI Command): Output a SINGLE executable bash/shell command line.\n"
-                    f"Mode B (Python Solver Script): Output a complete Python script inside ```python ... ``` blocks. FORGE will save it to `solve.py` and run `{sys.executable} solve.py` automatically.\n\n"
+                    f"Mode B (Python Solver Script): Output a complete Python script inside ```python ... ``` blocks. FORGE will save it to `solve.py` and run `{sys.executable} solve.py` automatically.\n"
+                    f"Mode C (Structured Completion): Output JSON {{\"action\": \"complete\", \"flag\": \"<flag>\", \"proof\": \"<explanation>\"}} if solve is verified.\n\n"
                     f"STRICT RULES:\n"
-                    f"1. Output ONLY the bash command line OR the ```python ... ``` solver script block. No surrounding conversation or Markdown headers.\n"
+                    f"1. Output ONLY the bash command line, the ```python ... ``` solver script block, or structured completion JSON.\n"
                     f"2. If you discover the real flag (e.g. picoCTF{{...}}, FLAG{{...}}, HTB{{...}}), reply EXACTLY: FLAG: <captured_flag>\n"
-                    f"3. If mission is complete without flag, reply: DONE\n"
+                    f"3. If mission is complete, provide the verified flag or exact solve payload.\n"
                     f"4. Multi-target inputs are joined using '+' sign. Process targets accordingly."
+                    f"{playbook_context}"
                 )
 
                 history_context = "\n".join(history_summary[-6:]) if history_summary else "No commands executed yet."
@@ -172,19 +200,22 @@ class AutonomousOrchestrator:
                     )
 
                 prompt = (
-                    f"--- STRUCTURED TARGET MEMORY STATE ---\n{memory_json}\n\n"
+                    f"--- STRUCTURED TARGET MEMORY STATE ---\n{memory_json}\n"
+                    f"{turbo_recon_context}\n"
                     f"--- RECENT STEP HISTORY ---\n{history_context}\n"
                     f"{repetition_warning_prompt}\n"
                     f"--- CURRENT TURN #{turn} ---\n"
-                    f"Analyze the target memory and step history. Issue the NEXT single command OR Python solver script to execute on '{target}'."
+                    f"Analyze the target memory, turbo recon, and step history. Issue the NEXT single command OR Python solver script to execute on '{target}'."
                 )
 
-                # Query AI Router
+                # Query AI Router with Speed-Tiered Routing
                 capability = "code_analysis" if state_memory["repetition_warnings"] > 0 else ("general_reasoning" if turn == 1 else "web_testing")
+                speed_tier = "deep" if challenge.category in ["reverse", "pwn", "crypto"] and turn > 5 else "fast"
                 llm_response = await model_router.route_request(
                     prompt=prompt,
                     capability=capability,
-                    system_instruction=system_instruction
+                    system_instruction=system_instruction,
+                    speed_tier=speed_tier
                 )
 
                 raw_ai_output = (llm_response.content or "").strip()
@@ -214,15 +245,48 @@ class AutonomousOrchestrator:
                     "confidence": 95
                 })
 
+                # Check if model emitted structured completion JSON: {"action": "complete", ...}
+                try:
+                    if "{" in raw_ai_output and "}" in raw_ai_output:
+                        json_match = re.search(r"\{.*\}", raw_ai_output, re.DOTALL)
+                        if json_match:
+                            parsed_action = json.loads(json_match.group(0))
+                            if isinstance(parsed_action, dict) and parsed_action.get("action") == "complete":
+                                cand_flag = parsed_action.get("flag", "")
+                                cand_proof = parsed_action.get("proof", "")
+                                found_in_json = re.findall(r"(?:picoCTF|FORGE|CTF|HTB|FLAG|THM)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}", f"{cand_flag} {cand_proof}", re.IGNORECASE)
+                                if found_in_json:
+                                    flag_str = found_in_json[0]
+                                    await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} Agent Structured Solve (Proof: {cand_proof[:100]})", history_summary)
+                                    break
+                                elif cand_proof and len(cand_proof) > 20:
+                                    # Verified proof of exploit completion
+                                    challenge.status = "COMPLETED"
+                                    challenge.progress = 100
+                                    if run:
+                                        run.status = "COMPLETED"
+                                    db.commit()
+                                    report_generator.generate_readme(db, challenge_id)
+                                    await ws_manager.broadcast({
+                                        "event": "RUN_COMPLETED",
+                                        "challenge_id": challenge_id,
+                                        "run_id": run_id,
+                                        "status": "COMPLETED",
+                                        "proof": cand_proof
+                                    })
+                                    break
+                except Exception:
+                    pass
+
                 # Check if model returned Flag directly in response
-                direct_flags = re.findall(r"(?:picoCTF|FORGE|CTF|HTB|FLAG)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}", raw_ai_output, re.IGNORECASE)
+                direct_flags = re.findall(r"(?:picoCTF|FORGE|CTF|HTB|FLAG|THM)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}", raw_ai_output, re.IGNORECASE)
                 if direct_flags or raw_ai_output.startswith("FLAG:"):
                     flag_str = direct_flags[0] if direct_flags else raw_ai_output.replace("FLAG:", "").strip()
-                    await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} AI Reasoning")
+                    await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} AI Reasoning", history_summary)
                     break
 
                 if raw_ai_output.upper() == "DONE":
-                    logger.info(f"AI declared mission completed on turn #{turn}.")
+                    logger.info(f"AI declared mission completed without explicit flag on turn #{turn}.")
                     break
 
                 # Extract Python script block OR single CLI command line
@@ -427,8 +491,9 @@ class AutonomousOrchestrator:
                     "timestamp": datetime.utcnow().strftime("%H:%M:%S")
                 })
 
-                # Append to history summary for next turn
-                history_summary.append(f"Turn #{turn} Command: `{cmd_line}`\nOutput snippet:\n{log_output[:400]}")
+                # Distill output via Stream Condenser for history summary & prompt context
+                condensed_output = stream_condenser.condense_output(tool_res.tool_name, stdout_text or log_output)
+                history_summary.append(f"Turn #{turn} Command: `{cmd_line}`\nOutput snippet:\n{condensed_output[:600]}")
 
                 # Save Evidence
                 ev = EvidenceModel(
@@ -444,10 +509,10 @@ class AutonomousOrchestrator:
 
                 # Check for REAL Flag pattern in STDOUT/STDERR
                 combined_output = f"{stdout_text}\n{stderr_text}"
-                found_flags = re.findall(r"(?:picoCTF|FORGE|CTF|HTB|FLAG)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}", combined_output, re.IGNORECASE)
+                found_flags = re.findall(r"(?:picoCTF|FORGE|CTF|HTB|FLAG|THM)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}", combined_output, re.IGNORECASE)
                 if found_flags:
                     flag_str = found_flags[0]
-                    await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} Tool `{cmd_line}` Output")
+                    await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} Tool `{cmd_line}` Output", history_summary)
                     break
 
                 # State Checkpoint
@@ -463,7 +528,6 @@ class AutonomousOrchestrator:
             except Exception as e:
                 import traceback
                 logger.error(f"Error during turn #{turn} of run {run_id}: {str(e)}\n{traceback.format_exc()}")
-                # Append error to challenge log for visibility
                 try:
                     logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
                     ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
@@ -476,32 +540,52 @@ class AutonomousOrchestrator:
 
             await asyncio.sleep(2.0)
 
-        # Mark Run & Challenge Completed
+        # Check Final State: Dual-Gated Strict Completion Rule
         db: Session = SessionLocal()
         try:
             run = db.query(RunModel).filter(RunModel.id == run_id).first()
             challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
-            if run:
-                run.status = "COMPLETED"
             if challenge:
-                challenge.status = "COMPLETED"
-                challenge.progress = 100
-                report_generator.generate_readme(db, challenge_id)
+                if challenge.flag_status == "CAPTURED" or challenge.status == "COMPLETED":
+                    challenge.status = "COMPLETED"
+                    challenge.progress = 100
+                    if run:
+                        run.status = "COMPLETED"
+                    output_dir = getattr(challenge, 'working_directory', '') or 'reports'
+                    report_generator.generate_readme(db, challenge_id, output_dir=output_dir)
+                    await ws_manager.broadcast({
+                        "event": "RUN_COMPLETED",
+                        "challenge_id": challenge_id,
+                        "run_id": run_id,
+                        "status": "COMPLETED",
+                        "flag": challenge.flag
+                    })
+                else:
+                    # Turn cycle completed WITHOUT capturing a flag -> AWAITING_FLAG (NEVER COMPLETED)
+                    challenge.status = "AWAITING_FLAG"
+                    challenge.progress = min(challenge.progress, 80)
+                    if run:
+                        run.status = "AWAITING_FLAG"
+                    logger.info(f"[Orchestrator] Run completed cycle without flag match. Setting status to AWAITING_FLAG.")
+                    await ws_manager.broadcast({
+                        "event": "RUN_AWAITING_FLAG",
+                        "challenge_id": challenge_id,
+                        "run_id": run_id,
+                        "status": "AWAITING_FLAG",
+                        "message": "Turn cycle finished without flag match. Ready for operator review or next attack vector."
+                    })
             db.commit()
-
-            await ws_manager.broadcast({
-                "event": "RUN_COMPLETED",
-                "challenge_id": challenge_id,
-                "run_id": run_id
-            })
         finally:
             db.close()
 
-    async def _record_flag_capture(self, db: Session, challenge, run, challenge_id: str, run_id: str, flag_str: str, source: str):
-        """Helper to record flag capture and broadcast websocket event."""
+    async def _record_flag_capture(self, db: Session, challenge, run, challenge_id: str, run_id: str, flag_str: str, source: str, history_summary: Optional[list] = None):
+        """Helper to record flag capture, mark challenge COMPLETED, and trigger Self-Learning Flywheel."""
         challenge.flag_status = "CAPTURED"
         challenge.flag = flag_str
+        challenge.status = "COMPLETED"
         challenge.progress = 100
+        if run:
+            run.status = "COMPLETED"
         db.commit()
 
         finding = FindingModel(
@@ -516,6 +600,25 @@ class AutonomousOrchestrator:
         )
         db.add(finding)
         db.commit()
+
+        # Generate markdown report
+        output_dir = getattr(challenge, 'working_directory', '') or 'reports'
+        report_generator.generate_readme(db, challenge_id, output_dir=output_dir)
+
+        # Trigger Self-Learning Flywheel Synthesis in Background
+        try:
+            winning_cmds = list(history_summary or [])
+            playbook_vault.synthesize_from_run(
+                challenge_id=challenge_id,
+                challenge_title=challenge.name,
+                category=challenge.category,
+                target_endpoint=getattr(challenge, "target", "") or source,
+                winning_payload=source,
+                winning_commands=winning_cmds,
+                flag=flag_str
+            )
+        except Exception as flywheel_err:
+            logger.debug(f"[Flywheel] Background synthesis skip: {flywheel_err}")
 
         await ws_manager.broadcast({
             "event": "FLAG_CAPTURED",

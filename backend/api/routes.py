@@ -209,6 +209,11 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
     db.commit()
     db.refresh(run)
 
+    # Phase 3 Turbo Recon: Pre-warm recon in background immediately
+    from backend.recon.turbo_recon import turbo_recon
+    if resolved_target:
+        asyncio.create_task(turbo_recon.start_turbo_recon(challenge.id, resolved_target, category.lower()))
+
     workflow_runner.start_run(run.id, challenge.id, resolved_target)
 
     # Initialize Challenge Dedicated Log File
@@ -996,3 +1001,58 @@ def get_agentrouter_quota_status():
     """
     return model_router.get_quota_status()
 
+# ----------------------------------------------------
+# PLAYBOOK VAULT (Phase 2)
+# ----------------------------------------------------
+
+class IngestWriteupRequest(BaseModel):
+    text: str
+    category: str = "web"
+    auto_approve: bool = False
+
+class SearchPlaybooksRequest(BaseModel):
+    query: str
+    category: Optional[str] = None
+    top_k: int = 5
+    include_unpromoted: bool = False
+
+@router.post("/playbooks/ingest")
+async def ingest_writeup(req: IngestWriteupRequest):
+    """Ingest a CTF write-up and extract structured playbook using the fast model tier."""
+    from backend.knowledge.playbook_vault import playbook_vault
+    if not req.text or len(req.text.strip()) < 20:
+        raise HTTPException(status_code=400, detail="Write-up text is too short to extract a playbook.")
+    pb = await playbook_vault.ingest_writeup(req.text, req.category, req.auto_approve)
+    if pb:
+        return {"status": "INGESTED", "playbook_id": pb.id, "category": pb.category, "tags": pb.tags, "is_promoted": pb.is_promoted}
+    raise HTTPException(status_code=500, detail="Failed to extract playbook from write-up.")
+
+@router.post("/playbooks/search")
+def search_playbooks(req: SearchPlaybooksRequest):
+    """Search the Playbook Vault using FTS5 index."""
+    from backend.knowledge.playbook_vault import playbook_vault
+    results = playbook_vault.search_playbooks(req.query, req.category, req.top_k, req.include_unpromoted)
+    return {
+        "query": req.query,
+        "count": len(results),
+        "playbooks": [pb.model_dump() for pb in results]
+    }
+
+@router.get("/playbooks")
+def list_playbooks():
+    """List all indexed playbooks from the vault."""
+    from backend.knowledge.playbook_vault import playbook_vault
+    playbook_vault.reload_index()
+    all_pbs = []
+    import yaml
+    for root, _, files in os.walk(playbook_vault.base_dir):
+        for file in files:
+            if file.endswith(".yaml") or file.endswith(".yml"):
+                try:
+                    with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+                        data = yaml.safe_load(f)
+                        if isinstance(data, dict) and "id" in data:
+                            all_pbs.append(data)
+                except Exception:
+                    pass
+    return {"count": len(all_pbs), "playbooks": all_pbs}
