@@ -1008,7 +1008,9 @@ def get_agentrouter_quota_status():
 class IngestWriteupRequest(BaseModel):
     text: str
     category: str = "web"
-    auto_approve: bool = False
+    source_type: str = "raw_text"  # "url", "raw_text", or "file"
+    title: Optional[str] = None
+    auto_approve: bool = True
 
 class SearchPlaybooksRequest(BaseModel):
     query: str
@@ -1018,14 +1020,29 @@ class SearchPlaybooksRequest(BaseModel):
 
 @router.post("/playbooks/ingest")
 async def ingest_writeup(req: IngestWriteupRequest):
-    """Ingest a CTF write-up and extract structured playbook using the fast model tier."""
-    from backend.knowledge.playbook_vault import playbook_vault
-    if not req.text or len(req.text.strip()) < 20:
-        raise HTTPException(status_code=400, detail="Write-up text is too short to extract a playbook.")
-    pb = await playbook_vault.ingest_writeup(req.text, req.category, req.auto_approve)
-    if pb:
-        return {"status": "INGESTED", "playbook_id": pb.id, "category": pb.category, "tags": pb.tags, "is_promoted": pb.is_promoted}
-    raise HTTPException(status_code=500, detail="Failed to extract playbook from write-up.")
+    """Ingest a CTF writeup (from URL, raw text, or markdown file) into the Playbook Vault."""
+    from backend.knowledge.ingest_writeup import ingest_url, ingest_raw_text
+    
+    if not req.text or len(req.text.strip()) < 5:
+        raise HTTPException(status_code=400, detail="Source text or URL is required.")
+        
+    source_str = req.text.strip()
+    if req.source_type == "url" or source_str.startswith("http://") or source_str.startswith("https://"):
+        try:
+            pb = ingest_url(source_str, category=req.category, title=req.title)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch and parse URL: {str(e)}")
+    else:
+        pb = ingest_raw_text(source_str, category=req.category, title=req.title)
+        
+    return {
+        "status": "INGESTED",
+        "playbook_id": pb.id,
+        "category": pb.category,
+        "tags": pb.tags,
+        "is_promoted": pb.is_promoted,
+        "playbook": pb.model_dump()
+    }
 
 @router.post("/playbooks/search")
 def search_playbooks(req: SearchPlaybooksRequest):

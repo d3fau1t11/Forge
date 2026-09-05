@@ -28,6 +28,7 @@ import { Targets } from './components/Pages/Targets';
 import { Agents } from './components/Pages/Agents';
 import { Tools } from './components/Pages/Tools';
 import { AiIntelligence } from './components/Pages/AiIntelligence';
+import { PlaybooksVault } from './components/Pages/PlaybooksVault';
 import { Evidence } from './components/Pages/Evidence';
 import { TerminalView } from './components/Pages/TerminalView';
 import { Providers } from './components/Pages/Providers';
@@ -569,6 +570,10 @@ export default function App() {
 
               {activeTab === 'ai_intelligence' && (
                 <AiIntelligence decisions={decisions} routes={routes} />
+              )}
+
+              {activeTab === 'playbooks' && (
+                <PlaybooksVault />
               )}
 
               {activeTab === 'evidence' && (

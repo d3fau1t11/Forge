@@ -492,6 +492,52 @@ export class ApiService {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
+
+  // ----------------------------------------------------
+  // PLAYBOOK VAULT
+  // ----------------------------------------------------
+
+  public async getPlaybooks() {
+    try {
+      const res = await fetch(`${API_BASE_URL}/playbooks`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return { count: 0, playbooks: [] };
+    }
+  }
+
+  public async searchPlaybooks(query: string, category?: string) {
+    try {
+      const res = await fetch(`${API_BASE_URL}/playbooks/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, category, top_k: 10, include_unpromoted: true })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return { query, count: 0, playbooks: [] };
+    }
+  }
+
+  public async ingestPlaybook(data: {
+    text: string;
+    category?: string;
+    source_type?: string;
+    title?: string;
+  }) {
+    const res = await fetch(`${API_BASE_URL}/playbooks/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw { response: { data: errBody } };
+    }
+    return await res.json();
+  }
 }
 
 export const apiService = new ApiService();

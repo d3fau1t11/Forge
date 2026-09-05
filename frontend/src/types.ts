@@ -5,6 +5,7 @@ export type NavTab =
   | 'agents' 
   | 'tools' 
   | 'ai_intelligence' 
+  | 'playbooks'
   | 'evidence' 
   | 'terminal' 
   | 'providers' 
