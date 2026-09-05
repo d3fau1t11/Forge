@@ -146,14 +146,8 @@ class ModelRouter:
                 api_key=settings.CLOUDFLARE_API_TOKEN,
                 account_id=settings.CLOUDFLARE_ACCOUNT_ID
             ))
-        if settings.AGENTROUTER_API_KEY:
-            self.register_provider("agentrouter", OpenAISpecProvider(
-                name="agentrouter",
-                is_paid=True,
-                api_key=settings.AGENTROUTER_API_KEY,
-                default_model="deepseek-v4-flash",
-                base_url="https://agentrouter.org/v1"
-            ))
+        # Note: Direct HTTP REST calls to agentrouter.org/v1 return 401 Unauthorized Client.
+        # AgentRouter access is strictly mediated via terminal CLI tools (agentrouter_claude_code & agentrouter_codex).
 
     def register_provider(self, name: str, provider: BaseProvider):
         self.providers[name.lower()] = provider

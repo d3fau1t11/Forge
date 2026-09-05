@@ -4,7 +4,7 @@ import os
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 from backend.config import settings
-from backend.providers.real_providers import OpenAISpecProvider
+from backend.providers.router import model_router
 
 class TestAgentRouterModels(unittest.TestCase):
 
@@ -13,7 +13,7 @@ class TestAgentRouterModels(unittest.TestCase):
             self.skipTest("No AGENTROUTER_API_KEY configured")
 
         models_to_test = [
-            "claude-opus-4.8",
+            "claude-opus-4-8",
             "claude-opus-5",
             "deepseek-v4-flash",
             "glm-5.3",
@@ -23,19 +23,12 @@ class TestAgentRouterModels(unittest.TestCase):
         async def run_tests():
             results = {}
             for model in models_to_test:
-                provider = OpenAISpecProvider(
-                    name="agentrouter",
-                    is_paid=True,
-                    api_key=settings.AGENTROUTER_API_KEY,
-                    default_model=model,
-                    base_url="https://agentrouter.org/v1"
-                )
                 try:
-                    res = await provider.generate_response("Say hello", model=model)
+                    res = await model_router.route_request("Say hello", capability="general_reasoning", target_model=model)
                     if res.is_refusal:
                         results[model] = f"REFUSAL: {res.refusal_reason}"
                     else:
-                        results[model] = f"SUCCESS: {res.content[:50]}"
+                        results[model] = f"SUCCESS ({res.provider_name}): {res.content[:50]}"
                 except Exception as e:
                     results[model] = f"ERROR: {str(e)}"
             return results
