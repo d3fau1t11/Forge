@@ -32,8 +32,8 @@ class AgentRouterClaudeCodeProvider(BaseCLIProvider):
             key = getattr(settings, env_var_name, None) or os.environ.get(env_var_name)
             if key and key.strip():
                 return key.strip()
-        # Fallback to general AGENTROUTER_API_KEY if model-specific key is unconfigured
-        return settings.AGENTROUTER_API_KEY or os.environ.get("AGENTROUTER_API_KEY")
+        # Fallback to AGENTROUTER_CLAUDE_OPUS_5_KEY or general AGENTROUTER_API_KEY
+        return getattr(settings, "AGENTROUTER_CLAUDE_OPUS_5_KEY", None) or settings.AGENTROUTER_API_KEY or os.environ.get("AGENTROUTER_API_KEY")
 
     async def generate_response(
         self,
