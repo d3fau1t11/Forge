@@ -21,6 +21,7 @@ try:
         
         # API Keys & Per-Model AgentRouter Keys
         GEMINI_API_KEY: str = ""
+        GEMINI_API_KEYS: str = ""
         NVIDIA_API_KEY: str = ""
         CEREBRAS_API_KEY: str = ""
         OPENROUTER_API_KEY: str = ""
@@ -31,6 +32,7 @@ try:
         MISTRAL_API_KEY: str = ""
         COHERE_API_KEY: str = ""
         GROQ_API_KEY: str = ""
+        GROQ_API_KEYS: str = ""
         RAPIDAPI_KEY: str = ""
 
         # AgentRouter Per-Model Keys

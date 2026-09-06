@@ -100,6 +100,7 @@ export class ApiService {
     target_address: string;
     working_directory?: string;
     platform_name?: string;
+    requires_root?: boolean;
   }) {
     const res = await fetch(`${API_BASE_URL}/challenges`, {
       method: 'POST',

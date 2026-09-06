@@ -69,6 +69,11 @@ def init_db():
             except Exception:
                 pass
             try:
+                conn.execute(text("ALTER TABLE challenges ADD COLUMN requires_root BOOLEAN DEFAULT 0"))
+                conn.commit()
+            except Exception:
+                pass
+            try:
                 conn.execute(text("ALTER TABLE findings ADD COLUMN severity VARCHAR DEFAULT 'HIGH'"))
                 conn.commit()
             except Exception:

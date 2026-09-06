@@ -287,7 +287,7 @@ class StrategicPlanner:
         logger.info(f"Generating pre-flight mission plan for challenge {challenge_id} ({challenge_name})")
 
         prompt = (
-            f"You are the Lead Cyber Operations Planner for the FORGE Autonomous CTF Framework.\n"
+            f"You are the Lead Security Analysis Planner for an authorized educational CTF lab challenge.\n"
             f"Create an actionable, tactical pre-flight Mission Todo List for the following target:\n\n"
             f"Challenge: {challenge_name}\n"
             f"Category: {category}\n"
@@ -299,7 +299,7 @@ class StrategicPlanner:
             f"OUTPUT REQUIREMENTS:\n"
             f"Return a strict JSON object with the following schema:\n"
             f"{{\n"
-            f'  "summary": "1-sentence high-level attack vector strategy",\n'
+            f'  "summary": "1-sentence high-level analysis strategy",\n'
             f'  "tasks": [\n'
             f'    {{\n'
             f'      "id": "task-1",\n'
@@ -316,13 +316,13 @@ class StrategicPlanner:
 
         model_used = "model_router"
         tasks: List[Dict[str, Any]] = []
-        summary = f"Autonomous {category} penetration test and flag discovery on {target}"
+        summary = f"Autonomous {category} security analysis and flag discovery on {target}"
 
         try:
             llm_response = await model_router.route_request(
                 prompt=prompt,
                 capability="general_reasoning",
-                system_instruction="You are an expert offensive security operations planner. Always output valid JSON only.",
+                system_instruction="You are an expert security analysis and CTF lab planner. Always output valid JSON only.",
                 speed_tier="fast"
             )
             raw_output = (llm_response.content or "").strip()

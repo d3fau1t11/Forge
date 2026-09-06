@@ -31,7 +31,14 @@ class HTTPBaseProvider(BaseProvider):
             return res.json()
 
 class GeminiProvider(HTTPBaseProvider):
-    def __init__(self, api_key: str = ""):
+    SAFETY_SETTINGS = [
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"}
+    ]
+
+    def __init__(self, api_key: str = "", api_keys: Optional[list] = None):
         super().__init__(
             name="gemini",
             is_paid=True,
@@ -39,6 +46,29 @@ class GeminiProvider(HTTPBaseProvider):
             default_model="gemini-3.6-flash",
             base_url="https://generativelanguage.googleapis.com/v1beta/models"
         )
+        # Initialize key pool (split comma-separated or list)
+        keys_pool = []
+        if api_keys:
+            keys_pool.extend([k.strip() for k in api_keys if k and k.strip()])
+        if api_key and api_key.strip() not in keys_pool:
+            keys_pool.insert(0, api_key.strip())
+        self.api_keys = list(dict.fromkeys(keys_pool))
+        self.current_key_idx = 0
+        if self.api_keys:
+            self.api_key = self.api_keys[0]
+
+    def _rotate_key(self) -> str:
+        """Rotates to the next available API key in the pool."""
+        if not self.api_keys:
+            return self.api_key
+        prev_idx = self.current_key_idx
+        self.current_key_idx = (self.current_key_idx + 1) % len(self.api_keys)
+        self.api_key = self.api_keys[self.current_key_idx]
+        logger.warning(f"[GEMINI KEY ROTATION] Quota exhausted on key #{prev_idx + 1}. Rotated to key #{self.current_key_idx + 1} of {len(self.api_keys)}.")
+        return self.api_key
+
+    async def is_available(self) -> bool:
+        return bool(self.api_keys or self.api_key)
 
     async def generate_response(
         self, prompt: str, system_instruction: Optional[str] = None, capability: str = "general_reasoning", model: Optional[str] = None, **kwargs
@@ -47,37 +77,78 @@ class GeminiProvider(HTTPBaseProvider):
         if not await self.is_available():
             return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="API Key unconfigured")
 
-        url = f"{self.base_url}/{model_to_use}:generateContent?key={self.api_key}"
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}]
+            "contents": [{"parts": [{"text": prompt}]}],
+            "safetySettings": self.SAFETY_SETTINGS
         }
         if system_instruction:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
-        try:
-            data = await self._post_json(url, {"Content-Type": "application/json"}, payload)
-            candidates = data.get("candidates", [])
-            if not candidates:
-                return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="No candidates returned")
-            
-            text_content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            return ProviderResponse(
-                provider_name=self.name,
-                model_name=model_to_use,
-                content=text_content,
-                prompt_tokens=len(prompt) // 4,
-                completion_tokens=len(text_content) // 4,
-                estimated_cost_usd=0.001
-            )
-        except Exception as e:
-            logger.error(f"Gemini API error: {str(e)}")
-            return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason=str(e))
+        # Try up to number of keys in pool
+        max_attempts = max(1, len(self.api_keys))
+        last_err = ""
+
+        for attempt in range(max_attempts):
+            active_key = self.api_keys[self.current_key_idx] if self.api_keys else self.api_key
+            url = f"{self.base_url}/{model_to_use}:generateContent?key={active_key}"
+
+            try:
+                data = await self._post_json(url, {"Content-Type": "application/json"}, payload)
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="No candidates returned")
+                
+                text_content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                return ProviderResponse(
+                    provider_name=self.name,
+                    model_name=model_to_use,
+                    content=text_content,
+                    prompt_tokens=len(prompt) // 4,
+                    completion_tokens=len(text_content) // 4,
+                    estimated_cost_usd=0.001
+                )
+            except Exception as e:
+                err_str = str(e)
+                last_err = err_str
+                # If 429 Resource Exhausted or 402, rotate to next key and retry immediately
+                if "429" in err_str or "402" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    logger.warning(f"Gemini key #{self.current_key_idx + 1} quota exhausted: {err_str[:120]}. Rotating...")
+                    self._rotate_key()
+                    continue
+                else:
+                    logger.error(f"Gemini API error on model '{model_to_use}': {err_str}")
+                    return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason=err_str)
+
+        return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason=f"All {max_attempts} Gemini API keys exhausted: {last_err}")
 
 class OpenAISpecProvider(HTTPBaseProvider):
     """Generic Provider for OpenAI-compatible REST APIs (OpenRouter, NVIDIA NIM, Cerebras, AgentRouter, Groq, Mistral)."""
-    def __init__(self, name: str, is_paid: bool, api_key: str, default_model: str, base_url: str, extra_headers: Optional[Dict[str, str]] = None, speed_tier: str = "fast"):
+    def __init__(self, name: str, is_paid: bool, api_key: str = "", default_model: str = "", base_url: str = "", extra_headers: Optional[Dict[str, str]] = None, speed_tier: str = "fast", api_keys: Optional[list] = None):
         super().__init__(name=name, is_paid=is_paid, api_key=api_key, default_model=default_model, base_url=base_url, speed_tier=speed_tier)
         self.extra_headers = extra_headers or {}
+        # Multi-key pool setup
+        keys_pool = []
+        if api_keys:
+            keys_pool.extend([k.strip() for k in api_keys if k and k.strip()])
+        if api_key and api_key.strip() not in keys_pool:
+            keys_pool.insert(0, api_key.strip())
+        self.api_keys = list(dict.fromkeys(keys_pool))
+        self.current_key_idx = 0
+        if self.api_keys:
+            self.api_key = self.api_keys[0]
+
+    def _rotate_key(self) -> str:
+        """Rotates to the next available API key in the pool."""
+        if not self.api_keys:
+            return self.api_key
+        prev_idx = self.current_key_idx
+        self.current_key_idx = (self.current_key_idx + 1) % len(self.api_keys)
+        self.api_key = self.api_keys[self.current_key_idx]
+        logger.warning(f"[{self.name.upper()} KEY ROTATION] Rotated from key #{prev_idx + 1} to key #{self.current_key_idx + 1} of {len(self.api_keys)}.")
+        return self.api_key
+
+    async def is_available(self) -> bool:
+        return bool(self.api_keys or self.api_key)
 
     async def generate_response(
         self, prompt: str, system_instruction: Optional[str] = None, capability: str = "general_reasoning", model: Optional[str] = None, **kwargs
@@ -93,13 +164,6 @@ class OpenAISpecProvider(HTTPBaseProvider):
         else:
             url = f"{self.base_url}/chat/completions"
 
-        headers = {
-            "Content-Type": "application/json",
-            **self.extra_headers
-        }
-        if "x-rapidapi-key" not in [k.lower() for k in headers.keys()] and self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
         messages = []
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
@@ -110,25 +174,47 @@ class OpenAISpecProvider(HTTPBaseProvider):
             "max_tokens": kwargs.get("max_tokens", 4096)
         }
 
-        try:
-            data = await self._post_json(url, headers, payload)
-            choices = data.get("choices", [])
-            if not choices:
-                return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="Empty choices")
+        max_attempts = max(1, len(self.api_keys))
+        last_err = ""
 
-            text_content = choices[0].get("message", {}).get("content", "")
-            usage = data.get("usage", {})
-            return ProviderResponse(
-                provider_name=self.name,
-                model_name=model_to_use,
-                content=text_content,
-                prompt_tokens=usage.get("prompt_tokens", len(prompt) // 4),
-                completion_tokens=usage.get("completion_tokens", len(text_content) // 4),
-                estimated_cost_usd=0.001 if self.is_paid else 0.0
-            )
-        except Exception as e:
-            logger.error(f"{self.name} API error: {str(e)}")
-            return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason=str(e))
+        for attempt in range(max_attempts):
+            active_key = self.api_keys[self.current_key_idx] if self.api_keys else self.api_key
+            headers = {
+                "Content-Type": "application/json",
+                **self.extra_headers
+            }
+            if "x-rapidapi-key" not in [k.lower() for k in headers.keys()] and active_key:
+                headers["Authorization"] = f"Bearer {active_key}"
+
+            try:
+                data = await self._post_json(url, headers, payload)
+                choices = data.get("choices", [])
+                if not choices:
+                    return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="Empty choices")
+
+                text_content = choices[0].get("message", {}).get("content", "")
+                usage = data.get("usage", {})
+                return ProviderResponse(
+                    provider_name=self.name,
+                    model_name=model_to_use,
+                    content=text_content,
+                    prompt_tokens=usage.get("prompt_tokens", len(prompt) // 4),
+                    completion_tokens=usage.get("completion_tokens", len(text_content) // 4),
+                    estimated_cost_usd=0.001 if self.is_paid else 0.0
+                )
+            except Exception as e:
+                err_str = str(e)
+                last_err = err_str
+                # Rotate on 429 rate limit or 402/403/401 quota exhaustion if we have backup keys
+                if len(self.api_keys) > 1 and any(code in err_str for code in ("429", "402", "401", "403", "rate_limit", "quota")):
+                    logger.warning(f"[{self.name}] Rate limit / error on key #{self.current_key_idx + 1}: {err_str[:100]}. Rotating key...")
+                    self._rotate_key()
+                    continue
+                else:
+                    logger.error(f"{self.name} API error: {err_str}")
+                    return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason=err_str)
+
+        return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason=f"All {max_attempts} {self.name} API keys exhausted: {last_err}")
 
 class AnthropicSpecProvider(HTTPBaseProvider):
     """Generic Provider for Anthropic Messages API specification (/v1/messages)."""

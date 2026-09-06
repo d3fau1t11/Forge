@@ -3,6 +3,7 @@ import json
 import re
 import os
 import sys
+import time
 import logging
 import uuid
 from datetime import datetime
@@ -67,6 +68,39 @@ class AutonomousOrchestrator:
         event = self._root_events.get(request_id)
         if event:
             event.set()
+
+    @staticmethod
+    def _snapshot_dir(dir_path: str) -> dict:
+        """Returns a mapping of relative file paths to their size in bytes."""
+        snapshot = {}
+        if not dir_path or not os.path.exists(dir_path):
+            return snapshot
+        try:
+            for root, _, files in os.walk(dir_path):
+                for f in files:
+                    full_path = os.path.join(root, f)
+                    rel_path = os.path.relpath(full_path, dir_path)
+                    try:
+                        snapshot[rel_path] = os.path.getsize(full_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return snapshot
+
+    @staticmethod
+    def _diff_dir_snapshots(before: dict, after: dict) -> list:
+        """Computes a human-readable list of file additions, modifications, and deletions."""
+        changes = []
+        for path, size in after.items():
+            if path not in before:
+                changes.append(f"+ Created: {path} ({size} bytes)")
+            elif before[path] != size:
+                changes.append(f"~ Modified: {path} ({before[path]} -> {size} bytes)")
+        for path in before:
+            if path not in after:
+                changes.append(f"- Deleted: {path}")
+        return changes
 
     async def run_autonomous_loop(self, run_id: str, challenge_id: str, target: str):
         """Asynchronous background 1-command ping-pong loop processing CTF challenge target."""
@@ -210,21 +244,21 @@ class AutonomousOrchestrator:
                     if cached_recon and cached_recon.get("raw_summary"):
                         turbo_recon_context = f"\n\n--- PRE-WARMED TURBO RECON (INSTANT) ---\n{cached_recon['raw_summary']}"
 
-                # Construct transparent ReAct System Prompt with Python Execution Mode & OS Context
+                # Construct transparent ReAct System Prompt with Educational CTF Lab Context
                 system_instruction = (
-                    f"You are FORGE Autonomous CTF Pentest Agent running on {os_distro}.\n"
-                    f"SYSTEM DIRECTIVE: Rely exclusively on live target scope and real execution outputs. Zero fake flags allowed.\n"
+                    f"You are FORGE Autonomous CTF Security Assistant operating in an authorized educational lab environment on {os_distro}.\n"
+                    f"SYSTEM DIRECTIVE: Analyze the target scope rigorously and rely exclusively on verified command outputs. Zero mock/fake flags.\n"
                     f"Target Scope: {target}\n"
                     f"Challenge Name: {challenge.name} | Category: {challenge.category} | Difficulty: {challenge.difficulty} | Platform: {challenge.platform_name}\n"
                     f"Working Directory: {challenge.working_directory}\n"
-                    f"Installed Pentest Tools & Python Libraries: {tools_str}, python3, {py_libs_str}\n\n"
+                    f"Installed Analysis Tools & Libraries: {tools_str}, python3, {py_libs_str}\n\n"
                     f"ACTION SELECTION MODES:\n"
                     f"Mode A (CLI Command): Output a SINGLE executable bash/shell command line.\n"
                     f"Mode B (Python Solver Script): Output a complete Python script inside ```python ... ``` blocks. FORGE will save it to `solve.py` and run `{sys.executable} solve.py` automatically.\n"
                     f"Mode C (Structured Completion): Output JSON {{\"action\": \"complete\", \"flag\": \"<flag>\", \"proof\": \"<explanation>\"}} if solve is verified.\n\n"
                     f"STRICT RULES:\n"
                     f"1. Output ONLY the bash command line, the ```python ... ``` solver script block, or structured completion JSON.\n"
-                    f"2. If you discover the real flag (e.g. picoCTF{{...}}, FLAG{{...}}, HTB{{...}}), reply EXACTLY: FLAG: <captured_flag>\n"
+                    f"2. If you discover the flag (e.g. picoCTF{{...}}, FLAG{{...}}, HTB{{...}}), reply EXACTLY: FLAG: <captured_flag>\n"
                     f"3. If mission is complete, provide the verified flag or exact solve payload.\n"
                     f"4. Multi-target inputs are joined using '+' sign. Process targets accordingly."
                     f"{playbook_context}"
@@ -255,12 +289,14 @@ class AutonomousOrchestrator:
                 # Query AI Router with Speed-Tiered Routing
                 capability = "code_analysis" if state_memory["repetition_warnings"] > 0 else ("general_reasoning" if turn == 1 else "web_testing")
                 speed_tier = "deep" if challenge.category in ["reverse", "pwn", "crypto"] and turn > 5 else "fast"
+                llm_start_time = time.time()
                 llm_response = await model_router.route_request(
                     prompt=prompt,
                     capability=capability,
                     system_instruction=system_instruction,
                     speed_tier=speed_tier
                 )
+                llm_duration_ms = int((time.time() - llm_start_time) * 1000)
 
                 raw_ai_output = (llm_response.content or "").strip()
                 model_used = getattr(llm_response, "model", getattr(llm_response, "provider_name", "model_router"))
@@ -417,12 +453,17 @@ class AutonomousOrchestrator:
                 if not cmd_line:
                     cmd_line = f"curl -s -L {target}" if target.startswith("http") else f"nmap -F {target}"
 
+                # Snapshot working directory before command execution
+                dir_before = self._snapshot_dir(challenge.working_directory)
+                cmd_start_time = time.time()
+
                 # Execute Command inside working directory
                 tool_res = await tool_manager.execute_raw_command(
                     command=cmd_line,
                     cwd=challenge.working_directory,
                     timeout_seconds=120
                 )
+                cmd_duration_ms = int((time.time() - cmd_start_time) * 1000)
 
                 stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
                 stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
@@ -463,11 +504,13 @@ class AutonomousOrchestrator:
                             if self._install_results.get(request_id, False):
                                 logger.info(f"Package '{pip_package}' installed. Retrying solver script.")
                                 # Re-run the same solver script
+                                cmd_retry_start = time.time()
                                 tool_res = await tool_manager.execute_raw_command(
                                     command=cmd_line,
                                     cwd=challenge.working_directory,
                                     timeout_seconds=120
                                 )
+                                cmd_duration_ms += int((time.time() - cmd_retry_start) * 1000)
                                 stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
                                 stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
                                 log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Re-execution finished."
@@ -488,68 +531,96 @@ class AutonomousOrchestrator:
                 )
 
                 if needs_root_elevation and not is_python_script:
-                    root_request_id = str(uuid.uuid4())
-                    root_reason = "This command requires elevated root / superuser privileges to execute."
-                    error_snippet = (stderr_text or stdout_text).strip()[-300:]
-                    logger.info(f"Command '{cmd_line}' requires root/sudo privileges. Requesting user approval [ID: {root_request_id}].")
+                    # Auto-elevate with sudo if challenge.requires_root is enabled
+                    if getattr(challenge, "requires_root", False):
+                        logger.info(f"Challenge has requires_root=True enabled. Auto-elevating command with sudo: {cmd_line}")
+                        sudo_cmd = cmd_line if cmd_line.startswith("sudo ") else f"sudo {cmd_line}"
+                        cmd_elev_start = time.time()
+                        tool_res = await tool_manager.execute_raw_command(
+                            command=sudo_cmd,
+                            cwd=challenge.working_directory,
+                            timeout_seconds=120
+                        )
+                        cmd_duration_ms += int((time.time() - cmd_elev_start) * 1000)
+                        stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
+                        stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
+                        log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Auto-elevated root execution completed."
+                    else:
+                        root_request_id = str(uuid.uuid4())
+                        root_reason = "This command requires elevated root / superuser privileges to execute."
+                        error_snippet = (stderr_text or stdout_text).strip()[-300:]
+                        logger.info(f"Command '{cmd_line}' requires root/sudo privileges. Requesting user approval [ID: {root_request_id}].")
 
-                    await ws_manager.broadcast({
-                        "event": "ROOT_PERMISSION_REQUEST",
-                        "request_id": root_request_id,
-                        "challenge_id": challenge_id,
-                        "challenge_name": challenge.name,
-                        "command": cmd_line,
-                        "reason": root_reason,
-                        "error_snippet": error_snippet,
-                        "timestamp": datetime.utcnow().strftime("%H:%M:%S")
-                    })
+                        await ws_manager.broadcast({
+                            "event": "ROOT_PERMISSION_REQUEST",
+                            "request_id": root_request_id,
+                            "challenge_id": challenge_id,
+                            "challenge_name": challenge.name,
+                            "command": cmd_line,
+                            "reason": root_reason,
+                            "error_snippet": error_snippet,
+                            "timestamp": datetime.utcnow().strftime("%H:%M:%S")
+                        })
 
-                    root_event = asyncio.Event()
-                    self._root_events[root_request_id] = root_event
-                    try:
-                        await asyncio.wait_for(root_event.wait(), timeout=120)
-                        res = self._root_results.get(root_request_id, {})
-                        if res.get("success"):
-                            logger.info(f"Root permission approved for '{cmd_line}'.")
-                            if res.get("tool_res"):
-                                tool_res = res["tool_res"]
+                        root_event = asyncio.Event()
+                        self._root_events[root_request_id] = root_event
+                        try:
+                            await asyncio.wait_for(root_event.wait(), timeout=120)
+                            res = self._root_results.get(root_request_id, {})
+                            if res.get("success"):
+                                logger.info(f"Root permission approved for '{cmd_line}'.")
+                                if res.get("tool_res"):
+                                    tool_res = res["tool_res"]
+                                else:
+                                    sudo_cmd = cmd_line if cmd_line.startswith("sudo ") else f"sudo {cmd_line}"
+                                    cmd_elev_start = time.time()
+                                    tool_res = await tool_manager.execute_raw_command(
+                                        command=sudo_cmd,
+                                        cwd=challenge.working_directory,
+                                        timeout_seconds=120
+                                    )
+                                    cmd_duration_ms += int((time.time() - cmd_elev_start) * 1000)
+                                stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
+                                stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
+                                log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Elevated execution completed."
                             else:
-                                sudo_cmd = cmd_line if cmd_line.startswith("sudo ") else f"sudo {cmd_line}"
-                                tool_res = await tool_manager.execute_raw_command(
-                                    command=sudo_cmd,
-                                    cwd=challenge.working_directory,
-                                    timeout_seconds=120
-                                )
-                            stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
-                            stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
-                            log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Elevated execution completed."
-                        else:
-                            logger.warning(f"Root permission was rejected/denied by operator for '{cmd_line}'.")
-                            stdout_text = ""
-                            stderr_text = f"[ACCESS DENIED] Root/sudo permission was rejected by the operator for: {cmd_line}. Please pivot to an unprivileged user-space alternative."
+                                logger.warning(f"Root permission was rejected/denied by operator for '{cmd_line}'.")
+                                stdout_text = ""
+                                stderr_text = f"[ACCESS DENIED] Root/sudo permission was rejected by the operator for: {cmd_line}. Please pivot to an unprivileged user-space alternative."
+                                log_output = stderr_text
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Root approval request timed out for '{cmd_line}'.")
+                            stderr_text = f"[TIMEOUT] Root permission request timed out after 120s. Please pivot to an unprivileged user-space alternative."
                             log_output = stderr_text
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Root approval request timed out for '{cmd_line}'.")
-                        stderr_text = f"[TIMEOUT] Root permission request timed out after 120s. Please pivot to an unprivileged user-space alternative."
-                        log_output = stderr_text
-                    finally:
-                        self._root_events.pop(root_request_id, None)
-                        self._root_results.pop(root_request_id, None)
+                        finally:
+                            self._root_events.pop(root_request_id, None)
+                            self._root_results.pop(root_request_id, None)
+
+                # Snapshot working directory after execution and compute filesystem deltas
+                dir_after = self._snapshot_dir(challenge.working_directory)
+                dir_changes = self._diff_dir_snapshots(dir_before, dir_after)
 
                 # Update Structured State Memory from Command Output
                 self._update_state_memory(state_memory, stdout_text)
 
-                # Append Full AI Conversation & Telemetry to Dedicated Challenge Log File
+                # Append Full AI Conversation, Timings & Telemetry to Dedicated Challenge Log File
                 logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
                 ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
+                now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                 try:
                     with open(ch_log_path, "a", encoding="utf-8") as f:
-                        f.write(f"[{datetime.utcnow().strftime('%H:%M:%S')}] TURN #{turn} (Model Provider: {model_used})\n")
+                        f.write(f"[{now_str} UTC] TURN #{turn} (Model: {model_used} | LLM Latency: {llm_duration_ms}ms | Exec Duration: {cmd_duration_ms}ms)\n")
                         f.write(f"  --- SYSTEM INSTRUCTION SENT TO AI ---\n{system_instruction}\n\n")
                         f.write(f"  --- PROMPT / RECENT HISTORY SENT TO AI ---\n{prompt}\n\n")
                         f.write(f"  --- RAW AI RESPONSE RECEIVED ---\n{raw_ai_output}\n\n")
                         f.write(f"  --- EXECUTED COMMAND ---\n{cmd_line}\n\n")
-                        f.write(f"  --- STDOUT / STDERR OUTPUT (Exit Code {tool_res.exit_code}) ---\n{log_output}\n")
+                        f.write(f"  --- EXECUTION TELEMETRY ---\n")
+                        f.write(f"    Exit Code: {tool_res.exit_code} | Duration: {cmd_duration_ms}ms | Working Dir: {challenge.working_directory}\n")
+                        if dir_changes:
+                            f.write(f"    Filesystem Changes:\n")
+                            for chg in dir_changes:
+                                f.write(f"      {chg}\n")
+                        f.write(f"  --- STDOUT / STDERR OUTPUT ---\n{log_output}\n")
                         f.write(f"================================================================================\n\n")
                 except Exception as log_err:
                     logger.warning(f"Failed to append to challenge log file: {log_err}")

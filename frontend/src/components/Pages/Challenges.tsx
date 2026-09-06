@@ -19,7 +19,7 @@ import { DirectoryBrowserModal } from './DirectoryBrowserModal';
 interface ChallengesProps {
   challenges: Challenge[];
   onSelectChallenge: (challenge: Challenge) => void;
-  onCreateChallenge: (newCh: { name: string; category: any; difficulty: any; target: string; description: string; workingDirectory?: string; platformName?: string }) => void;
+  onCreateChallenge: (newCh: { name: string; category: any; difficulty: any; target: string; description: string; workingDirectory?: string; platformName?: string; requiresRoot?: boolean }) => void;
   onToggleStatus: (id: string) => void;
   onDeleteChallenge?: (id: string) => void;
   onDeleteAllChallenges?: () => void;
@@ -47,6 +47,7 @@ export const Challenges: React.FC<ChallengesProps> = ({
   const [customTargetOverride, setCustomTargetOverride] = useState('');
   const [showTargetOverride, setShowTargetOverride] = useState(false);
   const [workingDirectory, setWorkingDirectory] = useState('');
+  const [requiresRoot, setRequiresRoot] = useState(false);
 
   const extractFolderName = (pathStr: string): string => {
     if (!pathStr) return '';
@@ -98,7 +99,8 @@ export const Challenges: React.FC<ChallengesProps> = ({
       target: targetToUse,
       description,
       workingDirectory,
-      platformName: platformName.trim() || 'PicoCTF'
+      platformName: platformName.trim() || 'PicoCTF',
+      requiresRoot
     });
     setName('');
     setPlatformName('PicoCTF');
@@ -106,6 +108,7 @@ export const Challenges: React.FC<ChallengesProps> = ({
     setCustomTargetOverride('');
     setShowTargetOverride(false);
     setWorkingDirectory('');
+    setRequiresRoot(false);
     setShowModal(false);
   };
 
@@ -500,6 +503,28 @@ export const Challenges: React.FC<ChallengesProps> = ({
                       />
                     </div>
                   )}
+
+                  {/* Root / Elevated Privileges Toggle */}
+                  <div className="mt-3 p-3 rounded-lg bg-obsidian-900 border border-slate-800 hover:border-cyber-cyan/40 transition-colors flex items-center justify-between">
+                    <div className="space-y-0.5 pr-3">
+                      <div className="flex items-center space-x-2">
+                        <Shield className="w-3.5 h-3.5 text-cyber-amber" />
+                        <span className="text-[11px] font-bold text-slate-200">GRANT ROOT / SUDO PRIVILEGES</span>
+                      </div>
+                      <p className="text-[10px] text-slate-400 leading-normal">
+                        Permits the agent to automatically execute privileged system tools via sudo without interactive approval prompts.
+                      </p>
+                    </div>
+                    <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={requiresRoot}
+                        onChange={(e) => setRequiresRoot(e.target.checked)}
+                        className="sr-only peer"
+                      />
+                      <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-cyber-cyan"></div>
+                    </label>
+                  </div>
                 </div>
               </div>
 

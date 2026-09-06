@@ -33,39 +33,53 @@ class ModelRouter:
     """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
 
     DEFAULT_ROUTING_MAP = {
-        "recon": ["openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "nvidia", "cerebras", "cloudflare", "agentrouter_claude_code"],
-        "directory_enumeration": ["openrouter", "gemini", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "nvidia", "cerebras", "cloudflare", "agentrouter_claude_code"],
-        "web_analysis": ["gemini", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "nvidia", "cloudflare", "agentrouter_claude_code"],
-        "code_analysis": ["openrouter", "gemini", "rapidapi_deepseek_v32", "nvidia", "cloudflare", "agentrouter_claude_code"],
-        "reverse_engineering": ["openrouter", "gemini", "rapidapi_deepseek_v32", "nvidia", "cloudflare", "agentrouter_claude_code"],
-        "fast_reasoning": ["openrouter", "gemini", "cerebras", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "nvidia", "cloudflare", "agentrouter_claude_code"],
-        "general_reasoning": ["gemini", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "nvidia", "cloudflare", "agentrouter_claude_code"],
-        "verification": ["gemini", "openrouter", "rapidapi_deepseek_v32", "nvidia", "cloudflare", "agentrouter_claude_code"]
+        # Live-tested 2026-09-06: GLM 5.3 Flash (OpenRouter) & RapidAPI DeepSeek & Groq Qwen = best CTF solvers.
+        # RapidAPI DeepSeek first, then OpenRouter GLM, then Groq Qwen (Free/fast), then Cloudflare.
+        "recon": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
+        "directory_enumeration": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
+        "web_analysis": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
+        "web_testing": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
+        "code_analysis": ["rapidapi_deepseek_v32", "groq", "openrouter", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
+        "reverse_engineering": ["rapidapi_deepseek_v32", "groq", "openrouter", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
+        "fast_reasoning": ["groq", "rapidapi_deepseek_v32", "openrouter", "cloudflare", "rapidapi_gpt54_mini", "nvidia", "agentrouter_claude_code", "gemini"],
+        "general_reasoning": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
+        "verification": ["rapidapi_deepseek_v32", "groq", "openrouter", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"]
     }
 
     # Model to Provider/Transport Mapping
     MODEL_PROVIDER_MAP = {
-        "deepseek-v4-flash": ("openrouter", "deepseek/deepseek-chat"),
-        "deepseek/deepseek-chat": ("openrouter", "deepseek/deepseek-chat"),
-        "deepseek-chat": ("openrouter", "deepseek/deepseek-chat"),
-        "glm-5.3": ("openrouter", "z-ai/glm-5.3"),
-        "z-ai/glm-5.3": ("openrouter", "z-ai/glm-5.3"),
-        "glm-5.3-flash": ("openrouter", "z-ai/glm-5.3-flash"),
-        "z-ai/glm-5.3-flash": ("openrouter", "z-ai/glm-5.3-flash"),
-        "gpt-5.6": ("agentrouter_codex", "codex"),
-        "gpt-5.6-sol": ("agentrouter_codex", "codex"),
+        # Groq (Curated fast models)
+        "qwen-3.8-27b": ("groq", "qwen/qwen3.8-27b"),
+        "gpt-oss-120b": ("groq", "openai/gpt-oss-120b"),
+        "groq-compound": ("groq", "groq/compound"),
+        # Claude (AgentRouter Claude Code CLI)
         "claude-opus-5": ("agentrouter_claude_code", "claude_code"),
         "claude-opus-4-8": ("agentrouter_claude_code", "claude_code"),
+        # Codex (AgentRouter Codex CLI)
+        "gpt-5.6": ("agentrouter_codex", "codex"),
+        "gpt-5.6-sol": ("agentrouter_codex", "codex"),
+        # RapidAPI (High reliability & speed)
         "gpt-5.4-mini": ("rapidapi_gpt54_mini", "gpt-5.4-mini"),
         "deepseek-v3.2": ("rapidapi_deepseek_v32", "DeepSeek-V3.2"),
         "gpt-5-nano": ("rapidapi_gpt5_nano", "GPT-5-nano"),
+        # OpenRouter (Low cost / accurate GLM)
+        "glm-5.3-flash": ("openrouter", "z-ai/glm-5.3-flash"),
+        "z-ai/glm-5.3-flash": ("openrouter", "z-ai/glm-5.3-flash"),
+        "glm-5.3": ("openrouter", "z-ai/glm-5.3"),
+        "z-ai/glm-5.3": ("openrouter", "z-ai/glm-5.3"),
+        "deepseek-v4-flash": ("openrouter", "deepseek/deepseek-chat"),
+        "deepseek/deepseek-chat": ("openrouter", "deepseek/deepseek-chat"),
+        "deepseek-chat": ("openrouter", "deepseek/deepseek-chat"),
+        # Cloudflare Workers AI
+        "cloudflare-llama": ("cloudflare", "@cf/meta/llama-3.1-8b-instruct"),
+        # Gemini (Fallback with 18-key pool)
         "gemini-3.6-flash": ("gemini", "gemini-3.6-flash"),
         "gemini-1.5-pro": ("gemini", "gemini-1.5-pro"),
+        # NVIDIA NIM
         "deepseek-v4-pro": ("nvidia", "deepseek-ai/deepseek-v4-pro-0813"),
         "nemotron-lightning": ("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b"),
         "nemotron-ultra": ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
-        "kimi-k3": ("nvidia", "moonshotai/kimi-k3"),
-        "llama3.1-8b": ("cerebras", "llama3.1-8b")
+        "kimi-k3": ("nvidia", "moonshotai/kimi-k3")
     }
 
     def __init__(self):
@@ -79,7 +93,7 @@ class ModelRouter:
         self._initialize_env_providers()
 
     def _initialize_env_providers(self):
-        # 1. RapidAPI Verified Working Models (Excluding deprecated/quota-exhausted GPT-5.5)
+        # 1. RapidAPI Verified Working Models
         rapidapi_key = (settings.RAPIDAPI_KEY or os.getenv("RAPIDAPI_KEY", "")).strip()
         if rapidapi_key:
             self.register_provider("rapidapi_gpt54_mini", OpenAISpecProvider(
@@ -88,7 +102,7 @@ class ModelRouter:
                 api_key=rapidapi_key,
                 default_model="gpt-5.4-mini",
                 base_url="https://gpt-5-4-mini.p.rapidapi.com",
-                extra_headers={"x-rapidapi-host": "gpt-5-4-mini.p.rapidapi.com", "x-rapidapi-key": rapidapi_key},
+                extra_headers={"x-rapidapi-host": "gpt-5-4-mini.p.rapidapi.com", "x-rapidapi-key": rapidapi_key, "User-Agent": "Mozilla/5.0"},
                 speed_tier="fast"
             ))
             self.register_provider("rapidapi_deepseek_v32", OpenAISpecProvider(
@@ -97,7 +111,7 @@ class ModelRouter:
                 api_key=rapidapi_key,
                 default_model="DeepSeek-V3.2",
                 base_url="https://deepseek-v31.p.rapidapi.com/",
-                extra_headers={"x-rapidapi-host": "deepseek-v31.p.rapidapi.com", "x-rapidapi-key": rapidapi_key},
+                extra_headers={"x-rapidapi-host": "deepseek-v31.p.rapidapi.com", "x-rapidapi-key": rapidapi_key, "User-Agent": "Mozilla/5.0"},
                 speed_tier="fast"
             ))
             self.register_provider("rapidapi_gpt5_nano", OpenAISpecProvider(
@@ -106,11 +120,46 @@ class ModelRouter:
                 api_key=rapidapi_key,
                 default_model="GPT-5-nano",
                 base_url="https://gpt-5-nano.p.rapidapi.com",
-                extra_headers={"x-rapidapi-host": "gpt-5-nano.p.rapidapi.com", "x-rapidapi-key": rapidapi_key},
+                extra_headers={"x-rapidapi-host": "gpt-5-nano.p.rapidapi.com", "x-rapidapi-key": rapidapi_key, "User-Agent": "Mozilla/5.0"},
                 speed_tier="fast"
             ))
-        if settings.GEMINI_API_KEY:
-            self.register_provider("gemini", GeminiProvider(api_key=settings.GEMINI_API_KEY))
+        # 2. Groq Provider with Multi-Key Rotation Pool
+        groq_keys = [k.strip() for k in (getattr(settings, "GROQ_API_KEYS", "") or "").split(",") if k.strip()]
+        groq_single_key = (settings.GROQ_API_KEY or os.getenv("GROQ_API_KEY", "")).strip()
+        if groq_single_key or groq_keys:
+            self.register_provider("groq", OpenAISpecProvider(
+                name="groq",
+                is_paid=False,
+                api_key=groq_single_key,
+                api_keys=groq_keys,
+                default_model="qwen/qwen3.8-27b",
+                base_url="https://api.groq.com/openai/v1",
+                speed_tier="fast"
+            ))
+        # 3. Gemini Provider with 18-Key Rotation Pool
+        if settings.GEMINI_API_KEY or settings.GEMINI_API_KEYS:
+            gem_keys = [k.strip() for k in (settings.GEMINI_API_KEYS or "").split(",") if k.strip()]
+            self.register_provider("gemini", GeminiProvider(
+                api_key=settings.GEMINI_API_KEY,
+                api_keys=gem_keys
+            ))
+        # 4. OpenRouter Provider
+        if settings.OPENROUTER_API_KEY:
+            self.register_provider("openrouter", OpenAISpecProvider(
+                name="openrouter",
+                is_paid=True,
+                api_key=settings.OPENROUTER_API_KEY,
+                default_model="z-ai/glm-5.3-flash",
+                base_url="https://openrouter.ai/api/v1",
+                extra_headers={"HTTP-Referer": "https://forge.local", "X-Title": "FORGE CTF"}
+            ))
+        # 5. Cloudflare Workers AI Provider
+        if settings.CLOUDFLARE_API_TOKEN and settings.CLOUDFLARE_ACCOUNT_ID:
+            self.register_provider("cloudflare", CloudflareProvider(
+                api_key=settings.CLOUDFLARE_API_TOKEN,
+                account_id=settings.CLOUDFLARE_ACCOUNT_ID
+            ))
+        # 6. NVIDIA NIM Provider
         if settings.NVIDIA_API_KEY:
             self.register_provider("nvidia", OpenAISpecProvider(
                 name="nvidia",
@@ -118,30 +167,6 @@ class ModelRouter:
                 api_key=settings.NVIDIA_API_KEY,
                 default_model="deepseek-ai/deepseek-v4-pro-0813",
                 base_url="https://integrate.api.nvidia.com/v1"
-            ))
-        if settings.CEREBRAS_API_KEY:
-            self.register_provider("cerebras", OpenAISpecProvider(
-                name="cerebras",
-                is_paid=False,
-                api_key=settings.CEREBRAS_API_KEY,
-                default_model="llama3.1-8b",
-                base_url="https://api.cerebras.ai/v1"
-            ))
-        if settings.OPENROUTER_API_KEY:
-            self.register_provider("openrouter", OpenAISpecProvider(
-                name="openrouter",
-                is_paid=True,
-                api_key=settings.OPENROUTER_API_KEY,
-                default_model="deepseek/deepseek-chat",
-                base_url="https://openrouter.ai/api/v1",
-                extra_headers={"HTTP-Referer": "https://forge.local", "X-Title": "FORGE CTF"}
-            ))
-        if settings.HF_TOKEN:
-            self.register_provider("huggingface", HuggingFaceProvider(api_key=settings.HF_TOKEN))
-        if settings.CLOUDFLARE_API_TOKEN and settings.CLOUDFLARE_ACCOUNT_ID:
-            self.register_provider("cloudflare", CloudflareProvider(
-                api_key=settings.CLOUDFLARE_API_TOKEN,
-                account_id=settings.CLOUDFLARE_ACCOUNT_ID
             ))
         # Note: Direct HTTP REST calls to agentrouter.org/v1 return 401 Unauthorized Client.
         # AgentRouter access is strictly mediated via terminal CLI tools (agentrouter_claude_code & agentrouter_codex).

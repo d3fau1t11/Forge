@@ -411,6 +411,7 @@ export default function App() {
     description: string;
     workingDirectory?: string;
     platformName?: string;
+    requiresRoot?: boolean;
   }) => {
     const createdLocally: Challenge = {
       id: `ch-${Date.now()}`,
@@ -452,7 +453,8 @@ export default function App() {
         description: newCh.description,
         target_address: newCh.target,
         working_directory: newCh.workingDirectory,
-        platform_name: newCh.platformName
+        platform_name: newCh.platformName,
+        requires_root: newCh.requiresRoot
       });
       if (resp && resp.id) {
         setChallenges((prev) =>

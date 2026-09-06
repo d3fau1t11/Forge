@@ -92,6 +92,7 @@ class CreateChallengeRequest(BaseModel):
     target_address: Optional[str] = ""
     working_directory: Optional[str] = ""
     platform_name: Optional[str] = ""
+    requires_root: bool = False
 
 class UpdateTargetAddressRequest(BaseModel):
     new_address: str
@@ -280,6 +281,7 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
         description=req.description,
         working_directory=working_dir,
         platform_name=platform,
+        requires_root=req.requires_root,
         status="RUNNING"
     )
     db.add(challenge)

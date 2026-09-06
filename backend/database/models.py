@@ -49,6 +49,7 @@ class ChallengeModel(Base):
     progress = Column(Integer, default=0)
     flag_status = Column(String, default="UNFOUND")
     flag = Column(String, nullable=True)
+    requires_root = Column(Boolean, default=False)
     started_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
     duration_seconds = Column(Integer, default=0)
