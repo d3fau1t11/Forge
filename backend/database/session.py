@@ -68,6 +68,16 @@ def init_db():
                 conn.commit()
             except Exception:
                 pass
+            try:
+                conn.execute(text("ALTER TABLE findings ADD COLUMN severity VARCHAR DEFAULT 'HIGH'"))
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE findings ADD COLUMN endpoint VARCHAR DEFAULT ''"))
+                conn.commit()
+            except Exception:
+                pass
 
 def get_db():
     db = SessionLocal()

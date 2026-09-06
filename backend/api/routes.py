@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import logging
+import shutil
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -27,6 +28,34 @@ from backend.privilege.manager import privilege_manager
 
 router = APIRouter()
 logger = logging.getLogger("forge.routes")
+
+def _safe_delete_working_dir(working_dir: str):
+    """Safely delete a challenge working directory ensuring it's not a root or user home directory."""
+    if not working_dir or not isinstance(working_dir, str):
+        return
+    clean_path = os.path.abspath(working_dir.strip())
+    # Guard against deleting system roots or user home
+    user_home = os.path.abspath(os.path.expanduser("~"))
+    root_paths = ["/", "c:\\", "c:/", "\\", "d:\\", "d:/"]
+    if clean_path.lower() in [r.lower() for r in root_paths] or clean_path == user_home:
+        logger.warning(f"Prevented unsafe directory deletion of system/home path: {clean_path}")
+        return
+    if os.path.exists(clean_path) and os.path.isdir(clean_path):
+        try:
+            shutil.rmtree(clean_path, ignore_errors=True)
+            logger.info(f"Successfully deleted challenge working directory: {clean_path}")
+        except Exception as e:
+            logger.warning(f"Error removing working directory {clean_path}: {e}")
+
+def _delete_challenge_log(challenge_id: str):
+    """Delete the dedicated challenge log file if it exists."""
+    try:
+        logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
+        log_file = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
+        if os.path.exists(log_file):
+            os.remove(log_file)
+    except Exception as e:
+        logger.debug(f"Error removing log for challenge {challenge_id}: {e}")
 
 def extract_target_from_text(text: str) -> str:
     """Intelligently extracts target network endpoint, URL, netcat connection, or artifact from description."""
@@ -164,6 +193,73 @@ def get_challenge_plan(challenge_id: str, db: Session = Depends(get_db)):
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
     return challenge.mission_plan or {"tasks": [], "status": "PENDING"}
+
+@router.delete("/challenges/{challenge_id}")
+async def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
+    """Deletes a challenge from the database, cascading to runs/findings, and deletes its working directory on disk."""
+    challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    
+    working_dir = challenge.working_directory
+    
+    # 1. Delete associated reports
+    db.query(ReportModel).filter(ReportModel.challenge_id == challenge_id).delete()
+    
+    # 2. Delete challenge (SQLAlchemy relationship cascade deletes runs, targets, checkpoints, tool_executions, evidence, findings)
+    db.delete(challenge)
+    db.commit()
+    
+    # 3. Clean up challenge working directory on disk safely
+    _safe_delete_working_dir(working_dir)
+    
+    # 4. Clean up challenge dedicated log file
+    _delete_challenge_log(challenge_id)
+    
+    # 5. Broadcast real-time WebSocket event
+    try:
+        await ws_manager.broadcast({
+            "event": "CHALLENGE_DELETED",
+            "challenge_id": challenge_id
+        })
+    except Exception:
+        pass
+        
+    return {
+        "status": "SUCCESS",
+        "message": f"Challenge '{challenge_id}' and associated working directory deleted successfully.",
+        "challenge_id": challenge_id
+    }
+
+@router.delete("/challenges")
+async def delete_all_challenges(db: Session = Depends(get_db)):
+    """Deletes all challenges from the database and deletes all associated working directories on disk."""
+    challenges = db.query(ChallengeModel).all()
+    deleted_count = 0
+    for ch in challenges:
+        working_dir = ch.working_directory
+        ch_id = ch.id
+        db.query(ReportModel).filter(ReportModel.challenge_id == ch_id).delete()
+        db.delete(ch)
+        _safe_delete_working_dir(working_dir)
+        _delete_challenge_log(ch_id)
+        deleted_count += 1
+    
+    db.commit()
+    
+    try:
+        await ws_manager.broadcast({
+            "event": "ALL_CHALLENGES_DELETED",
+            "count": deleted_count
+        })
+    except Exception:
+        pass
+        
+    return {
+        "status": "SUCCESS",
+        "message": f"All {deleted_count} challenges and associated working directories deleted successfully.",
+        "deleted_count": deleted_count
+    }
 
 @router.post("/challenges")
 async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(get_db)):

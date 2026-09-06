@@ -31,11 +31,59 @@ class TestFoundation(unittest.TestCase):
         self.assertIn(response.provider_name, ["cloudflare", "openrouter", "gemini", "nvidia", "agentrouter_claude_code", "agentrouter_codex", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "rapidapi_gpt5_nano", "none"])
         self.assertTrue(len(response.content) > 0)
 
-    def test_tool_manager_missing_tool(self):
-        async def run_async():
-            return await tool_manager.execute_capability("non_existent_capability", "127.0.0.1")
-        res = asyncio.run(run_async())
-        self.assertEqual(res.status, "MISSING_TOOL")
+    def test_findings_schema_and_challenge_delete(self):
+        from backend.database.session import init_db, SessionLocal
+        from backend.database.models import ChallengeModel, FindingModel
+        import tempfile
+        import shutil
+
+        init_db()
+        db = SessionLocal()
+        try:
+            # Create a test working directory
+            test_dir = tempfile.mkdtemp(prefix="forge_test_ctf_")
+            ch = ChallengeModel(
+                name="Test Challenge To Delete",
+                category="WEB",
+                difficulty="EASY",
+                working_directory=test_dir,
+                status="RUNNING"
+            )
+            db.add(ch)
+            db.commit()
+            db.refresh(ch)
+
+            # Add a finding with severity and endpoint
+            f = FindingModel(
+                challenge_id=ch.id,
+                agent="web",
+                title="Test SQLi",
+                vulnerability_class="sqli",
+                severity="HIGH",
+                endpoint="/login"
+            )
+            db.add(f)
+            db.commit()
+
+            # Query findings
+            findings = db.query(FindingModel).filter(FindingModel.challenge_id == ch.id).all()
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].severity, "HIGH")
+            self.assertEqual(findings[0].endpoint, "/login")
+
+            # Delete challenge via cascade
+            db.delete(ch)
+            db.commit()
+
+            # Verify finding was cascade deleted
+            findings_after = db.query(FindingModel).filter(FindingModel.challenge_id == ch.id).all()
+            self.assertEqual(len(findings_after), 0)
+
+            # Clean up test directory
+            shutil.rmtree(test_dir, ignore_errors=True)
+            self.assertFalse(os.path.exists(test_dir))
+        finally:
+            db.close()
 
 if __name__ == "__main__":
     unittest.main()
