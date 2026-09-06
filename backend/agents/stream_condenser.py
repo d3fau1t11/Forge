@@ -62,7 +62,18 @@ class StreamCondenser:
                     if line.strip() not in extracted_lines:
                         extracted_lines.append(line.strip())
 
-        # 3. Fallback generic distillation if tool-specific matched too few lines
+        # 3. Web / HTML / Script Output Distillation
+        for line in lines:
+            l_lower = line.lower()
+            if any(kw in l_lower for kw in [
+                "<!--", "-->", "//", "/*", "*/", "rot13", "base64", "bypass", "header", "cookie",
+                "x-", "auth", "token", "jwt", "secret", "dev", "debug", "<form", "<input", "fetch(",
+                "post", "get", "api", "endpoint", "admin", "password", "email", "username", "flag"
+            ]):
+                if line.strip() not in extracted_lines:
+                    extracted_lines.append(line.strip())
+
+        # 4. Fallback generic distillation if tool-specific matched too few lines
         if len(extracted_lines) < 3:
             for line in lines:
                 l_lower = line.lower()
@@ -70,9 +81,9 @@ class StreamCondenser:
                     if line.strip() not in extracted_lines:
                         extracted_lines.append(line.strip())
 
-        # If still nothing specific, grab the first 10 lines + last 10 lines
+        # If still nothing specific, grab the first 12 lines + last 12 lines
         if not extracted_lines:
-            extracted_lines = [l.strip() for l in lines[:10] + lines[-10:] if l.strip()]
+            extracted_lines = [l.strip() for l in lines[:12] + lines[-12:] if l.strip()]
 
         # Deduplicate and cap to max_lines
         final_lines = list(dict.fromkeys(extracted_lines))[:max_lines]
