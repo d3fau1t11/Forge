@@ -11,7 +11,9 @@ class TestLiveAPIKeys(unittest.TestCase):
     def test_providers_registered_from_env(self):
         registered = list(model_router.providers.keys())
         print(f"\n[FORGE] Registered Providers in Router: {registered}")
-        self.assertIn("agentrouter_codex", registered)
+        self.assertIn("groq", registered)
+        self.assertIn("mistral", registered)
+        self.assertIn("xkiro", registered)
         if settings.GEMINI_API_KEY:
             self.assertIn("gemini", registered)
         if settings.NVIDIA_API_KEY:

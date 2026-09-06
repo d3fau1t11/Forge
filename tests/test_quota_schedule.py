@@ -21,7 +21,7 @@ def test_quota_manager_schedule():
 
     # 4. Fallback mapping
     fb = quota_manager.get_fallback_model("claude-opus-5")
-    assert fb == "deepseek-v4-flash"
+    assert fb == "deepseek/deepseek-chat"
 
     next_batch_str = quota_manager.get_next_batch_time_str()
     print(f"Next batch string: {next_batch_str}")

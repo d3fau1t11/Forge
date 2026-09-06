@@ -36,21 +36,29 @@ endpoints = [
     }
 ]
 
-async def test_all():
+async def run_rapidapi_tests():
     print(f"Testing 5 RapidAPI endpoints with key: {key[:8]}...{key[-4:]}\n" + "="*60)
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        for ep in endpoints:
-            headers = {
-                "Content-Type": "application/json",
-                "x-rapidapi-host": ep["host"],
-                "x-rapidapi-key": key
-            }
-            try:
-                r = await client.post(ep["url"], headers=headers, json=ep["payload"])
-                print(f"[{ep['name']}] Status: {r.status_code}")
-                print(f"Response: {r.text[:300]}\n")
-            except Exception as e:
-                print(f"[{ep['name']}] Error: {type(e).__name__}: {e}\n")
+    for ep in endpoints:
+        headers = {
+            "x-rapidapi-key": key,
+            "x-rapidapi-host": ep["host"],
+            "Content-Type": "application/json"
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                res = await client.post(ep["url"], headers=headers, json=ep["payload"])
+                print(f"[{ep['name']:15s}] Status: {res.status_code}")
+                if res.status_code == 200:
+                    text = str(res.json())[:100]
+                    print(f"  OK -> {text}")
+                else:
+                    print(f"  FAIL -> {res.text[:100]}")
+        except Exception as e:
+            print(f"[{ep['name']:15s}] ERR: {e}")
+        await asyncio.sleep(0.5)
+
+def test_all():
+    asyncio.run(run_rapidapi_tests())
 
 if __name__ == "__main__":
-    asyncio.run(test_all())
+    test_all()

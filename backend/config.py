@@ -34,6 +34,7 @@ try:
         GROQ_API_KEY: str = ""
         GROQ_API_KEYS: str = ""
         RAPIDAPI_KEY: str = ""
+        XKIRO_API_KEY: str = ""
 
         # AgentRouter Per-Model Keys
         AGENTROUTER_CLAUDE_OPUS_5_KEY: str = ""
@@ -73,6 +74,7 @@ except ImportError:
             self.MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
             self.COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
             self.GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+            self.XKIRO_API_KEY = os.getenv("XKIRO_API_KEY", "")
 
             # AgentRouter Per-Model Keys
             self.AGENTROUTER_CLAUDE_OPUS_5_KEY = os.getenv("AGENTROUTER_CLAUDE_OPUS_5_KEY", "")

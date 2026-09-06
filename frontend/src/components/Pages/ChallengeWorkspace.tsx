@@ -165,10 +165,15 @@ ${evidenceText}
                 <span className="px-2.5 py-1 rounded bg-cyan-950/80 border border-cyber-cyan/60 text-cyber-cyan text-xs font-bold uppercase">
                   {challenge.category} CTF
                 </span>
-                <span className="text-xs text-slate-400">• TARGET: <span className="text-cyber-cyan font-bold">{target.currentIp}</span></span>
                 <span className="px-2.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-400 text-[11px] font-bold font-mono">
                   🐧 OS: Linux (Parrot/Kali) — Optimal Operational Mode
                 </span>
+                {challenge.status === 'RUNNING' && (
+                  <span className="px-2.5 py-0.5 rounded bg-amber-950/90 border border-amber-500/80 text-amber-300 text-[11px] font-bold font-mono flex items-center space-x-1 animate-pulse shadow-[0_0_10px_rgba(245,158,11,0.3)]">
+                    <Zap className="w-3 h-3 text-amber-400 fill-amber-400" />
+                    <span>⚡ KEEP-AWAKE: Sleep Prevention Active</span>
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -338,26 +343,62 @@ ${evidenceText}
           </div>
 
           <div className="glass-panel border border-slate-800 p-5 rounded-xl space-y-4">
-            <h2 className="font-display font-bold text-slate-100 uppercase border-b border-slate-800 pb-2 text-sm neon-text-cyan">
-              ASSIGNED AGENT TELEMETRY
+            <h2 className="font-display font-bold text-slate-100 uppercase border-b border-slate-800 pb-2 text-sm neon-text-cyan flex items-center justify-between">
+              <span>SWARM FLEET HUD</span>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-950 border border-cyber-cyan/50 text-cyber-cyan">3 PARALLEL WORKERS</span>
             </h2>
             <div className="space-y-3">
-              <div className="p-3.5 rounded-lg bg-obsidian-950 border border-cyber-cyan/40">
-                <div className="flex justify-between font-bold text-cyber-cyan">
-                  <span>ORCHESTRATOR</span>
-                  <span className="text-cyber-emerald">{challenge.status}</span>
+              {/* Swarm Worker 1 */}
+              <div className="p-3 rounded-lg bg-obsidian-950 border border-cyber-cyan/40 space-y-1">
+                <div className="flex justify-between font-bold text-cyber-cyan text-xs">
+                  <span>🛰️ RECON WORKER</span>
+                  <span className={challenge.status === 'RUNNING' ? 'text-cyber-emerald animate-pulse' : 'text-slate-500'}>
+                    {challenge.status === 'RUNNING' ? 'CRAWLING' : 'STANDBY'}
+                  </span>
                 </div>
-                <p className="text-[11px] text-slate-400 mt-1">Coordinating challenge workflow execution</p>
+                <div className="text-[10px] text-purple-300 font-mono">Model: Groq Qwen / Minimax M3 (Zero Cost)</div>
+                <p className="text-[11px] text-slate-400">Port scanning, directory fuzzing & endpoint harvesting</p>
               </div>
 
-              <div className="p-3.5 rounded-lg bg-obsidian-950 border border-cyber-cyan/40">
-                <div className="flex justify-between font-bold text-cyber-cyan">
-                  <span>{challenge.category.toUpperCase()} AGENT</span>
-                  <span className="text-cyber-cyan">{challenge.status === 'RUNNING' ? 'ANALYZING' : challenge.status}</span>
+              {/* Swarm Worker 2 */}
+              <div className="p-3 rounded-lg bg-obsidian-950 border border-cyber-cyan/40 space-y-1">
+                <div className="flex justify-between font-bold text-cyber-cyan text-xs">
+                  <span>🔬 CODE & CRYPTO AUDITOR</span>
+                  <span className={challenge.status === 'RUNNING' ? 'text-cyber-cyan animate-pulse' : 'text-slate-500'}>
+                    {challenge.status === 'RUNNING' ? 'DEOBFUSCATING' : 'STANDBY'}
+                  </span>
                 </div>
-                <p className="text-[11px] text-slate-400 mt-1">
-                  {decisions[0]?.capability ? `Executing ${decisions[0].capability}` : `Analyzing ${challenge.category} target surface`}
-                </p>
+                <div className="text-[10px] text-purple-300 font-mono">Model: Mistral Codestral (Specialist)</div>
+                <p className="text-[11px] text-slate-400">Decompiling scripts, ROT13/JWT token & comment decoding</p>
+              </div>
+
+              {/* Swarm Worker 3 */}
+              <div className="p-3 rounded-lg bg-obsidian-950 border border-cyber-cyan/40 space-y-1">
+                <div className="flex justify-between font-bold text-cyber-cyan text-xs">
+                  <span>⚡ EXPLOIT & PWN SOLVER</span>
+                  <span className={challenge.status === 'RUNNING' ? 'text-cyber-amber animate-pulse' : 'text-slate-500'}>
+                    {challenge.status === 'RUNNING' ? 'SYNTHESIZING' : 'STANDBY'}
+                  </span>
+                </div>
+                <div className="text-[10px] text-purple-300 font-mono">Model: xKiro Qwen Coder / DeepSeek V4</div>
+                <p className="text-[11px] text-slate-400">Crafting auth bypass headers, SQLi & payload delivery</p>
+              </div>
+
+              {/* Shared Blackboard State Summary */}
+              <div className="p-3 rounded-lg bg-obsidian-900/80 border border-slate-700 space-y-1.5 mt-2">
+                <span className="text-[10px] text-slate-400 uppercase font-bold block">SHARED BLACKBOARD STATUS:</span>
+                <div className="flex justify-between text-[11px] text-slate-300">
+                  <span>Discovered Endpoints:</span>
+                  <span className="font-bold text-cyber-cyan">{target.services.length > 0 ? target.services.length + ' mapped' : 'Active'}</span>
+                </div>
+                <div className="flex justify-between text-[11px] text-slate-300">
+                  <span>Deduplication Filter:</span>
+                  <span className="font-bold text-cyber-emerald">ACTIVE (0 collision)</span>
+                </div>
+                <div className="flex justify-between text-[11px] text-slate-300">
+                  <span>Global Flag Kill-Switch:</span>
+                  <span className="font-bold text-amber-400">ARMED (Auto-terminate)</span>
+                </div>
               </div>
             </div>
           </div>

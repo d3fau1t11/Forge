@@ -15,7 +15,7 @@ Key Policy:
 import time
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Set
 
 logger = logging.getLogger("forge.quota_manager")
 
@@ -54,15 +54,27 @@ class AgentRouterQuotaManager:
 
     def __init__(self):
         # Tracks when each model family was last observed as exhausted
-        # Key: model_name, Value: timestamp of last 402 error
         self._exhaustion_timestamps: Dict[str, float] = {}
-
-        # Tracks the count of consecutive 402 errors per model
         self._consecutive_402_counts: Dict[str, int] = {}
-
-        # Global flag: True if ANY quota-limited model returned 402 recently
         self._quota_exhausted_globally = False
         self._last_global_exhaustion_ts: float = 0.0
+        # Session-Wide Circuit Breaker: Models/providers blacklisted for current session
+        self._session_blacklisted: Set[str] = set()
+
+    def blacklist_for_session(self, identifier: str, reason: str = "Quota/RateLimit Exceeded"):
+        """Instantly blacklists a provider or model name for the rest of the session with zero re-tries."""
+        key = identifier.lower().strip()
+        self._session_blacklisted.add(key)
+        logger.warning(f"[CircuitBreaker] ⛔ Model/Provider '{identifier}' BLACKLISTED for current session. Reason: {reason}")
+
+    def is_blacklisted_for_session(self, identifier: str) -> bool:
+        """Returns True if model/provider is blacklisted by the circuit breaker."""
+        return identifier.lower().strip() in self._session_blacklisted
+
+    def reset_session_blacklists(self):
+        """Clears all session blacklists."""
+        self._session_blacklisted.clear()
+        logger.info("[CircuitBreaker] Session blacklists reset.")
 
     def is_quota_limited_model(self, model: str) -> bool:
         """Check if a model is subject to AgentRouter batch quota limits."""

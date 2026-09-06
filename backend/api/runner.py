@@ -41,37 +41,34 @@ class WorkflowRunner:
         self.kill_switches[run_id] = False
 
         # Determine which execution engine to dispatch
-        # Check if Claude Code or Codex CLI is installed and preferred
-        selected_engine = engine_type or "auto"
-
+        # Default directly to Swarm Intelligence or ReAct loop (AgentRouter/Codex CLI completely purged)
+        selected_engine = engine_type or "swarm"
         if selected_engine == "auto":
-            from backend.providers.quota_manager import quota_manager
-            has_claude = bool(shutil.which("claude") or shutil.which("claude.cmd") or os.environ.get("CLAUDE_CODE_PATH"))
-            has_codex = bool(shutil.which("codex") or shutil.which("codex.cmd") or os.environ.get("CODEX_PATH"))
-
-            claude_exhausted = quota_manager.is_model_exhausted("claude-opus-5") or quota_manager.should_skip_quota_limited_models()
-
-            if has_claude and not claude_exhausted:
-                selected_engine = "claude_code"
-            elif has_codex:
-                selected_engine = "codex"
-                if not model:
-                    model = "deepseek-v4-flash"
-            else:
-                selected_engine = "react_loop"
+            selected_engine = "swarm"
 
         try:
             loop = asyncio.get_running_loop()
 
-            if selected_engine in ["claude_code", "codex"]:
-                from backend.agents.cli_agent_runner import cli_agent_runner
+            if selected_engine == "swarm":
+                from backend.agents.swarm_orchestrator import swarm_orchestrator
+                from backend.database.session import SessionLocal
+                from backend.database.models import ChallengeModel
+                
+                db = SessionLocal()
+                ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+                workdir = ch.working_directory if ch else "."
+                category = ch.category if ch else "WEB"
+                difficulty = ch.difficulty if ch else "EASY"
+                db.close()
+
                 task = loop.create_task(
-                    cli_agent_runner.run_cli_agent_loop(
+                    swarm_orchestrator.run_swarm(
                         run_id=run_id,
                         challenge_id=challenge_id,
-                        target=target,
-                        agent_type=selected_engine,
-                        model=model
+                        target_scope=target,
+                        working_directory=workdir,
+                        category=category,
+                        difficulty=difficulty
                     )
                 )
             else:

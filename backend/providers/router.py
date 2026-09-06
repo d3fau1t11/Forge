@@ -7,8 +7,6 @@ from backend.config import settings
 from backend.providers.base import BaseProvider, ProviderResponse
 
 from backend.providers.real_providers import GeminiProvider, OpenAISpecProvider, HuggingFaceProvider, CloudflareProvider
-from backend.providers.cli.claude_code import AgentRouterClaudeCodeProvider
-from backend.providers.cli.codex import AgentRouterCodexProvider
 from backend.providers.quota_manager import quota_manager
 
 logger = logging.getLogger("forge.router")
@@ -35,15 +33,15 @@ class ModelRouter:
     DEFAULT_ROUTING_MAP = {
         # Live-tested 2026-09-06: GLM 5.3 Flash (OpenRouter) & RapidAPI DeepSeek & Groq Qwen = best CTF solvers.
         # RapidAPI DeepSeek first, then OpenRouter GLM, then Groq Qwen (Free/fast), then Cloudflare.
-        "recon": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
-        "directory_enumeration": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
-        "web_analysis": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
-        "web_testing": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
-        "code_analysis": ["rapidapi_deepseek_v32", "groq", "openrouter", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
-        "reverse_engineering": ["rapidapi_deepseek_v32", "groq", "openrouter", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
-        "fast_reasoning": ["groq", "rapidapi_deepseek_v32", "openrouter", "cloudflare", "rapidapi_gpt54_mini", "nvidia", "agentrouter_claude_code", "gemini"],
-        "general_reasoning": ["rapidapi_deepseek_v32", "groq", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"],
-        "verification": ["rapidapi_deepseek_v32", "groq", "openrouter", "cloudflare", "nvidia", "agentrouter_claude_code", "gemini"]
+        "recon": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
+        "directory_enumeration": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
+        "web_analysis": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
+        "web_testing": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
+        "code_analysis": ["mistral_codestral", "xkiro_coder", "rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "cloudflare", "nvidia", "gemini"],
+        "reverse_engineering": ["mistral_codestral", "xkiro_coder", "rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "cloudflare", "nvidia", "gemini"],
+        "fast_reasoning": ["groq", "xkiro", "mistral", "rapidapi_deepseek_v32", "openrouter", "cloudflare", "rapidapi_gpt54_mini", "nvidia", "gemini"],
+        "general_reasoning": ["rapidapi_deepseek_v32", "groq", "xkiro", "xkiro_planner", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
+        "verification": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "cloudflare", "nvidia", "gemini"]
     }
 
     # Model to Provider/Transport Mapping
@@ -52,12 +50,6 @@ class ModelRouter:
         "qwen-3.8-27b": ("groq", "qwen/qwen3.8-27b"),
         "gpt-oss-120b": ("groq", "openai/gpt-oss-120b"),
         "groq-compound": ("groq", "groq/compound"),
-        # Claude (AgentRouter Claude Code CLI)
-        "claude-opus-5": ("agentrouter_claude_code", "claude_code"),
-        "claude-opus-4-8": ("agentrouter_claude_code", "claude_code"),
-        # Codex (AgentRouter Codex CLI)
-        "gpt-5.6": ("agentrouter_codex", "codex"),
-        "gpt-5.6-sol": ("agentrouter_codex", "codex"),
         # RapidAPI (High reliability & speed)
         "gpt-5.4-mini": ("rapidapi_gpt54_mini", "gpt-5.4-mini"),
         "deepseek-v3.2": ("rapidapi_deepseek_v32", "DeepSeek-V3.2"),
@@ -79,14 +71,25 @@ class ModelRouter:
         "deepseek-v4-pro": ("nvidia", "deepseek-ai/deepseek-v4-pro-0813"),
         "nemotron-lightning": ("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b"),
         "nemotron-ultra": ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
-        "kimi-k3": ("nvidia", "moonshotai/kimi-k3")
+        "kimi-k3": ("nvidia", "moonshotai/kimi-k3"),
+        # Mistral AI (Codestral for code, Mistral Small/Medium for general)
+        "codestral-latest": ("mistral_codestral", "codestral-latest"),
+        "codestral-2508": ("mistral_codestral", "codestral-2508"),
+        "mistral-small-latest": ("mistral", "mistral-small-latest"),
+        "mistral-medium-latest": ("mistral", "mistral-medium-latest"),
+        "mistral-medium-3.5": ("mistral", "mistral-medium-3.5"),
+        "magistral-medium-latest": ("mistral", "magistral-medium-latest"),
+        "magistral-small-latest": ("mistral", "magistral-small-latest"),
+        # xKiro Free-Tier Models (Zero cost, high quota)
+        "xkiro-deepseek-v4": ("xkiro", "deepseek/deepseek-v4-flash"),
+        "xkiro-deepseek-chat": ("xkiro", "deepseek/deepseek-chat-v3.1"),
+        "xkiro-mistral-large": ("xkiro_planner", "mistralai/mistral-large-2512"),
+        "xkiro-qwen-coder": ("xkiro_coder", "qwen/qwen3-coder-plus:free"),
+        "xkiro-minimax-m3": ("xkiro", "minimax/minimax-m3:free")
     }
 
     def __init__(self):
-        self.providers: Dict[str, BaseProvider] = {
-            "agentrouter_claude_code": AgentRouterClaudeCodeProvider(),
-            "agentrouter_codex": AgentRouterCodexProvider()
-        }
+        self.providers: Dict[str, BaseProvider] = {}
         self.paid_allowed = settings.PAID_MODEL_ALLOWED
         self.daily_budget_usd = settings.DAILY_BUDGET_USD
         self.current_spent_usd = 0.0
@@ -167,6 +170,57 @@ class ModelRouter:
                 api_key=settings.NVIDIA_API_KEY,
                 default_model="deepseek-ai/deepseek-v4-pro-0813",
                 base_url="https://integrate.api.nvidia.com/v1"
+            ))
+        # 7. Mistral AI Provider (46 models, no content filtering, verified 2026-09-06)
+        mistral_key = (settings.MISTRAL_API_KEY or os.getenv("MISTRAL_API_KEY", "")).strip()
+        if mistral_key:
+            # Codestral - specialized for code analysis & reverse engineering
+            self.register_provider("mistral_codestral", OpenAISpecProvider(
+                name="mistral_codestral",
+                is_paid=True,
+                api_key=mistral_key,
+                default_model="codestral-latest",
+                base_url="https://api.mistral.ai/v1",
+                speed_tier="fast"
+            ))
+            # Mistral general - small/medium for reasoning & CTF tasks
+            self.register_provider("mistral", OpenAISpecProvider(
+                name="mistral",
+                is_paid=True,
+                api_key=mistral_key,
+                default_model="mistral-small-latest",
+                base_url="https://api.mistral.ai/v1",
+                speed_tier="fast"
+            ))
+        # 8. xKiro AI Gateway Provider (Free models, verified CTF unrestricted)
+        xkiro_key = (getattr(settings, "XKIRO_API_KEY", "") or os.getenv("XKIRO_API_KEY", "")).strip()
+        if xkiro_key:
+            # Default fast reasoning / recon
+            self.register_provider("xkiro", OpenAISpecProvider(
+                name="xkiro",
+                is_paid=False,
+                api_key=xkiro_key,
+                default_model="deepseek/deepseek-v4-flash",
+                base_url="https://api.xkiro.com/v1",
+                speed_tier="fast"
+            ))
+            # Binary decompilation and code reversing
+            self.register_provider("xkiro_coder", OpenAISpecProvider(
+                name="xkiro_coder",
+                is_paid=False,
+                api_key=xkiro_key,
+                default_model="qwen/qwen3-coder-plus:free",
+                base_url="https://api.xkiro.com/v1",
+                speed_tier="fast"
+            ))
+            # Large multi-step planner
+            self.register_provider("xkiro_planner", OpenAISpecProvider(
+                name="xkiro_planner",
+                is_paid=False,
+                api_key=xkiro_key,
+                default_model="mistralai/mistral-large-2512",
+                base_url="https://api.xkiro.com/v1",
+                speed_tier="fast"
             ))
         # Note: Direct HTTP REST calls to agentrouter.org/v1 return 401 Unauthorized Client.
         # AgentRouter access is strictly mediated via terminal CLI tools (agentrouter_claude_code & agentrouter_codex).
@@ -278,8 +332,8 @@ class ModelRouter:
             candidates.sort(key=lambda p_name: 0 if getattr(self.providers.get(p_name), "speed_tier", "fast") == speed_tier else 1)
 
         for provider_name in candidates:
-            if skip_quota_limited and provider_name == "agentrouter_claude_code":
-                # Outside 3-hour batch window or exhausted: skip Claude Code immediately
+            # Zero-retry session circuit breaker check
+            if quota_manager.is_blacklisted_for_session(provider_name):
                 continue
 
             provider = self.providers.get(provider_name)
@@ -304,12 +358,9 @@ class ModelRouter:
                     )
                     
                     if response.is_refusal:
-                        # Check for quota exhaustion in refusal
                         refusal = response.refusal_reason or ""
-                        if quota_manager.detect_quota_error(refusal):
-                            quota_manager.record_quota_exhaustion(
-                                response.model_name, refusal
-                            )
+                        if quota_manager.detect_quota_error(refusal) or "429" in refusal or "402" in refusal or "401" in refusal:
+                            quota_manager.blacklist_for_session(provider_name, refusal)
                         logger.warning(f"Model refusal from {provider_name}: {response.refusal_reason}. Fallback...")
                         asyncio.create_task(_notify_fallback(provider_name, refusal or "Model Refusal / Quota Limit"))
                         continue
@@ -321,9 +372,8 @@ class ModelRouter:
                     return response
                 except Exception as e:
                     error_str = str(e)
-                    # Detect 402 quota errors from exceptions too
-                    if quota_manager.detect_quota_error(error_str):
-                        quota_manager.record_quota_exhaustion(provider_name, error_str)
+                    if quota_manager.detect_quota_error(error_str) or "429" in error_str or "402" in error_str or "401" in error_str:
+                        quota_manager.blacklist_for_session(provider_name, error_str)
                     logger.error(f"Error calling provider {provider_name}: {error_str}. Fallback...")
                     asyncio.create_task(_notify_fallback(provider_name, error_str))
                     continue
