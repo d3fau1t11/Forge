@@ -14,7 +14,7 @@ import {
   INITIAL_AUDIT_LOGS, 
   INITIAL_FINDINGS,
   INITIAL_WORKFLOW_PIPELINE 
-} from './data/mockData';
+} from './data/initialState';
 
 import { Sidebar } from './components/Shell/Sidebar';
 import { TopBar } from './components/Shell/TopBar';
