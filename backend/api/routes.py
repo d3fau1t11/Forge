@@ -549,6 +549,13 @@ async def start_run(challenge_id: str, db: Session = Depends(get_db)):
         "target": target_addr
     })
 
+    if challenge.mission_plan:
+        await ws_manager.broadcast({
+            "event": "PLAN_GENERATED",
+            "challenge_id": challenge.id,
+            "plan": challenge.mission_plan
+        })
+
     return run
 
 @router.get("/checkpoints")

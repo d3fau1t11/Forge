@@ -58,18 +58,51 @@ class AgentRouterQuotaManager:
         self._consecutive_402_counts: Dict[str, int] = {}
         self._quota_exhausted_globally = False
         self._last_global_exhaustion_ts: float = 0.0
-        # Session-Wide Circuit Breaker: Models/providers blacklisted for current session
-        self._session_blacklisted: Set[str] = set()
+        # Session-Wide Circuit Breaker: Models/providers temporarily blacklisted
+        # Maps identifier -> (expiry_timestamp, reason)
+        self._session_blacklisted: Dict[str, Tuple[float, str]] = {}
 
     def blacklist_for_session(self, identifier: str, reason: str = "Quota/RateLimit Exceeded"):
-        """Instantly blacklists a provider or model name for the rest of the session with zero re-tries."""
+        """Temporarily blacklists a provider/model with a time-limited cooldown.
+        - 429/rate-limit errors: 5-minute cooldown (transient, will recover)
+        - 402/quota errors: 30-minute cooldown (likely won't recover soon, but not permanent)
+        - 401/auth errors: 60-minute cooldown (likely config issue)
+        """
         key = identifier.lower().strip()
-        self._session_blacklisted.add(key)
-        logger.warning(f"[CircuitBreaker] ⛔ Model/Provider '{identifier}' BLACKLISTED for current session. Reason: {reason}")
+        reason_lower = reason.lower()
+        
+        # Determine cooldown duration based on error type
+        if "429" in reason or "rate" in reason_lower:
+            cooldown_seconds = 300  # 5 minutes for rate limits
+            error_type = "rate-limit"
+        elif "402" in reason or "quota" in reason_lower or "budget" in reason_lower:
+            cooldown_seconds = 1800  # 30 minutes for quota exhaustion
+            error_type = "quota"
+        elif "401" in reason or "unauthorized" in reason_lower:
+            cooldown_seconds = 3600  # 60 minutes for auth errors
+            error_type = "auth"
+        else:
+            cooldown_seconds = 300  # 5 minutes default
+            error_type = "unknown"
+        
+        expiry = time.time() + cooldown_seconds
+        self._session_blacklisted[key] = (expiry, reason)
+        logger.warning(
+            f"[CircuitBreaker] ⛔ Provider '{identifier}' blacklisted for {cooldown_seconds}s ({error_type}). Reason: {reason[:120]}"
+        )
 
     def is_blacklisted_for_session(self, identifier: str) -> bool:
-        """Returns True if model/provider is blacklisted by the circuit breaker."""
-        return identifier.lower().strip() in self._session_blacklisted
+        """Returns True if model/provider is currently blacklisted (not expired)."""
+        key = identifier.lower().strip()
+        if key not in self._session_blacklisted:
+            return False
+        expiry, reason = self._session_blacklisted[key]
+        if time.time() >= expiry:
+            # Blacklist expired — provider can be retried
+            del self._session_blacklisted[key]
+            logger.info(f"[CircuitBreaker] ✅ Provider '{identifier}' blacklist expired, re-enabled.")
+            return False
+        return True
 
     def reset_session_blacklists(self):
         """Clears all session blacklists."""
@@ -268,7 +301,7 @@ class AgentRouterQuotaManager:
         return False
 
     def detect_quota_error(self, error_text: str) -> bool:
-        """Detect if an error string indicates AgentRouter quota exhaustion."""
+        """Detect if an error string indicates quota exhaustion, rate limit, or budget depletion."""
         if not error_text:
             return False
         lower = error_text.lower()
@@ -277,6 +310,14 @@ class AgentRouterQuotaManager:
             or "budget pool quota has been exhausted" in lower
             or "quota exhausted" in lower
             or "quota has been exhausted" in lower
+            or "exceeded the daily quota" in lower
+            or "exceeded the quota" in lower
+            or "exceeded your current quota" in lower
+            or "daily quota" in lower
+            or "insufficient_quota" in lower
+            or "rate limit" in lower
+            or "too many requests" in lower
+            or ("quota" in lower and any(w in lower for w in ("exceeded", "limit", "zero", "depleted", "exhausted")))
         )
 
 

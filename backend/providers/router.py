@@ -31,17 +31,16 @@ class ModelRouter:
     """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
 
     DEFAULT_ROUTING_MAP = {
-        # Live-tested 2026-09-06: GLM 5.3 Flash (OpenRouter) & RapidAPI DeepSeek & Groq Qwen = best CTF solvers.
-        # RapidAPI DeepSeek first, then OpenRouter GLM, then Groq Qwen (Free/fast), then Cloudflare.
-        "recon": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
-        "directory_enumeration": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
-        "web_analysis": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
-        "web_testing": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
-        "code_analysis": ["mistral_codestral", "xkiro_coder", "rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "cloudflare", "nvidia", "gemini"],
-        "reverse_engineering": ["mistral_codestral", "xkiro_coder", "rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "cloudflare", "nvidia", "gemini"],
-        "fast_reasoning": ["groq", "xkiro", "mistral", "rapidapi_deepseek_v32", "openrouter", "cloudflare", "rapidapi_gpt54_mini", "nvidia", "gemini"],
-        "general_reasoning": ["rapidapi_deepseek_v32", "groq", "xkiro", "xkiro_planner", "mistral", "openrouter", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "gemini"],
-        "verification": ["rapidapi_deepseek_v32", "groq", "xkiro", "mistral", "openrouter", "cloudflare", "nvidia", "gemini"]
+        # Curated order: Groq (multi-key), xKiro (free CTF), Mistral (46 models), OpenRouter (GLM/DeepSeek), Gemini (18 keys), RapidAPI, Cloudflare, NVIDIA
+        "recon": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
+        "directory_enumeration": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
+        "web_analysis": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
+        "web_testing": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
+        "code_analysis": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia"],
+        "reverse_engineering": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia"],
+        "fast_reasoning": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "rapidapi_gpt54_mini", "nvidia"],
+        "general_reasoning": ["groq", "xkiro", "xkiro_planner", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
+        "verification": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia"]
     }
 
     # Model to Provider/Transport Mapping
@@ -283,45 +282,60 @@ class ModelRouter:
                 target_model = fallback_model
 
             provider_name, target_model_id = self.MODEL_PROVIDER_MAP[target_model]
-            provider = self.providers.get(provider_name)
-            if provider and await provider.is_available():
-                logger.info(f"[ModelRouter] Direct routing model '{target_model}' to provider '{provider_name}' (target: {target_model_id})")
-                res = await provider.generate_response(
-                    prompt=prompt,
-                    system_instruction=system_instruction,
-                    capability=capability,
-                    model=target_model_id,
-                    **kwargs
-                )
-                if not res.is_refusal:
-                    quota_manager.record_successful_request(target_model)
-                    return res
-
-                # Detect AgentRouter 402 quota exhaustion from refusal reason
-                refusal = res.refusal_reason or ""
-                if quota_manager.detect_quota_error(refusal) or "402" in refusal or "budget" in refusal.lower():
-                    quota_manager.record_quota_exhaustion(target_model, refusal)
-                    # Instant auto-fallback to OpenRouter always-available model
-                    fallback_model = quota_manager.get_fallback_model(target_model) or "deepseek/deepseek-chat"
-                    logger.info(
-                        f"[ModelRouter] Quota 402 detected for '{target_model}'. "
-                        f"Instantly failing over to OpenRouter model '{fallback_model}'..."
-                    )
-                    fb_provider_name, fb_model_id = self.MODEL_PROVIDER_MAP.get(fallback_model, ("openrouter", "deepseek/deepseek-chat"))
-                    fb_provider = self.providers.get(fb_provider_name)
-                    if fb_provider and await fb_provider.is_available():
-                        fb_res = await fb_provider.generate_response(
+            if not quota_manager.is_blacklisted_for_session(provider_name):
+                provider = self.providers.get(provider_name)
+                if provider and await provider.is_available():
+                    try:
+                        logger.info(f"[ModelRouter] Direct routing model '{target_model}' to provider '{provider_name}' (target: {target_model_id})")
+                        res = await provider.generate_response(
                             prompt=prompt,
                             system_instruction=system_instruction,
                             capability=capability,
-                            model=fb_model_id,
+                            model=target_model_id,
                             **kwargs
                         )
-                        if not fb_res.is_refusal:
-                            quota_manager.record_successful_request(fallback_model)
-                            return fb_res
+                        if not res.is_refusal:
+                            quota_manager.record_successful_request(target_model)
+                            return res
 
-                logger.warning(f"Provider '{provider_name}' failed for model '{target_model}': {res.refusal_reason}. Falling back to capability chain...")
+                        # Detect AgentRouter 402 quota exhaustion from refusal reason
+                        refusal = res.refusal_reason or ""
+                        if quota_manager.detect_quota_error(refusal) or "402" in refusal or "budget" in refusal.lower():
+                            quota_manager.record_quota_exhaustion(target_model, refusal)
+                            quota_manager.blacklist_for_session(provider_name, refusal)
+                            # Instant auto-fallback to OpenRouter always-available model
+                            fallback_model = quota_manager.get_fallback_model(target_model) or "deepseek/deepseek-chat"
+                            logger.info(
+                                f"[ModelRouter] Quota 402 detected for '{target_model}'. "
+                                f"Instantly failing over to OpenRouter model '{fallback_model}'..."
+                            )
+                            fb_provider_name, fb_model_id = self.MODEL_PROVIDER_MAP.get(fallback_model, ("openrouter", "deepseek/deepseek-chat"))
+                            fb_provider = self.providers.get(fb_provider_name)
+                            if fb_provider and await fb_provider.is_available():
+                                try:
+                                    fb_res = await fb_provider.generate_response(
+                                        prompt=prompt,
+                                        system_instruction=system_instruction,
+                                        capability=capability,
+                                        model=fb_model_id,
+                                        **kwargs
+                                    )
+                                    if not fb_res.is_refusal:
+                                        quota_manager.record_successful_request(fallback_model)
+                                        return fb_res
+                                except Exception as fb_err:
+                                    logger.warning(f"[ModelRouter] Fallback model '{fallback_model}' also failed: {fb_err}")
+
+                        logger.warning(f"Provider '{provider_name}' failed for model '{target_model}': {res.refusal_reason}. Falling back to capability chain...")
+                        asyncio.create_task(_notify_fallback(provider_name, res.refusal_reason or "Direct model refusal"))
+
+                    except Exception as direct_err:
+                        # Direct model path crashed (network error, timeout, etc.) — fall through to capability chain
+                        error_str = str(direct_err)
+                        logger.warning(f"[ModelRouter] Direct model '{target_model}' via '{provider_name}' raised exception: {error_str}. Falling back to capability chain...")
+                        if "402" in error_str or quota_manager.detect_quota_error(error_str):
+                            quota_manager.blacklist_for_session(provider_name, error_str)
+                        asyncio.create_task(_notify_fallback(provider_name, error_str))
 
         # 2. Capability Candidates Fallback Chain
         skip_quota_limited = quota_manager.should_skip_quota_limited_models()
@@ -332,7 +346,7 @@ class ModelRouter:
             candidates.sort(key=lambda p_name: 0 if getattr(self.providers.get(p_name), "speed_tier", "fast") == speed_tier else 1)
 
         for provider_name in candidates:
-            # Zero-retry session circuit breaker check
+            # Time-limited circuit breaker check
             if quota_manager.is_blacklisted_for_session(provider_name):
                 continue
 
@@ -359,8 +373,13 @@ class ModelRouter:
                     
                     if response.is_refusal:
                         refusal = response.refusal_reason or ""
-                        if quota_manager.detect_quota_error(refusal) or "429" in refusal or "402" in refusal or "401" in refusal:
+                        # Only blacklist for confirmed quota exhaustion (402) or auth failure (401)
+                        # Do NOT blacklist for 429 rate limits — they're transient, just skip to next provider
+                        if quota_manager.detect_quota_error(refusal) or "402" in refusal:
                             quota_manager.blacklist_for_session(provider_name, refusal)
+                        elif "401" in refusal or "unauthorized" in refusal.lower():
+                            quota_manager.blacklist_for_session(provider_name, refusal)
+                        # 429 and generic refusals: skip this provider for now but don't blacklist
                         logger.warning(f"Model refusal from {provider_name}: {response.refusal_reason}. Fallback...")
                         asyncio.create_task(_notify_fallback(provider_name, refusal or "Model Refusal / Quota Limit"))
                         continue
@@ -372,7 +391,10 @@ class ModelRouter:
                     return response
                 except Exception as e:
                     error_str = str(e)
-                    if quota_manager.detect_quota_error(error_str) or "429" in error_str or "402" in error_str or "401" in error_str:
+                    # Only blacklist for confirmed quota/auth errors, not transient network issues
+                    if quota_manager.detect_quota_error(error_str) or "402" in error_str:
+                        quota_manager.blacklist_for_session(provider_name, error_str)
+                    elif "401" in error_str:
                         quota_manager.blacklist_for_session(provider_name, error_str)
                     logger.error(f"Error calling provider {provider_name}: {error_str}. Fallback...")
                     asyncio.create_task(_notify_fallback(provider_name, error_str))

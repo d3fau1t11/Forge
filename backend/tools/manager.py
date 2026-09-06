@@ -206,4 +206,29 @@ class ToolManager:
             duration_ms=elapsed_ms
         )
 
+    async def execute_tool(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        timeout: int = 60,
+        working_directory: Optional[str] = None
+    ) -> ToolExecutionResult:
+        """Universal tool invocation supporting CLI/bash commands and registered capabilities."""
+        if tool_name in ["bash", "sh", "cli", "terminal", "command", "raw"]:
+            cmd = params.get("command") or params.get("cmd") or ""
+            return await self.execute_raw_command(
+                command=cmd,
+                cwd=working_directory,
+                timeout_seconds=timeout
+            )
+        else:
+            target = params.get("target") or params.get("url") or params.get("ip") or ""
+            extra_args = params.get("extra_args") or params.get("args") or ""
+            return await self.execute_capability(
+                capability=tool_name,
+                target=target,
+                extra_args=extra_args,
+                cwd=working_directory
+            )
+
 tool_manager = ToolManager()

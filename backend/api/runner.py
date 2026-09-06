@@ -81,13 +81,32 @@ class WorkflowRunner:
                     )
                 )
 
+            # Attach error callback so unhandled exceptions surface in logs
+            def _on_task_done(t: asyncio.Task):
+                if t.cancelled():
+                    logger.info(f"Run task {run_id} was cancelled.")
+                    return
+                exc = t.exception()
+                if exc:
+                    import traceback as tb
+                    logger.error(f"Run task {run_id} crashed with unhandled exception: {exc}\n{''.join(tb.format_exception(type(exc), exc, exc.__traceback__))}")
+                    # Write to challenge log file for visibility
+                    try:
+                        from backend.agents.swarm_orchestrator import _append_to_challenge_log
+                        _append_to_challenge_log(challenge_id, "runner", f"FATAL: {exc}")
+                    except Exception:
+                        pass
+
+            task.add_done_callback(_on_task_done)
             self.tasks[run_id] = task
             logger.info(f"Started workflow run {run_id} using engine '{selected_engine}' for target {target}")
 
         except RuntimeError as e:
-            logger.error(f"Failed to create run task for run {run_id}: {e}")
+            import traceback as tb
+            logger.error(f"Failed to create run task for run {run_id}: {e}\n{tb.format_exc()}")
         except Exception as e:
-            logger.error(f"Unexpected error starting run task for run {run_id}: {e}")
+            import traceback as tb
+            logger.error(f"Unexpected error starting run task for run {run_id}: {e}\n{tb.format_exc()}")
 
     def activate_kill_switch(self, run_id: Optional[str] = None):
         """Emergency Kill Switch - immediately halts autonomous operations."""
