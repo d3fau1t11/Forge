@@ -310,6 +310,9 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
         current_phase="ingest",
         current_agent="orchestrator"
     )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
     # Pre-flight Mission Plan Generation
     from backend.agents.strategic_planner import strategic_planner
     try:
