@@ -23,6 +23,7 @@ from backend.reporting.generator import report_generator
 from backend.knowledge.playbook_vault import playbook_vault
 from backend.recon.turbo_recon import turbo_recon
 from backend.agents.stream_condenser import stream_condenser
+from backend.agents.strategic_planner import strategic_planner
 
 logger = logging.getLogger("forge.orchestrator")
 
@@ -96,6 +97,45 @@ class AutonomousOrchestrator:
             "repetition_warnings": 0
         }
 
+        # ── Pre-flight Mission Planning Phase ──
+        db_init: Session = SessionLocal()
+        mission_plan = None
+        try:
+            ch_obj = db_init.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+            if ch_obj:
+                if not ch_obj.started_at:
+                    ch_obj.started_at = datetime.utcnow()
+                
+                # Check existing mission plan or generate new pre-flight plan
+                if ch_obj.mission_plan and isinstance(ch_obj.mission_plan, dict) and ch_obj.mission_plan.get("tasks"):
+                    mission_plan = ch_obj.mission_plan
+                else:
+                    cached_recon = turbo_recon.get_cached_recon(challenge_id)
+                    recon_summary = cached_recon.get("raw_summary", "") if cached_recon else ""
+                    
+                    mission_plan = await strategic_planner.generate_initial_plan(
+                        challenge_id=challenge_id,
+                        challenge_name=ch_obj.name,
+                        category=ch_obj.category,
+                        difficulty=ch_obj.difficulty,
+                        target=target,
+                        description=ch_obj.description,
+                        turbo_recon_summary=recon_summary
+                    )
+                    ch_obj.mission_plan = mission_plan
+                    db_init.commit()
+
+                await ws_manager.broadcast({
+                    "event": "PLAN_GENERATED",
+                    "challenge_id": challenge_id,
+                    "run_id": run_id,
+                    "plan": mission_plan
+                })
+        except Exception as plan_err:
+            logger.error(f"Pre-flight mission plan initialization error: {plan_err}")
+        finally:
+            db_init.close()
+
         for turn in range(1, max_turns + 1):
             if workflow_runner.is_cancelled(run_id):
                 logger.warning(f"Run {run_id} cancelled by Kill Switch.")
@@ -114,15 +154,18 @@ class AutonomousOrchestrator:
                     logger.info(f"Run {run_id} terminated or paused externally.")
                     return
 
-                # Calculate realistic progress based on investigation state milestones
-                if challenge.flag_status == "CAPTURED":
-                    progress = 100
-                elif state_memory["discovered_endpoints"] or state_memory["observed_cookies"]:
-                    progress = min(85, 30 + (turn * 4))
-                else:
-                    progress = min(40, 10 + (turn * 3))
+                # Calculate dynamic task-based progress %
+                dynamic_progress = strategic_planner.calculate_progress(
+                    mission_plan,
+                    flag_captured=(challenge.flag_status == "CAPTURED" or challenge.status == "COMPLETED")
+                )
+                challenge.progress = max(challenge.progress, dynamic_progress)
 
-                challenge.progress = max(challenge.progress, progress)
+                # Record live operation uptime / duration
+                if challenge.started_at:
+                    duration_sec = int((datetime.utcnow() - challenge.started_at).total_seconds())
+                    challenge.duration_seconds = max(challenge.duration_seconds or 0, duration_sec)
+
                 run.current_phase = "recon" if turn <= 3 else ("web" if turn <= 10 else "exploitation")
                 run.current_agent = "orchestrator"
                 db.commit()
@@ -132,7 +175,8 @@ class AutonomousOrchestrator:
                     "challenge_id": challenge_id,
                     "run_id": run_id,
                     "phase": run.current_phase,
-                    "progress": challenge.progress
+                    "progress": challenge.progress,
+                    "duration_seconds": challenge.duration_seconds
                 })
 
                 # Format Structured State Memory for Prompt Injection
@@ -329,6 +373,38 @@ class AutonomousOrchestrator:
                 if normalized_history and normalized_history.count(norm_cmd) >= 1:
                     state_memory["repetition_warnings"] += 1
                     logger.warning(f"Normalized loop detected for `{norm_cmd[:30]}` (Count={normalized_history.count(norm_cmd)}). Forcing pivot.")
+                    
+                    # Trigger Multi-Model Strategic Review
+                    if mission_plan:
+                        try:
+                            mission_plan = await strategic_planner.review_and_adapt_plan(
+                                challenge_name=challenge.name,
+                                category=challenge.category,
+                                target=target,
+                                mission_plan=mission_plan,
+                                stuck_reason=f"Repetition deadlock on command `{norm_cmd[:40]}`",
+                                recent_history=history_summary,
+                                primary_model=model_used
+                            )
+                            challenge.mission_plan = mission_plan
+                            db.commit()
+                            if mission_plan.get("strategic_reviews"):
+                                await ws_manager.broadcast({
+                                    "event": "STRATEGIC_REVIEW_TRIGGERED",
+                                    "challenge_id": challenge_id,
+                                    "run_id": run_id,
+                                    "review": mission_plan["strategic_reviews"][-1],
+                                    "plan": mission_plan
+                                })
+                                await ws_manager.broadcast({
+                                    "event": "PLAN_UPDATED",
+                                    "challenge_id": challenge_id,
+                                    "run_id": run_id,
+                                    "plan": mission_plan
+                                })
+                        except Exception as rev_err:
+                            logger.error(f"Strategic review trigger error: {rev_err}")
+
                     if "login" in cmd_line:
                         cmd_line = f"curl -i -s -c cookies.txt {target.rstrip('/')}/register"
                     elif "nmap" in cmd_line:
@@ -495,6 +571,38 @@ class AutonomousOrchestrator:
                 condensed_output = stream_condenser.condense_output(tool_res.tool_name, stdout_text or log_output)
                 history_summary.append(f"Turn #{turn} Command: `{cmd_line}`\nOutput snippet:\n{condensed_output[:600]}")
 
+                # Update Mission Todo List Task Progress
+                if mission_plan:
+                    try:
+                        mission_plan = strategic_planner.update_task_progress(
+                            mission_plan=mission_plan,
+                            turn=turn,
+                            executed_command=cmd_line,
+                            output_snippet=condensed_output,
+                            is_success=(tool_res.exit_code == 0)
+                        )
+                        challenge.mission_plan = mission_plan
+                        new_progress = strategic_planner.calculate_progress(mission_plan, flag_captured=(challenge.flag_status == "CAPTURED"))
+                        challenge.progress = max(challenge.progress, new_progress)
+                        db.commit()
+
+                        await ws_manager.broadcast({
+                            "event": "PLAN_UPDATED",
+                            "challenge_id": challenge_id,
+                            "run_id": run_id,
+                            "plan": mission_plan
+                        })
+                        await ws_manager.broadcast({
+                            "event": "PROGRESS_UPDATED",
+                            "challenge_id": challenge_id,
+                            "run_id": run_id,
+                            "phase": run.current_phase,
+                            "progress": challenge.progress,
+                            "duration_seconds": challenge.duration_seconds
+                        })
+                    except Exception as plan_up_err:
+                        logger.error(f"Task progress update error: {plan_up_err}")
+
                 # Save Evidence
                 ev = EvidenceModel(
                     challenge_id=challenge_id,
@@ -546,11 +654,28 @@ class AutonomousOrchestrator:
             run = db.query(RunModel).filter(RunModel.id == run_id).first()
             challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
             if challenge:
+                if challenge.started_at:
+                    duration_sec = int((datetime.utcnow() - challenge.started_at).total_seconds())
+                    challenge.duration_seconds = max(challenge.duration_seconds or 0, duration_sec)
+
                 if challenge.flag_status == "CAPTURED" or challenge.status == "COMPLETED":
                     challenge.status = "COMPLETED"
                     challenge.progress = 100
+                    challenge.completed_at = datetime.utcnow()
                     if run:
                         run.status = "COMPLETED"
+                    
+                    if challenge.mission_plan and isinstance(challenge.mission_plan, dict) and "tasks" in challenge.mission_plan:
+                        for t in challenge.mission_plan["tasks"]:
+                            t["status"] = "COMPLETED"
+                        challenge.mission_plan["status"] = "COMPLETED"
+                        await ws_manager.broadcast({
+                            "event": "PLAN_UPDATED",
+                            "challenge_id": challenge_id,
+                            "run_id": run_id,
+                            "plan": challenge.mission_plan
+                        })
+
                     output_dir = getattr(challenge, 'working_directory', '') or 'reports'
                     report_generator.generate_readme(db, challenge_id, output_dir=output_dir)
                     await ws_manager.broadcast({
@@ -558,7 +683,8 @@ class AutonomousOrchestrator:
                         "challenge_id": challenge_id,
                         "run_id": run_id,
                         "status": "COMPLETED",
-                        "flag": challenge.flag
+                        "flag": challenge.flag,
+                        "duration_seconds": challenge.duration_seconds
                     })
                 else:
                     # Turn cycle completed WITHOUT capturing a flag -> AWAITING_FLAG (NEVER COMPLETED)
@@ -572,6 +698,7 @@ class AutonomousOrchestrator:
                         "challenge_id": challenge_id,
                         "run_id": run_id,
                         "status": "AWAITING_FLAG",
+                        "duration_seconds": challenge.duration_seconds,
                         "message": "Turn cycle finished without flag match. Ready for operator review or next attack vector."
                     })
             db.commit()
@@ -584,8 +711,26 @@ class AutonomousOrchestrator:
         challenge.flag = flag_str
         challenge.status = "COMPLETED"
         challenge.progress = 100
+        challenge.completed_at = datetime.utcnow()
+        if challenge.started_at:
+            duration_sec = int((datetime.utcnow() - challenge.started_at).total_seconds())
+            challenge.duration_seconds = max(challenge.duration_seconds or 0, duration_sec)
+
         if run:
             run.status = "COMPLETED"
+
+        # Complete all mission plan tasks
+        if challenge.mission_plan and isinstance(challenge.mission_plan, dict) and "tasks" in challenge.mission_plan:
+            for t in challenge.mission_plan["tasks"]:
+                t["status"] = "COMPLETED"
+            challenge.mission_plan["status"] = "COMPLETED"
+            await ws_manager.broadcast({
+                "event": "PLAN_UPDATED",
+                "challenge_id": challenge_id,
+                "run_id": run_id,
+                "plan": challenge.mission_plan
+            })
+
         db.commit()
 
         finding = FindingModel(
@@ -624,7 +769,8 @@ class AutonomousOrchestrator:
             "event": "FLAG_CAPTURED",
             "challenge_id": challenge_id,
             "flag": flag_str,
-            "source": source
+            "source": source,
+            "duration_seconds": challenge.duration_seconds
         })
 
     async def execute_run_step(self, db: Session, run_id: str) -> Dict[str, Any]:

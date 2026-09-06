@@ -82,6 +82,16 @@ export class ApiService {
     }
   }
 
+  public async getChallengePlan(challengeId: string) {
+    try {
+      const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/plan`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return null;
+    }
+  }
+
   public async createChallenge(data: {
     name: string;
     category: string;

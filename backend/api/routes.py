@@ -156,6 +156,13 @@ def get_challenge(challenge_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Challenge not found")
     return challenge
 
+@router.get("/challenges/{challenge_id}/plan")
+def get_challenge_plan(challenge_id: str, db: Session = Depends(get_db)):
+    challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    return challenge.mission_plan or {"tasks": [], "status": "PENDING"}
+
 @router.post("/challenges")
 async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(get_db)):
     platform = req.platform_name.strip() if (req.platform_name and req.platform_name.strip()) else "PicoCTF"
@@ -205,9 +212,23 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
         current_phase="ingest",
         current_agent="orchestrator"
     )
-    db.add(run)
-    db.commit()
-    db.refresh(run)
+    # Pre-flight Mission Plan Generation
+    from backend.agents.strategic_planner import strategic_planner
+    try:
+        initial_plan = await strategic_planner.generate_initial_plan(
+            challenge_id=challenge.id,
+            challenge_name=challenge.name,
+            category=challenge.category,
+            difficulty=challenge.difficulty,
+            target=resolved_target,
+            description=challenge.description
+        )
+        challenge.mission_plan = initial_plan
+        challenge.started_at = datetime.utcnow()
+        db.commit()
+        db.refresh(challenge)
+    except Exception as plan_err:
+        logger.warning(f"Initial plan creation fallback: {plan_err}")
 
     # Phase 3 Turbo Recon: Pre-warm recon in background immediately
     from backend.recon.turbo_recon import turbo_recon
@@ -239,6 +260,14 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
         "working_directory": working_dir,
         "log_file": ch_log_path
     })
+
+    if challenge.mission_plan:
+        await ws_manager.broadcast({
+            "event": "PLAN_GENERATED",
+            "challenge_id": challenge.id,
+            "run_id": run.id,
+            "plan": challenge.mission_plan
+        })
 
     return challenge
 

@@ -87,9 +87,45 @@ export default function App() {
             setChallenges((prev) =>
               prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
             );
+            setActiveChallenge((prev) => (prev && prev.id === data.challenge_id ? { ...prev, status: 'RUNNING' } : prev));
+          } else if (data.event === 'PLAN_GENERATED' || data.event === 'PLAN_UPDATED') {
+            setChallenges((prev) =>
+              prev.map((c) => (c.id === data.challenge_id ? { ...c, missionPlan: data.plan, mission_plan: data.plan } : c))
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id ? { ...prev, missionPlan: data.plan, mission_plan: data.plan } : prev
+            );
+          } else if (data.event === 'STRATEGIC_REVIEW_TRIGGERED') {
+            setChallenges((prev) =>
+              prev.map((c) => (c.id === data.challenge_id ? { ...c, missionPlan: data.plan, mission_plan: data.plan } : c))
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id ? { ...prev, missionPlan: data.plan, mission_plan: data.plan } : prev
+            );
           } else if (data.event === 'PROGRESS_UPDATED') {
             setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, progress: data.progress, status: 'RUNNING' } : c))
+              prev.map((c) =>
+                c.id === data.challenge_id
+                  ? {
+                      ...c,
+                      progress: data.progress,
+                      status: 'RUNNING',
+                      durationSeconds: data.duration_seconds ?? c.durationSeconds,
+                      duration_seconds: data.duration_seconds ?? c.duration_seconds
+                    }
+                  : c
+              )
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id
+                ? {
+                    ...prev,
+                    progress: data.progress,
+                    status: 'RUNNING',
+                    durationSeconds: data.duration_seconds ?? prev.durationSeconds,
+                    duration_seconds: data.duration_seconds ?? prev.duration_seconds
+                  }
+                : prev
             );
           } else if (data.event === 'LOG_OUTPUT') {
             const newLog: TerminalLog = {
@@ -148,7 +184,32 @@ export default function App() {
             setEvidenceList((prev) => [newEv, ...prev]);
           } else if (data.event === 'FLAG_CAPTURED') {
             setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, flagStatus: 'CAPTURED', flag: data.flag } : c))
+              prev.map((c) =>
+                c.id === data.challenge_id
+                  ? {
+                      ...c,
+                      flagStatus: 'CAPTURED',
+                      flag: data.flag,
+                      status: 'COMPLETED',
+                      progress: 100,
+                      durationSeconds: data.duration_seconds ?? c.durationSeconds,
+                      duration_seconds: data.duration_seconds ?? c.duration_seconds
+                    }
+                  : c
+              )
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id
+                ? {
+                    ...prev,
+                    flagStatus: 'CAPTURED',
+                    flag: data.flag,
+                    status: 'COMPLETED',
+                    progress: 100,
+                    durationSeconds: data.duration_seconds ?? prev.durationSeconds,
+                    duration_seconds: data.duration_seconds ?? prev.duration_seconds
+                  }
+                : prev
             );
             const newFinding: Finding = {
               id: `find-${Date.now()}`,
@@ -162,7 +223,51 @@ export default function App() {
             setFindings((prev) => [newFinding, ...prev]);
           } else if (data.event === 'RUN_COMPLETED') {
             setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'COMPLETED', progress: 100 } : c))
+              prev.map((c) =>
+                c.id === data.challenge_id
+                  ? {
+                      ...c,
+                      status: 'COMPLETED',
+                      progress: 100,
+                      durationSeconds: data.duration_seconds ?? c.durationSeconds,
+                      duration_seconds: data.duration_seconds ?? c.duration_seconds
+                    }
+                  : c
+              )
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id
+                ? {
+                    ...prev,
+                    status: 'COMPLETED',
+                    progress: 100,
+                    durationSeconds: data.duration_seconds ?? prev.durationSeconds,
+                    duration_seconds: data.duration_seconds ?? prev.duration_seconds
+                  }
+                : prev
+            );
+          } else if (data.event === 'RUN_AWAITING_FLAG') {
+            setChallenges((prev) =>
+              prev.map((c) =>
+                c.id === data.challenge_id
+                  ? {
+                      ...c,
+                      status: 'AWAITING_FLAG',
+                      durationSeconds: data.duration_seconds ?? c.durationSeconds,
+                      duration_seconds: data.duration_seconds ?? c.duration_seconds
+                    }
+                  : c
+              )
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id
+                ? {
+                    ...prev,
+                    status: 'AWAITING_FLAG',
+                    durationSeconds: data.duration_seconds ?? prev.durationSeconds,
+                    duration_seconds: data.duration_seconds ?? prev.duration_seconds
+                  }
+                : prev
             );
           } else if (data.event === 'KILL_SWITCH_ACTIVATED') {
             setKillSwitchActive(true);
@@ -236,11 +341,21 @@ export default function App() {
           status: c.status,
           progress: c.progress || 0,
           lastActivity: 'Just now',
-          flagStatus: c.flagStatus || 'UNFOUND',
+          flagStatus: c.flagStatus || c.flag_status || 'UNFOUND',
           flag: c.flag,
           description: c.description,
           workingDirectory: c.working_directory,
-          platformName: c.platform_name
+          platformName: c.platform_name,
+          createdAt: c.created_at || c.createdAt,
+          created_at: c.created_at || c.createdAt,
+          startedAt: c.started_at || c.startedAt,
+          started_at: c.started_at || c.startedAt,
+          completedAt: c.completed_at || c.completedAt,
+          completed_at: c.completed_at || c.completedAt,
+          durationSeconds: c.duration_seconds || c.durationSeconds || 0,
+          duration_seconds: c.duration_seconds || c.durationSeconds || 0,
+          missionPlan: c.mission_plan || c.missionPlan,
+          mission_plan: c.mission_plan || c.missionPlan
         }));
         setChallenges(formatted);
       }

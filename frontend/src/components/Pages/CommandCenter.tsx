@@ -46,15 +46,39 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         setElapsedSeconds(0);
         return;
       }
-      const createdStr = activeChallenge.createdAt || (activeChallenge as any).created_at;
-      if (createdStr) {
-        const createdMs = new Date(createdStr).getTime();
-        const nowMs = Date.now();
-        if (!isNaN(createdMs)) {
-          setElapsedSeconds(Math.max(0, Math.floor((nowMs - createdMs) / 1000)));
+      
+      const startedStr = activeChallenge.startedAt || activeChallenge.started_at || activeChallenge.createdAt || activeChallenge.created_at;
+      const completedStr = activeChallenge.completedAt || activeChallenge.completed_at;
+
+      if (activeChallenge.status === 'RUNNING') {
+        if (startedStr) {
+          const startMs = new Date(startedStr).getTime();
+          const nowMs = Date.now();
+          if (!isNaN(startMs)) {
+            setElapsedSeconds(Math.max(0, Math.floor((nowMs - startMs) / 1000)));
+            return;
+          }
+        }
+      } else if (activeChallenge.status === 'COMPLETED' || activeChallenge.status === 'AWAITING_FLAG') {
+        if (activeChallenge.durationSeconds || activeChallenge.duration_seconds) {
+          setElapsedSeconds(activeChallenge.durationSeconds || activeChallenge.duration_seconds || 0);
           return;
         }
+        if (startedStr && completedStr) {
+          const startMs = new Date(startedStr).getTime();
+          const endMs = new Date(completedStr).getTime();
+          if (!isNaN(startMs) && !isNaN(endMs)) {
+            setElapsedSeconds(Math.max(0, Math.floor((endMs - startMs) / 1000)));
+            return;
+          }
+        }
       }
+
+      if (activeChallenge.durationSeconds || activeChallenge.duration_seconds) {
+        setElapsedSeconds(activeChallenge.durationSeconds || activeChallenge.duration_seconds || 0);
+        return;
+      }
+
       setElapsedSeconds((prev) => prev + 1);
     };
 
@@ -65,7 +89,19 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [activeChallenge?.id, activeChallenge?.status, (activeChallenge as any)?.createdAt, (activeChallenge as any)?.created_at, killSwitchActive]);
+  }, [
+    activeChallenge?.id,
+    activeChallenge?.status,
+    activeChallenge?.startedAt,
+    activeChallenge?.started_at,
+    activeChallenge?.createdAt,
+    activeChallenge?.created_at,
+    activeChallenge?.completedAt,
+    activeChallenge?.completed_at,
+    activeChallenge?.durationSeconds,
+    activeChallenge?.duration_seconds,
+    killSwitchActive
+  ]);
 
   const formatDuration = (totalSeconds: number): string => {
     const hrs = Math.floor(totalSeconds / 3600);

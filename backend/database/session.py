@@ -48,6 +48,26 @@ def init_db():
                 conn.commit()
             except Exception:
                 pass
+            try:
+                conn.execute(text("ALTER TABLE challenges ADD COLUMN started_at TIMESTAMP"))
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE challenges ADD COLUMN completed_at TIMESTAMP"))
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE challenges ADD COLUMN duration_seconds INTEGER DEFAULT 0"))
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE challenges ADD COLUMN mission_plan JSON"))
+                conn.commit()
+            except Exception:
+                pass
 
 def get_db():
     db = SessionLocal()

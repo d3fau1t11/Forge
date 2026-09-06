@@ -14,6 +14,7 @@ export type NavTab =
 
 export type ChallengeTab = 
   | 'overview' 
+  | 'todo_plan'
   | 'workflow' 
   | 'terminal' 
   | 'ai_decisions' 
@@ -21,13 +22,44 @@ export type ChallengeTab =
   | 'findings' 
   | 'readme';
 
+export interface MissionTask {
+  id: string;
+  phase: 'RECON' | 'SURFACE_ANALYSIS' | 'EXPLOITATION' | 'FLAG_EXTRACTION' | 'VERIFICATION';
+  title: string;
+  tool: string;
+  reasoning: string;
+  playbook_ref?: string;
+  status: 'PENDING' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED' | 'REVISED';
+  output_summary?: string;
+}
+
+export interface StrategicReview {
+  id: string;
+  timestamp: string;
+  reviewer_model: string;
+  stuck_reason: string;
+  diagnosis: string;
+  pivot_strategy: string;
+}
+
+export interface MissionPlan {
+  challenge_id: string;
+  status: string;
+  summary: string;
+  model?: string;
+  created_at: string;
+  updated_at: string;
+  tasks: MissionTask[];
+  strategic_reviews?: StrategicReview[];
+}
+
 export interface Challenge {
   id: string;
   name: string;
   category: string;
   difficulty: 'EASY' | 'MEDIUM' | 'HARD' | 'INSANE';
   target: string;
-  status: 'RUNNING' | 'PAUSED' | 'WAITING' | 'SOLVED' | 'FAILED' | 'COMPLETED' | 'QUEUED';
+  status: 'RUNNING' | 'PAUSED' | 'WAITING' | 'SOLVED' | 'FAILED' | 'COMPLETED' | 'QUEUED' | 'AWAITING_FLAG';
   progress: number; // 0 - 100
   lastActivity: string;
   flagStatus: 'UNFOUND' | 'CAPTURED' | 'VERIFYING';
@@ -37,6 +69,14 @@ export interface Challenge {
   platformName?: string;
   createdAt?: string;
   created_at?: string;
+  startedAt?: string;
+  started_at?: string;
+  completedAt?: string;
+  completed_at?: string;
+  durationSeconds?: number;
+  duration_seconds?: number;
+  missionPlan?: MissionPlan;
+  mission_plan?: MissionPlan;
 }
 
 export interface Target {

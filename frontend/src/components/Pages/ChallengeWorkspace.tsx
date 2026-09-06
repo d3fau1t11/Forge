@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Play, 
   Pause, 
@@ -14,7 +14,10 @@ import {
   FileText,
   AlertTriangle,
   FileCode,
-  Folder
+  Folder,
+  ListTodo,
+  Clock,
+  Zap
 } from 'lucide-react';
 import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
@@ -43,8 +46,45 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   onToggleStatus
 }) => {
   const [activeTab, setActiveTab] = useState<
-    'overview' | 'workflow' | 'terminal' | 'ai_decisions' | 'evidence' | 'findings' | 'readme'
+    'overview' | 'todo_plan' | 'workflow' | 'terminal' | 'ai_decisions' | 'evidence' | 'findings' | 'readme'
   >('overview');
+  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
+
+  useEffect(() => {
+    let interval: any = null;
+
+    const calcElapsed = () => {
+      const startedStr = challenge.startedAt || challenge.started_at || challenge.createdAt || challenge.created_at;
+      if (startedStr) {
+        const startMs = new Date(startedStr).getTime();
+        const nowMs = Date.now();
+        if (!isNaN(startMs)) {
+          setElapsedSeconds(Math.max(0, Math.floor((nowMs - startMs) / 1000)));
+          return;
+        }
+      }
+      if (challenge.durationSeconds || challenge.duration_seconds) {
+        setElapsedSeconds(challenge.durationSeconds || challenge.duration_seconds || 0);
+        return;
+      }
+      setElapsedSeconds((prev) => prev + 1);
+    };
+
+    calcElapsed();
+    if (challenge.status === 'RUNNING') {
+      interval = setInterval(calcElapsed, 1000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [challenge.id, challenge.status, challenge.startedAt, challenge.started_at, challenge.createdAt, challenge.created_at, challenge.durationSeconds, challenge.duration_seconds]);
+
+  const formatDuration = (totalSeconds: number): string => {
+    const hrs = Math.floor(totalSeconds / 3600);
+    const mins = Math.floor((totalSeconds % 3600) / 60);
+    const secs = totalSeconds % 60;
+    return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
 
   const activeWorkflowNodes: WorkflowNode[] = workflowNodes.length > 0 ? workflowNodes : [
     { id: 'wn-1', label: '1. INGEST', status: 'COMPLETED', description: `Challenge scope & target ${challenge.target} initialized in workspace.` },
@@ -115,6 +155,8 @@ ${evidenceText}
     setWriteupText(buildDynamicWriteup());
   };
 
+  const currentPlan = challenge.missionPlan || challenge.mission_plan;
+
   return (
     <div className="space-y-5 font-mono text-slate-100 pb-10">
       {/* Workspace Top Header Bar */}
@@ -142,8 +184,14 @@ ${evidenceText}
             </div>
           </div>
 
-          {/* Action Controls & Progress */}
-          <div className="flex items-center space-x-4">
+          {/* Action Controls & Uptime & Progress */}
+          <div className="flex items-center space-x-4 flex-wrap gap-2">
+            <div className="flex items-center space-x-2 text-xs bg-obsidian-900/90 px-3 py-1.5 rounded-lg border border-slate-800 shadow-inner">
+              <Clock className="w-3.5 h-3.5 text-cyber-cyan" />
+              <span className="text-slate-400 font-bold text-[10px] uppercase">UPTIME:</span>
+              <span className="text-slate-100 font-bold font-mono text-xs">{formatDuration(elapsedSeconds)}</span>
+            </div>
+
             <div className="flex items-center space-x-2 text-xs">
               <span className={`w-3 h-3 rounded-full ${challenge.status === 'RUNNING' ? 'bg-cyber-emerald animate-ping' : 'bg-cyber-amber'}`}></span>
               <span className="font-bold text-cyber-emerald tracking-wider">● {challenge.status}</span>
@@ -172,9 +220,9 @@ ${evidenceText}
           </div>
         </div>
 
-        {/* Progress Bar Row */}
+        {/* Dynamic Progress Bar Row */}
         <div className="flex items-center space-x-4 text-xs">
-          <span className="text-slate-400 font-bold shrink-0">CHALLENGE COMPLETION:</span>
+          <span className="text-slate-400 font-bold shrink-0">MISSION COMPLETION:</span>
           <div className="flex-1 h-2.5 bg-obsidian-950 rounded-full overflow-hidden border border-slate-800">
             <div
               className="h-full bg-cyber-cyan transition-all duration-500 shadow-[0_0_12px_#00f0ff]"
@@ -185,10 +233,11 @@ ${evidenceText}
         </div>
       </div>
 
-      {/* 7 Workspace Navigation Tabs */}
+      {/* 8 Workspace Navigation Tabs */}
       <div className="flex items-center space-x-2 border-b border-slate-800 pb-2 overflow-x-auto text-xs font-mono">
         {[
           { key: 'overview', label: 'OVERVIEW', icon: Shield },
+          { key: 'todo_plan', label: 'MISSION TODO LIST', icon: ListTodo },
           { key: 'workflow', label: 'PIPELINE GRAPH', icon: Layers },
           { key: 'terminal', label: 'TERMINAL', icon: Terminal },
           { key: 'ai_decisions', label: 'AI REASONING', icon: Cpu },
@@ -209,6 +258,11 @@ ${evidenceText}
             >
               <Icon className="w-4 h-4" />
               <span>{t.label}</span>
+              {t.key === 'todo_plan' && currentPlan?.tasks && (
+                <span className="ml-1 px-1.5 py-0.2 rounded-full bg-obsidian-950 text-[10px] text-cyber-cyan font-bold border border-cyber-cyan/40">
+                  {currentPlan.tasks.filter(tk => tk.status === 'COMPLETED').length}/{currentPlan.tasks.length}
+                </span>
+              )}
             </button>
           );
         })}
@@ -235,6 +289,22 @@ ${evidenceText}
                     {decisions[0]?.reason || findings[0]?.description || 'Target capability reasoning active. Formulating vulnerability hypothesis...'}
                   </span>
                 </div>
+                {currentPlan?.tasks && currentPlan.tasks.length > 0 && (
+                  <div className="bg-obsidian-950 p-3 rounded-lg border border-cyber-cyan/30 flex items-center justify-between">
+                    <div>
+                      <span className="text-slate-500 block text-[10px] uppercase font-bold mb-0.5">Active Mission Task:</span>
+                      <span className="text-cyber-cyan font-bold text-xs">
+                        {currentPlan.tasks.find(t => t.status === 'IN_PROGRESS')?.title || currentPlan.tasks[0]?.title}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => handleTabChange('todo_plan')}
+                      className="px-2.5 py-1 rounded bg-obsidian-900 border border-cyber-cyan/60 hover:bg-cyan-950 text-cyber-cyan text-[11px] font-bold"
+                    >
+                      VIEW TODO LIST →
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -301,6 +371,181 @@ ${evidenceText}
                 </p>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB: MISSION TODO LIST */}
+      {activeTab === 'todo_plan' && (
+        <div className="space-y-5 font-mono text-xs">
+          {/* Mission Strategy & Header Summary */}
+          <div className="glass-panel border-2 border-cyber-cyan/40 rounded-xl p-5 space-y-4 shadow-[0_0_30px_rgba(0,240,255,0.15)] cyber-corner">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-4">
+              <div>
+                <div className="flex items-center space-x-2">
+                  <ListTodo className="w-5 h-5 text-cyber-cyan animate-pulse" />
+                  <h2 className="text-lg font-display font-bold text-slate-100 uppercase neon-text-cyan tracking-wider">
+                    AUTONOMOUS PRE-FLIGHT MISSION PLAN & TODO LIST
+                  </h2>
+                </div>
+                <p className="text-slate-400 text-xs mt-1">
+                  {currentPlan?.summary || `Pre-flight sequential attack vector and tactical milestones for ${target.currentIp}`}
+                </p>
+              </div>
+
+              <div className="flex items-center space-x-3 shrink-0">
+                <div className="bg-obsidian-950 px-3 py-1.5 rounded-lg border border-slate-800 flex items-center space-x-2">
+                  <Cpu className="w-4 h-4 text-cyber-emerald" />
+                  <span className="text-[11px] text-slate-300 font-bold">
+                    Planner: <span className="text-cyber-emerald">{currentPlan?.model || 'AI Model Router'}</span>
+                  </span>
+                </div>
+                <div className="bg-obsidian-950 px-3 py-1.5 rounded-lg border border-slate-800 flex items-center space-x-2">
+                  <Zap className="w-4 h-4 text-cyber-cyan" />
+                  <span className="text-[11px] text-slate-300 font-bold">
+                    Completed: <span className="text-cyber-cyan">
+                      {currentPlan?.tasks?.filter(t => t.status === 'COMPLETED').length || 0} / {currentPlan?.tasks?.length || 0}
+                    </span>
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Strategic Multi-Model Review Alert Banner (if any reviews occurred) */}
+            {currentPlan?.strategic_reviews && currentPlan.strategic_reviews.length > 0 && (
+              <div className="p-4 rounded-xl bg-purple-950/40 border-2 border-purple-500/60 shadow-[0_0_20px_rgba(168,85,247,0.2)] space-y-2.5">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center space-x-2">
+                    <Sparkles className="w-4 h-4 text-purple-400 animate-spin" />
+                    <span className="font-display font-bold text-purple-200 uppercase tracking-wide text-xs">
+                      🤖 MULTI-MODEL STRATEGIC REVIEW & PIVOT ACTIVE
+                    </span>
+                  </div>
+                  <span className="text-[10px] text-purple-300 bg-purple-900/60 px-2 py-0.5 rounded border border-purple-700">
+                    Reviewer: {currentPlan.strategic_reviews[currentPlan.strategic_reviews.length - 1].reviewer_model}
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-300 space-y-1">
+                  <p><span className="text-purple-400 font-bold">Diagnosis:</span> {currentPlan.strategic_reviews[currentPlan.strategic_reviews.length - 1].diagnosis}</p>
+                  <p><span className="text-cyber-emerald font-bold">Pivot Strategy:</span> {currentPlan.strategic_reviews[currentPlan.strategic_reviews.length - 1].pivot_strategy}</p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Task Checklist Cards */}
+          <div className="space-y-3">
+            {currentPlan?.tasks && currentPlan.tasks.length > 0 ? (
+              currentPlan.tasks.map((task, idx) => {
+                const isCompleted = task.status === 'COMPLETED';
+                const isInProgress = task.status === 'IN_PROGRESS';
+                const isRevised = task.status === 'REVISED';
+                const isFailed = task.status === 'FAILED';
+
+                return (
+                  <div
+                    key={task.id || idx}
+                    className={`glass-panel p-4 rounded-xl border transition-all duration-300 ${
+                      isInProgress
+                        ? 'border-cyber-cyan shadow-[0_0_20px_rgba(0,240,255,0.25)] bg-obsidian-900/90'
+                        : isCompleted
+                        ? 'border-emerald-500/40 bg-emerald-950/10 hover:border-emerald-500/70'
+                        : isRevised
+                        ? 'border-purple-500/40 bg-purple-950/10'
+                        : 'border-slate-800/80 bg-obsidian-950/60 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="flex items-start space-x-3.5">
+                        <div className="pt-0.5 shrink-0">
+                          {isCompleted ? (
+                            <div className="w-6 h-6 rounded-full bg-emerald-500/20 border border-emerald-500 flex items-center justify-center text-cyber-emerald shadow-[0_0_10px_rgba(0,255,136,0.3)]">
+                              <Check className="w-3.5 h-3.5" />
+                            </div>
+                          ) : isInProgress ? (
+                            <div className="w-6 h-6 rounded-full bg-cyan-500/20 border border-cyber-cyan flex items-center justify-center text-cyber-cyan animate-pulse shadow-[0_0_10px_rgba(0,240,255,0.4)]">
+                              <div className="w-2 h-2 rounded-full bg-cyber-cyan"></div>
+                            </div>
+                          ) : isRevised ? (
+                            <div className="w-6 h-6 rounded-full bg-purple-500/20 border border-purple-500 flex items-center justify-center text-purple-400">
+                              <Sparkles className="w-3.5 h-3.5" />
+                            </div>
+                          ) : isFailed ? (
+                            <div className="w-6 h-6 rounded-full bg-rose-500/20 border border-cyber-rose flex items-center justify-center text-cyber-rose">
+                              <AlertTriangle className="w-3.5 h-3.5" />
+                            </div>
+                          ) : (
+                            <div className="w-6 h-6 rounded-full bg-obsidian-950 border border-slate-700 flex items-center justify-center text-slate-500 text-[10px] font-bold">
+                              {idx + 1}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="space-y-1">
+                          <div className="flex items-center space-x-2 flex-wrap">
+                            <span className="font-bold text-sm text-slate-100 tracking-wide">{task.title}</span>
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                              task.phase === 'RECON'
+                                ? 'bg-blue-950/80 text-blue-400 border border-blue-800'
+                                : task.phase === 'SURFACE_ANALYSIS'
+                                ? 'bg-amber-950/80 text-amber-400 border border-amber-800'
+                                : task.phase === 'EXPLOITATION'
+                                ? 'bg-purple-950/80 text-purple-400 border border-purple-800'
+                                : task.phase === 'FLAG_EXTRACTION'
+                                ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800'
+                                : 'bg-slate-900 text-slate-300 border border-slate-700'
+                            }`}>
+                              {task.phase}
+                            </span>
+                          </div>
+                          <p className="text-slate-400 text-xs leading-relaxed">{task.reasoning}</p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center space-x-2 self-start sm:self-center shrink-0">
+                        <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold tracking-wider uppercase border ${
+                          isCompleted
+                            ? 'bg-emerald-950/90 text-emerald-400 border-emerald-700'
+                            : isInProgress
+                            ? 'bg-cyan-950/90 text-cyber-cyan border-cyber-cyan shadow-[0_0_10px_rgba(0,240,255,0.3)] animate-pulse'
+                            : isRevised
+                            ? 'bg-purple-950/90 text-purple-300 border-purple-700'
+                            : isFailed
+                            ? 'bg-rose-950/90 text-cyber-rose border-rose-800'
+                            : 'bg-obsidian-950 text-slate-500 border-slate-800'
+                        }`}>
+                          {task.status}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Tool & Playbook Details */}
+                    <div className="mt-3 pt-3 border-t border-slate-800/60 flex items-center justify-between flex-wrap gap-2 text-[11px]">
+                      <div className="flex items-center space-x-2 text-slate-400">
+                        <Terminal className="w-3.5 h-3.5 text-cyber-cyan" />
+                        <span>Tool: <code className="text-cyber-cyan font-semibold">{task.tool}</code></span>
+                        {task.playbook_ref && (
+                          <span className="ml-2 text-slate-500">• Playbook: <code className="text-slate-300">{task.playbook_ref}</code></span>
+                        )}
+                      </div>
+                      {task.output_summary && (
+                        <div className="text-slate-400 text-[10px] truncate max-w-md" title={task.output_summary}>
+                          Output: <span className="text-slate-200">{task.output_summary}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="glass-panel border border-slate-800 rounded-xl p-8 text-center space-y-3">
+                <ListTodo className="w-8 h-8 text-cyber-cyan mx-auto animate-pulse" />
+                <h3 className="font-display font-bold text-slate-200">GENERATING PRE-FLIGHT MISSION TODO LIST</h3>
+                <p className="text-slate-400 text-xs max-w-md mx-auto font-mono">
+                  FORGE Autonomous Agent is analyzing target surface scope and compiling initial attack tasks.
+                </p>
+              </div>
+            )}
           </div>
         </div>
       )}
