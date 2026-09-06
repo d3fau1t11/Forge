@@ -58,6 +58,8 @@ class CLIAgentRunner:
             env["ANTHROPIC_BASE_URL"] = "https://agentrouter.org"
             env["ANTHROPIC_AUTH_TOKEN"] = api_key
             env["AGENTROUTER_API_KEY"] = api_key
+            env["ANTHROPIC_MODEL"] = model_name or "claude-opus-5"
+            env["CLAUDE_MODEL"] = model_name or "claude-opus-5"
 
         elif agent_type == "codex":
             api_key = (
@@ -164,6 +166,8 @@ class CLIAgentRunner:
                 cmd_args = [
                     executable,
                     "-p", initial_prompt,
+                    "--model", model_arg,
+                    "--no-session-persistence",
                     "--output-format", "text"
                 ]
             else: # codex
@@ -182,7 +186,7 @@ class CLIAgentRunner:
                 "agent": agent_type.upper(),
                 "goal": f"Autonomous CLI Investigation via {binary_name}",
                 "capability": "cli_autonomous_agent",
-                "model": model or agent_type,
+                "model": model_arg,
                 "result": f"Spawning autonomous {binary_name} process in {working_dir}...",
                 "confidence": 99
             })
@@ -192,7 +196,7 @@ class CLIAgentRunner:
             ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
 
             # Spawn subprocess in challenge working directory
-            logger.info(f"Spawning `{binary_name}` process in cwd: {working_dir}")
+            logger.info(f"Spawning `{binary_name}` process in cwd: {working_dir} with model {model_arg}")
             proc = await asyncio.create_subprocess_exec(
                 *cmd_args,
                 cwd=working_dir,
@@ -218,38 +222,46 @@ class CLIAgentRunner:
                     line_bytes = await stream.readline()
                     if not line_bytes:
                         break
-                    line = line_bytes.decode(errors="replace")
-                    clean_line = redact_secrets(line, redact_list)
+
+                    raw_line = line_bytes.decode(errors="replace")
+                    clean_line = redact_secrets(raw_line, redact_list)
                     accumulated_output.append(clean_line)
 
-                    # Log to dedicated challenge log file
+                    # Append to challenge dedicated log file
                     try:
                         with open(ch_log_path, "a", encoding="utf-8") as f:
                             f.write(f"[{datetime.utcnow().strftime('%H:%M:%S')}] [{binary_name}] {clean_line}")
                     except Exception:
                         pass
 
-                    # Broadcast real-time log event to frontend terminal
+                    # Real-time WebSocket streaming of CLI output to Terminal Tab
                     await ws_manager.broadcast({
                         "event": "LOG_OUTPUT",
                         "challenge_id": challenge_id,
-                        "command": f"{binary_name} output",
-                        "output": clean_line,
-                        "exit_code": 0 if not is_stderr else 1,
+                        "command": f"{binary_name} exec",
+                        "output": clean_line.strip(),
+                        "exit_code": None,
                         "timestamp": datetime.utcnow().strftime("%H:%M:%S")
                     })
 
-                    # Check for flag match in stream
-                    if not captured_flag:
-                        match = FLAG_REGEX.search(clean_line)
-                        if match:
-                            captured_flag = match.group(1)
-                            logger.info(f"[FLAG CAPTURED BY {binary_name.upper()}] Flag: {captured_flag}")
+                    # Real-time flag discovery detection
+                    for flag_pattern in [
+                        r"picoCTF\{[A-Za-z0-9_!@#$%^&*+-]+\}",
+                        r"FLAG\{[A-Za-z0-9_!@#$%^&*+-]+\}",
+                        r"HTB\{[A-Za-z0-9_!@#$%^&*+-]+\}",
+                        r"CTF\{[A-Za-z0-9_!@#$%^&*+-]+\}"
+                    ]:
+                        match = re.search(flag_pattern, clean_line, re.IGNORECASE)
+                        if match and not captured_flag:
+                            captured_flag = match.group(0)
+                            logger.info(f"FLAG CAPTURED by {binary_name} agent: {captured_flag}")
                             await ws_manager.broadcast({
                                 "event": "FLAG_CAPTURED",
                                 "challenge_id": challenge_id,
-                                "flag": captured_flag
+                                "flag": captured_flag,
+                                "agent": agent_type
                             })
+                            break
 
             # Run stream readers concurrently
             await asyncio.gather(
@@ -260,28 +272,38 @@ class CLIAgentRunner:
             await proc.wait()
             logger.info(f"{binary_name} process exited with return code {proc.returncode}")
 
+            # Record elapsed duration
+            if challenge.started_at:
+                challenge.duration_seconds = max(
+                    challenge.duration_seconds or 0,
+                    int((datetime.utcnow() - challenge.started_at).total_seconds())
+                )
+
             # Finalize Challenge State
             full_output = "".join(accumulated_output)
-            # Check for AgentRouter 402 Quota Exhaustion
             from backend.providers.quota_manager import quota_manager
             is_quota_error = quota_manager.detect_quota_error(full_output) or "402" in full_output or "budget pool" in full_output.lower()
 
-            if proc.returncode != 0 and is_quota_error and not captured_flag:
-                failed_model = model or ("claude-opus-5" if agent_type == "claude_code" else "gpt-5.6")
-                quota_manager.record_quota_exhaustion(failed_model, full_output[:200])
+            # Handle errors (402 quota, 403 permission, or any non-zero exit code): Auto-fallback to Autonomous Orchestrator
+            if proc.returncode != 0 and not captured_flag:
+                failed_model = model_arg
+                if is_quota_error:
+                    quota_manager.record_quota_exhaustion(failed_model, full_output[:200])
+
                 next_batch = quota_manager.get_next_batch_time_str()
+                reason_msg = f"HTTP 402 Quota limit (Next batch at {next_batch})" if is_quota_error else f"CLI exited with error code {proc.returncode} / permission check"
 
                 logger.warning(
-                    f"[CLIAgentRunner] AgentRouter quota EXHAUSTED for '{agent_type}'. "
-                    f"Next replenishment: {next_batch}. Auto-fallback to Autonomous Orchestrator..."
+                    f"[CLIAgentRunner] `{binary_name}` encountered issue ({reason_msg}). "
+                    f"Auto-falling back to Autonomous Orchestrator with OpenRouter & Gemini..."
                 )
 
                 await ws_manager.broadcast({
                     "type": "PROVIDER_FALLBACK_TRIGGERED",
                     "data": {
-                        "failed_provider": f"{binary_name.upper()} (Claude/GPT Batch Quota Exhausted)",
-                        "reason": f"HTTP 402 Budget pool quota exhausted. Next batch at {next_batch}",
-                        "next_provider": "Autonomous Orchestrator (RapidAPI / DeepSeek)",
+                        "failed_provider": f"{binary_name.upper()} ({reason_msg})",
+                        "reason": reason_msg,
+                        "next_provider": "Autonomous Orchestrator (OpenRouter DeepSeek / Gemini)",
                         "timestamp": datetime.utcnow().isoformat()
                     }
                 })
@@ -290,12 +312,12 @@ class CLIAgentRunner:
                     "event": "LOG_OUTPUT",
                     "challenge_id": challenge_id,
                     "command": f"{binary_name} fallback",
-                    "output": f"[QUOTA NOTICE] Claude batch quota exhausted (402). Auto-switching to Autonomous Orchestrator ReAct engine with RapidAPI/DeepSeek...",
+                    "output": f"[FALLBACK NOTICE] `{binary_name}` stopped ({reason_msg}). Seamlessly transitioning to Autonomous Orchestrator...",
                     "exit_code": 0,
                     "timestamp": datetime.utcnow().strftime("%H:%M:%S")
                 })
 
-                # Seamlessly hand off to Autonomous Orchestrator without failing
+                # Seamlessly hand off to Autonomous Orchestrator to execute the Todo list
                 from backend.agents.orchestrator_loop import orchestrator_loop
                 await orchestrator_loop.run_autonomous_loop(run_id, challenge_id, target)
                 return
@@ -305,6 +327,7 @@ class CLIAgentRunner:
                 challenge.flag_status = "CAPTURED"
                 challenge.status = "COMPLETED"
                 challenge.progress = 100
+                challenge.completed_at = datetime.utcnow()
 
                 finding = FindingModel(
                     challenge_id=challenge.id,
@@ -321,10 +344,11 @@ class CLIAgentRunner:
             elif proc.returncode == 0:
                 challenge.status = "AWAITING_FLAG"
                 challenge.progress = 80
-                logger.info(f"[CLIAgentRunner] {binary_name} exited with code 0 but no flag was captured. Setting status to AWAITING_FLAG and cascading to Orchestrator...")
+                logger.info(f"[CLIAgentRunner] {binary_name} exited with code 0 but no flag was captured. Cascading to Orchestrator...")
             else:
                 challenge.status = "FAILED"
                 challenge.progress = 30
+                challenge.completed_at = datetime.utcnow()
 
             # Store full session evidence
             evidence = EvidenceModel(
@@ -347,7 +371,8 @@ class CLIAgentRunner:
                 "run_id": run_id,
                 "challenge_id": challenge_id,
                 "status": challenge.status,
-                "flag": captured_flag
+                "flag": captured_flag,
+                "duration_seconds": challenge.duration_seconds
             })
 
             # If CLI agent finished clean (exit 0) but didn't extract flag, automatically cascade to orchestrator to continue hunting
