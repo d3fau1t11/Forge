@@ -94,6 +94,7 @@ class AgentRouterClaudeCodeProvider(BaseCLIProvider):
                 *cmd,
                 cwd=temp_dir,
                 env=sub_env,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )

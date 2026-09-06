@@ -633,7 +633,7 @@ export default function App() {
           {/* IF DEDICATED CHALLENGE WORKSPACE IS ACTIVE */}
           {activeChallenge ? (
             <ChallengeWorkspace
-              challenge={activeChallenge}
+              challenge={challenges.find((c) => c.id === activeChallenge.id) || activeChallenge}
               target={currentTarget}
               evidenceList={evidenceList.filter((e) => !e.challengeId || e.challengeId === activeChallenge.id)}
               decisions={decisions.filter((d) => !d.challengeId || d.challengeId === activeChallenge.id)}
@@ -648,7 +648,7 @@ export default function App() {
             <>
               {activeTab === 'command' && (
                 <CommandCenter
-                  activeChallenge={challenges[0]}
+                  activeChallenge={challenges.find((c) => c.status === 'RUNNING') || challenges[0]}
                   target={targets[0]}
                   agents={agents}
                   providers={providers}

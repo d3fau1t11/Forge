@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
+import { computeElapsedSeconds, formatDuration } from '../../utils/timeUtils';
 
 interface ChallengeWorkspaceProps {
   challenge: Challenge;
@@ -48,43 +49,31 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   const [activeTab, setActiveTab] = useState<
     'overview' | 'todo_plan' | 'workflow' | 'terminal' | 'ai_decisions' | 'evidence' | 'findings' | 'readme'
   >('overview');
-  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
+
+  const startedStr = challenge.startedAt || challenge.started_at || challenge.createdAt || challenge.created_at;
+  const completedStr = challenge.completedAt || challenge.completed_at;
+  const initialDuration = computeElapsedSeconds(startedStr, completedStr, challenge.durationSeconds || challenge.duration_seconds, challenge.status);
+
+  const [elapsedSeconds, setElapsedSeconds] = useState<number>(initialDuration);
 
   useEffect(() => {
     let interval: any = null;
 
-    const calcElapsed = () => {
-      const startedStr = challenge.startedAt || challenge.started_at || challenge.createdAt || challenge.created_at;
-      if (startedStr) {
-        const startMs = new Date(startedStr).getTime();
-        const nowMs = Date.now();
-        if (!isNaN(startMs)) {
-          setElapsedSeconds(Math.max(0, Math.floor((nowMs - startMs) / 1000)));
-          return;
-        }
-      }
-      if (challenge.durationSeconds || challenge.duration_seconds) {
-        setElapsedSeconds(challenge.durationSeconds || challenge.duration_seconds || 0);
-        return;
-      }
-      setElapsedSeconds((prev) => prev + 1);
+    const tick = () => {
+      const currentStarted = challenge.startedAt || challenge.started_at || challenge.createdAt || challenge.created_at;
+      const currentCompleted = challenge.completedAt || challenge.completed_at;
+      const updated = computeElapsedSeconds(currentStarted, currentCompleted, challenge.durationSeconds || challenge.duration_seconds, challenge.status);
+      setElapsedSeconds(updated);
     };
 
-    calcElapsed();
+    tick();
     if (challenge.status === 'RUNNING') {
-      interval = setInterval(calcElapsed, 1000);
+      interval = setInterval(tick, 1000);
     }
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [challenge.id, challenge.status, challenge.startedAt, challenge.started_at, challenge.createdAt, challenge.created_at, challenge.durationSeconds, challenge.duration_seconds]);
-
-  const formatDuration = (totalSeconds: number): string => {
-    const hrs = Math.floor(totalSeconds / 3600);
-    const mins = Math.floor((totalSeconds % 3600) / 60);
-    const secs = totalSeconds % 60;
-    return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
+  }, [challenge.id, challenge.status, challenge.startedAt, challenge.started_at, challenge.createdAt, challenge.created_at, challenge.completedAt, challenge.completed_at, challenge.durationSeconds, challenge.duration_seconds]);
 
   const activeWorkflowNodes: WorkflowNode[] = workflowNodes.length > 0 ? workflowNodes : [
     { id: 'wn-1', label: '1. INGEST', status: 'COMPLETED', description: `Challenge scope & target ${challenge.target} initialized in workspace.` },

@@ -354,9 +354,7 @@ class AutonomousOrchestrator:
                         logger.error(f"Failed to save solve.py: {sf_err}")
                         cmd_line = f'"{sys.executable}" -c ' + json.dumps(script_code)
                 else:
-                    cmd_line = raw_ai_output.split("\n")[0].strip()
-                    cmd_line = re.sub(r"^```(?:bash|sh)?", "", cmd_line).strip()
-                    cmd_line = re.sub(r"```$", "", cmd_line).strip()
+                    cmd_line = self._clean_cli_command(raw_ai_output)
 
                 # Sanitize nmap target if AI passes http:// or port
                 if cmd_line.startswith("nmap"):
@@ -812,6 +810,37 @@ class AutonomousOrchestrator:
             "capability": capability,
             "tool_status": "SUCCESS"
         }
+
+    def _clean_cli_command(self, raw_output: str) -> str:
+        """Extracts and sanitizes a single executable command line from potentially noisy LLM output."""
+        text = raw_output.strip()
+        
+        # 1. Look for backticked command in markdown: `cmd` or ```bash\ncmd\n```
+        fenced_match = re.search(r"```(?:bash|sh|cmd|powershell)?\s*\n?([^\n`]+)\n?```", text, re.IGNORECASE)
+        if fenced_match:
+            cmd = fenced_match.group(1).strip()
+            if cmd:
+                return cmd
+
+        inline_backtick = re.search(r"`([^`\n]+)`", text)
+        if inline_backtick:
+            cmd = inline_backtick.group(1).strip()
+            if any(cmd.startswith(prefix) for prefix in ["curl", "nmap", "ffuf", "gobuster", "python", "py ", "nikto", "sqlmap", "hydra", "tshark", "strings", "file ", "checksec", "cat ", "ls ", "nc ", "netcat", "ping", "dir"]):
+                return cmd
+
+        # 2. Iterate through lines and strip label headers
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        for line in lines:
+            cleaned = re.sub(r"^(?:Mode\s+[A-Z]\s*(?:\([^)]*\))?\s*[:\-]|Command\s*[:\-]|Action\s*[:\-]|Execute\s*[:\-]|Bash\s*[:\-]|Shell\s*[:\-])\s*", "", line, flags=re.IGNORECASE).strip()
+            cleaned = re.sub(r"^`|`$", "", cleaned).strip()
+            if not cleaned:
+                continue
+            if any(cleaned.startswith(tool) for tool in ["curl", "nmap", "ffuf", "gobuster", "python", "py ", "nikto", "sqlmap", "hydra", "tshark", "tcpdump", "strings", "file ", "checksec", "cat ", "ls ", "nc ", "netcat", "ping", "dir", "wpscan", "ghidra", "r2", "radare2", "volatility", "john", "hashcat", "sublist3r", "rustscan", "masscan"]):
+                return cleaned
+            if not cleaned.lower().startswith(("given ", "i will ", "we can ", "let's ", "this command", "to ", "first, ", "next, ")):
+                return cleaned
+
+        return lines[0] if lines else ""
 
     def _normalize_command(self, command: str) -> str:
         """Normalize command string by removing dynamic cookies, timestamps, and redundant whitespace."""

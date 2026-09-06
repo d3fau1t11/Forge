@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { Challenge, Target, AgentInfo, ProviderInfo } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
+import { computeElapsedSeconds, formatDuration } from '../../utils/timeUtils';
 
 interface CommandCenterProps {
   activeChallenge?: Challenge | null;
@@ -36,55 +37,30 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   killSwitchActive
 }) => {
   const [quickNotice, setQuickNotice] = useState<string | null>(null);
-  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
+
+  const startedStr = activeChallenge?.startedAt || activeChallenge?.started_at || activeChallenge?.createdAt || activeChallenge?.created_at;
+  const completedStr = activeChallenge?.completedAt || activeChallenge?.completed_at;
+  const initialDuration = computeElapsedSeconds(startedStr, completedStr, activeChallenge?.durationSeconds || activeChallenge?.duration_seconds, activeChallenge?.status);
+
+  const [elapsedSeconds, setElapsedSeconds] = useState<number>(initialDuration);
 
   useEffect(() => {
     let interval: any = null;
 
-    const calcElapsed = () => {
+    const tick = () => {
       if (!activeChallenge) {
         setElapsedSeconds(0);
         return;
       }
-      
-      const startedStr = activeChallenge.startedAt || activeChallenge.started_at || activeChallenge.createdAt || activeChallenge.created_at;
-      const completedStr = activeChallenge.completedAt || activeChallenge.completed_at;
-
-      if (activeChallenge.status === 'RUNNING') {
-        if (startedStr) {
-          const startMs = new Date(startedStr).getTime();
-          const nowMs = Date.now();
-          if (!isNaN(startMs)) {
-            setElapsedSeconds(Math.max(0, Math.floor((nowMs - startMs) / 1000)));
-            return;
-          }
-        }
-      } else if (activeChallenge.status === 'COMPLETED' || activeChallenge.status === 'AWAITING_FLAG') {
-        if (activeChallenge.durationSeconds || activeChallenge.duration_seconds) {
-          setElapsedSeconds(activeChallenge.durationSeconds || activeChallenge.duration_seconds || 0);
-          return;
-        }
-        if (startedStr && completedStr) {
-          const startMs = new Date(startedStr).getTime();
-          const endMs = new Date(completedStr).getTime();
-          if (!isNaN(startMs) && !isNaN(endMs)) {
-            setElapsedSeconds(Math.max(0, Math.floor((endMs - startMs) / 1000)));
-            return;
-          }
-        }
-      }
-
-      if (activeChallenge.durationSeconds || activeChallenge.duration_seconds) {
-        setElapsedSeconds(activeChallenge.durationSeconds || activeChallenge.duration_seconds || 0);
-        return;
-      }
-
-      setElapsedSeconds((prev) => prev + 1);
+      const currentStarted = activeChallenge.startedAt || activeChallenge.started_at || activeChallenge.createdAt || activeChallenge.created_at;
+      const currentCompleted = activeChallenge.completedAt || activeChallenge.completed_at;
+      const updated = computeElapsedSeconds(currentStarted, currentCompleted, activeChallenge.durationSeconds || activeChallenge.duration_seconds, activeChallenge.status);
+      setElapsedSeconds(updated);
     };
 
-    calcElapsed();
+    tick();
     if (activeChallenge && activeChallenge.status === 'RUNNING' && !killSwitchActive) {
-      interval = setInterval(calcElapsed, 1000);
+      interval = setInterval(tick, 1000);
     }
     return () => {
       if (interval) clearInterval(interval);
@@ -102,13 +78,6 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
     activeChallenge?.duration_seconds,
     killSwitchActive
   ]);
-
-  const formatDuration = (totalSeconds: number): string => {
-    const hrs = Math.floor(totalSeconds / 3600);
-    const mins = Math.floor((totalSeconds % 3600) / 60);
-    const secs = totalSeconds % 60;
-    return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
 
   const liveEvents = activeChallenge ? [
     { time: '00:00:01', source: 'ORCHESTRATOR', text: `Target profile initialized (${target?.currentIp || '127.0.0.1'})`, color: 'text-cyber-cyan' },
