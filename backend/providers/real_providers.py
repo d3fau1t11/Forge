@@ -103,9 +103,12 @@ class OpenAISpecProvider(HTTPBaseProvider):
         messages = []
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {"model": model_to_use, "messages": messages}
+        messages.append({"role": "user", "content": prompt if (prompt and prompt.strip()) else "Hello"})
+        payload = {
+            "model": model_to_use,
+            "messages": messages,
+            "max_tokens": kwargs.get("max_tokens", 4096)
+        }
 
         try:
             data = await self._post_json(url, headers, payload)

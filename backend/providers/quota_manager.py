@@ -27,18 +27,22 @@ QUOTA_LIMITED_MODELS = {
     "gpt-5.6-sol",
 }
 
-# Models that are always available (no quota limit)
+# Models that are always available (no quota limit, routed via OpenRouter)
 ALWAYS_AVAILABLE_MODELS = {
+    "deepseek/deepseek-chat",
     "deepseek-v4-flash",
+    "z-ai/glm-5.3-flash",
+    "z-ai/glm-5.3",
     "glm-5.3",
+    "glm-5.3-flash",
 }
 
-# Recommended fallback mapping: quota-limited model → always-available alternative
+# Recommended fallback mapping: quota-limited model → always-available OpenRouter / Gemini alternative
 QUOTA_FALLBACK_MAP: Dict[str, str] = {
-    "claude-opus-5": "deepseek-v4-flash",
-    "claude-opus-4-8": "deepseek-v4-flash",
-    "gpt-5.6": "deepseek-v4-flash",
-    "gpt-5.6-sol": "glm-5.3",
+    "claude-opus-5": "deepseek/deepseek-chat",
+    "claude-opus-4-8": "deepseek/deepseek-chat",
+    "gpt-5.6": "deepseek/deepseek-chat",
+    "gpt-5.6-sol": "z-ai/glm-5.3-flash",
 }
 
 # Batch replenishment schedule in UTC hours
