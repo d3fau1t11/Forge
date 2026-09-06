@@ -391,34 +391,34 @@ export const INITIAL_AI_DECISIONS: AiDecision[] = [];
 export const INITIAL_MODEL_ROUTES: ModelRoute[] = [
   {
     task: 'Reconnaissance & Quick Scans',
-    selectedProvider: 'Cerebras',
-    model: 'llama-3.3-70b (Ultra High-Speed)',
-    reason: 'Ultra low latency required for tool invocation loops',
-    latency: '120ms',
-    fallback: 'Gemini 1.5 Flash'
+    selectedProvider: 'AgentRouter (Codex)',
+    model: 'DeepSeek V4 Flash (CLI Mode)',
+    reason: 'Ultra low latency, high throughput & zero quota restrictions',
+    latency: '180ms',
+    fallback: 'Gemini 1.5 Pro'
   },
   {
     task: 'Web Analysis & Vision',
     selectedProvider: 'Gemini',
     model: 'Gemini 1.5 Pro',
-    reason: 'Superior contextual analysis & multi-modal screenshot parsing',
+    reason: 'Superior contextual analysis, multi-modal vision & CTF reasoning',
     latency: '420ms',
-    fallback: 'OpenRouter / Claude'
+    fallback: 'AgentRouter / Codex (DeepSeek-V4-Flash)'
   },
   {
-    task: 'Code Analysis & Payload Dev',
-    selectedProvider: 'NVIDIA',
-    model: 'Nemotron 70B',
-    reason: 'Strong syntax comprehension & exploit script formulation',
-    latency: '310ms',
-    fallback: 'Codex'
+    task: 'Code Analysis & Exploit Scripting',
+    selectedProvider: 'AgentRouter (Codex)',
+    model: 'GLM-5.3 (CLI Mode)',
+    reason: 'High syntax accuracy for Python pwntools & requests exploit scripts',
+    latency: '260ms',
+    fallback: 'DeepSeek V4 Flash'
   },
   {
-    task: 'Hard Reasoning & Escalation',
-    selectedProvider: 'AgentRouter / Claude Code',
-    model: 'Claude 3.5 Sonnet (CLI Agent)',
-    reason: 'Escalated complex multi-step reasoning & terminal agent loop',
-    latency: '890ms',
+    task: 'Hard Reasoning & Multi-Model Stuck Review',
+    selectedProvider: 'Gemini 1.5 Pro ➔ Codex DeepSeek',
+    model: 'Gemini 1.5 Pro / DeepSeek V4 Flash',
+    reason: 'Root-cause diagnosis on stuck loop with auto-pivot to Codex',
+    latency: '450ms',
     fallback: 'AgentRouter / Codex'
   }
 ];
@@ -429,6 +429,34 @@ export const INITIAL_TERMINAL_LOGS: TerminalLog[] = [];
 
 export const INITIAL_PROVIDERS: ProviderInfo[] = [
   {
+    name: 'AgentRouter (Codex – DeepSeek)',
+    status: 'HEALTHY',
+    model: 'DeepSeek V4 Flash (CLI Mode)',
+    transport: 'CLI',
+    latency: '180ms',
+    requests: 0,
+    quota: '∞ Always Available (No Limit)',
+    lastError: 'None',
+    fallbackPriority: 1,
+    routerNote: 'Primary CLI Agent Engine. ZERO QUOTA RESTRICTIONS: Instant execution with full tool invocation support.',
+    quotaLimited: false,
+    quotaExhausted: false
+  },
+  {
+    name: 'AgentRouter (Codex – GLM)',
+    status: 'HEALTHY',
+    model: 'GLM-5.3 (CLI Mode)',
+    transport: 'CLI',
+    latency: '260ms',
+    requests: 0,
+    quota: '∞ Always Available (No Limit)',
+    lastError: 'None',
+    fallbackPriority: 2,
+    routerNote: 'High-capability code & exploit formulation. ZERO QUOTA RESTRICTIONS: Always available for script generation.',
+    quotaLimited: false,
+    quotaExhausted: false
+  },
+  {
     name: 'Gemini',
     status: 'HEALTHY',
     model: 'Gemini 1.5 Pro / Flash',
@@ -437,32 +465,32 @@ export const INITIAL_PROVIDERS: ProviderInfo[] = [
     requests: 0,
     quota: '100% Available',
     lastError: 'None',
-    fallbackPriority: 1,
-    routerNote: 'Primary for Web Vision & Multimodal CTF context'
-  },
-  {
-    name: 'NVIDIA',
-    status: 'HEALTHY',
-    model: 'Nemotron 70B Instruct',
-    transport: 'API',
-    latency: '310ms',
-    requests: 0,
-    quota: '100% Available',
-    lastError: 'None',
-    fallbackPriority: 2,
-    routerNote: 'Primary for source code & script generation'
-  },
-  {
-    name: 'Cerebras',
-    status: 'HEALTHY',
-    model: 'Llama 3.3 70B (Fast)',
-    transport: 'API',
-    latency: '120ms',
-    requests: 0,
-    quota: '100% Available',
-    lastError: 'None',
     fallbackPriority: 3,
-    routerNote: 'Primary for high-frequency tool selection'
+    routerNote: 'Primary Strategic Diagnostician for multi-model stuck reviews & multimodal web analysis.'
+  },
+  {
+    name: 'RapidAPI (DeepSeek-V3.2)',
+    status: 'HEALTHY',
+    model: 'DeepSeek-V3.2 (API Mode)',
+    transport: 'API',
+    latency: '340ms',
+    requests: 0,
+    quota: '100% Available',
+    lastError: 'None',
+    fallbackPriority: 4,
+    routerNote: 'High-speed cloud reasoning fallback.'
+  },
+  {
+    name: 'Cloudflare',
+    status: 'HEALTHY',
+    model: 'Meta Llama 3.1 8B Instruct',
+    transport: 'API',
+    latency: '290ms',
+    requests: 0,
+    quota: '100% Available',
+    lastError: 'None',
+    fallbackPriority: 5,
+    routerNote: 'Fast serverless edge inference provider.'
   },
   {
     name: 'OpenRouter',
@@ -473,8 +501,8 @@ export const INITIAL_PROVIDERS: ProviderInfo[] = [
     requests: 0,
     quota: '100% Available',
     lastError: 'None',
-    fallbackPriority: 4,
-    routerNote: 'Fallback route for broad LLM availability'
+    fallbackPriority: 6,
+    routerNote: 'Global LLM aggregate route.'
   },
   {
     name: 'AgentRouter (Claude Code)',
@@ -483,10 +511,10 @@ export const INITIAL_PROVIDERS: ProviderInfo[] = [
     transport: 'CLI',
     latency: '890ms',
     requests: 0,
-    quota: 'Batch Quota (07:00 & 19:00 Beijing)',
+    quota: '3h Window Active (07:00 & 19:00 Beijing)',
     lastError: 'None',
-    fallbackPriority: 5,
-    routerNote: 'CLI → AgentRouter wrapper. QUOTA LIMITED: Claude models use batch quotas released at Beijing 07:00 & 19:00 (UTC 23:00 & 11:00). Auto-falls back to DeepSeek when exhausted.',
+    fallbackPriority: 7,
+    routerNote: 'Restricted Batch Window: Used strictly within 3 hours following batch reset (07:00-10:00 & 19:00-22:00 Beijing). Auto-fast-failovers to Codex.',
     quotaLimited: true,
     quotaExhausted: false,
     quotaFallbackModel: 'deepseek-v4-flash',
@@ -499,42 +527,14 @@ export const INITIAL_PROVIDERS: ProviderInfo[] = [
     transport: 'CLI',
     latency: '740ms',
     requests: 0,
-    quota: 'Batch Quota (07:00 & 19:00 Beijing)',
+    quota: '3h Window Active (07:00 & 19:00 Beijing)',
     lastError: 'None',
-    fallbackPriority: 6,
-    routerNote: 'CLI → AgentRouter wrapper. QUOTA LIMITED: GPT models use batch quotas released at Beijing 07:00 & 19:00 (UTC 23:00 & 11:00). Auto-falls back to DeepSeek / GLM when exhausted.',
+    fallbackPriority: 8,
+    routerNote: 'Restricted Batch Window: Used strictly within 3 hours following batch reset (07:00-10:00 & 19:00-22:00 Beijing). Auto-fast-failovers to Codex.',
     quotaLimited: true,
     quotaExhausted: false,
     quotaFallbackModel: 'deepseek-v4-flash',
     nextBatchTime: ''
-  },
-  {
-    name: 'AgentRouter (Codex – DeepSeek)',
-    status: 'HEALTHY',
-    model: 'DeepSeek V4 Flash (CLI Mode)',
-    transport: 'CLI',
-    latency: '680ms',
-    requests: 0,
-    quota: '∞ Always Available',
-    lastError: 'None',
-    fallbackPriority: 7,
-    routerNote: 'CLI → AgentRouter wrapper. NO QUOTA LIMIT: DeepSeek models are always available, unaffected by batch quota system.',
-    quotaLimited: false,
-    quotaExhausted: false
-  },
-  {
-    name: 'AgentRouter (Codex – GLM)',
-    status: 'HEALTHY',
-    model: 'GLM-5.3 (CLI Mode)',
-    transport: 'CLI',
-    latency: '720ms',
-    requests: 0,
-    quota: '∞ Always Available',
-    lastError: 'None',
-    fallbackPriority: 8,
-    routerNote: 'CLI → AgentRouter wrapper. NO QUOTA LIMIT: GLM models are always available, unaffected by batch quota system.',
-    quotaLimited: false,
-    quotaExhausted: false
   }
 ];
 

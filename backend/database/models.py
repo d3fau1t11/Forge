@@ -15,7 +15,7 @@ class ProviderConfigModel(Base):
     __tablename__ = "providers"
     
     id = Column(String, primary_key=True, default=generate_uuid)
-    name = Column(String, unique=True, nullable=False) # gemini, nvidia, cerebras, openrouter, hf, cloudflare, agentrouter, mistral, cohere, groq, mock
+    name = Column(String, unique=True, nullable=False) # gemini, nvidia, cerebras, openrouter, hf, cloudflare, agentrouter, mistral, cohere, groq
     enabled = Column(Boolean, default=True)
     is_paid = Column(Boolean, default=False)
     api_key_configured = Column(Boolean, default=False)

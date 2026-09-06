@@ -244,6 +244,95 @@ export const Providers: React.FC<ProvidersProps> = ({
         </span>
       </div>
 
+      {/* REGISTERED LLM MODELS & QUOTA POLICY TABLE */}
+      <div className="glass-panel border border-slate-800 rounded-xl p-5 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-2">
+            <Cpu className="w-4 h-4 text-cyber-cyan" />
+            <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider">REGISTERED MODELS & ACTIVE ROUTING DIRECTORY</h3>
+          </div>
+          <span className="text-[10px] text-cyber-cyan font-mono bg-cyan-950/60 border border-cyan-800/60 px-2 py-0.5 rounded">
+            ROUTING PRIORITY: CODEX (DEEPSEEK / GLM) ➔ GEMINI ➔ CLOUD INFERENCE
+          </span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs font-mono">
+            <thead>
+              <tr className="border-b border-slate-800 text-slate-400 text-[11px]">
+                <th className="pb-2 font-bold">MODEL ID</th>
+                <th className="pb-2 font-bold">PROVIDER / TRANSPORT</th>
+                <th className="pb-2 font-bold">AVAILABILITY & STATUS</th>
+                <th className="pb-2 font-bold">QUOTA SCHEDULE / POLICY</th>
+                <th className="pb-2 font-bold">FAST-FAILOVER</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/60 text-slate-300">
+              <tr className="hover:bg-slate-800/30">
+                <td className="py-2.5 font-bold text-cyber-emerald flex items-center space-x-1.5">
+                  <span className="w-2 h-2 rounded-full bg-cyber-emerald animate-pulse"></span>
+                  <span>deepseek-v4-flash</span>
+                </td>
+                <td className="py-2.5 text-slate-200">AgentRouter (Codex) <span className="px-1.5 py-0.2 rounded bg-obsidian-950 border border-slate-700 text-[10px] text-cyber-cyan">CLI</span></td>
+                <td className="py-2.5 text-cyber-emerald font-bold">ACTIVE (PRIMARY)</td>
+                <td className="py-2.5 text-slate-300">∞ Always Available (Zero Quota Limits)</td>
+                <td className="py-2.5 text-slate-400">—</td>
+              </tr>
+              <tr className="hover:bg-slate-800/30">
+                <td className="py-2.5 font-bold text-cyber-emerald flex items-center space-x-1.5">
+                  <span className="w-2 h-2 rounded-full bg-cyber-emerald animate-pulse"></span>
+                  <span>glm-5.3</span>
+                </td>
+                <td className="py-2.5 text-slate-200">AgentRouter (Codex) <span className="px-1.5 py-0.2 rounded bg-obsidian-950 border border-slate-700 text-[10px] text-cyber-cyan">CLI</span></td>
+                <td className="py-2.5 text-cyber-emerald font-bold">ACTIVE (CODE/EXPLOIT)</td>
+                <td className="py-2.5 text-slate-300">∞ Always Available (Zero Quota Limits)</td>
+                <td className="py-2.5 text-slate-400">DeepSeek-V4-Flash</td>
+              </tr>
+              <tr className="hover:bg-slate-800/30">
+                <td className="py-2.5 font-bold text-cyber-cyan flex items-center space-x-1.5">
+                  <span className="w-2 h-2 rounded-full bg-cyber-cyan"></span>
+                  <span>gemini-1.5-pro</span>
+                </td>
+                <td className="py-2.5 text-slate-200">Google Gemini <span className="px-1.5 py-0.2 rounded bg-obsidian-950 border border-slate-700 text-[10px] text-cyber-cyan">API</span></td>
+                <td className="py-2.5 text-cyber-cyan font-bold">ACTIVE (STUCK REVIEW & WEB)</td>
+                <td className="py-2.5 text-slate-300">Primary Multi-Model Stuck Diagnostician</td>
+                <td className="py-2.5 text-cyber-emerald font-bold">Codex (DeepSeek)</td>
+              </tr>
+              <tr className="hover:bg-slate-800/30">
+                <td className="py-2.5 font-bold text-slate-200 flex items-center space-x-1.5">
+                  <span className="w-2 h-2 rounded-full bg-cyber-cyan"></span>
+                  <span>deepseek-v3.2</span>
+                </td>
+                <td className="py-2.5 text-slate-200">RapidAPI <span className="px-1.5 py-0.2 rounded bg-obsidian-950 border border-slate-700 text-[10px] text-cyber-cyan">API</span></td>
+                <td className="py-2.5 text-cyber-emerald font-bold">ACTIVE</td>
+                <td className="py-2.5 text-slate-300">Rapid Cloud Fallback Route</td>
+                <td className="py-2.5 text-slate-400">Cloudflare Llama</td>
+              </tr>
+              <tr className="hover:bg-slate-800/30">
+                <td className="py-2.5 font-bold text-cyber-amber flex items-center space-x-1.5">
+                  <span className="w-2 h-2 rounded-full bg-cyber-amber"></span>
+                  <span>claude-opus-5 / 4.8</span>
+                </td>
+                <td className="py-2.5 text-slate-200">AgentRouter (Claude Code) <span className="px-1.5 py-0.2 rounded bg-obsidian-950 border border-slate-700 text-[10px] text-cyber-cyan">CLI</span></td>
+                <td className="py-2.5 text-cyber-amber font-bold">RESTRICTED BATCH WINDOW</td>
+                <td className="py-2.5 text-slate-400">3h Window Post-Reset (07:00-10:00 & 19:00-22:00 Beijing)</td>
+                <td className="py-2.5 text-cyber-emerald font-bold">Direct Failover ➔ Codex</td>
+              </tr>
+              <tr className="hover:bg-slate-800/30">
+                <td className="py-2.5 font-bold text-cyber-amber flex items-center space-x-1.5">
+                  <span className="w-2 h-2 rounded-full bg-cyber-amber"></span>
+                  <span>gpt-5.6 / gpt-5.6-sol</span>
+                </td>
+                <td className="py-2.5 text-slate-200">AgentRouter (Codex) <span className="px-1.5 py-0.2 rounded bg-obsidian-950 border border-slate-700 text-[10px] text-cyber-cyan">CLI</span></td>
+                <td className="py-2.5 text-cyber-amber font-bold">RESTRICTED BATCH WINDOW</td>
+                <td className="py-2.5 text-slate-400">3h Window Post-Reset (07:00-10:00 & 19:00-22:00 Beijing)</td>
+                <td className="py-2.5 text-cyber-emerald font-bold">Direct Failover ➔ DeepSeek</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       {/* Providers Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
         {providers.map((p) => (

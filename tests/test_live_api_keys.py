@@ -11,7 +11,7 @@ class TestLiveAPIKeys(unittest.TestCase):
     def test_providers_registered_from_env(self):
         registered = list(model_router.providers.keys())
         print(f"\n[FORGE] Registered Providers in Router: {registered}")
-        self.assertIn("mock", registered)
+        self.assertIn("agentrouter_codex", registered)
         if settings.GEMINI_API_KEY:
             self.assertIn("gemini", registered)
         if settings.NVIDIA_API_KEY:
@@ -25,8 +25,6 @@ class TestLiveAPIKeys(unittest.TestCase):
         async def run_live_tests():
             results = {}
             for name, provider in model_router.providers.items():
-                if name == "mock":
-                    continue
                 available = await provider.is_available()
                 if not available:
                     results[name] = "SKIPPED (No Key)"

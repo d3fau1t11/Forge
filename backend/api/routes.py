@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -25,6 +26,7 @@ from backend.reporting.generator import report_generator
 from backend.privilege.manager import privilege_manager
 
 router = APIRouter()
+logger = logging.getLogger("forge.routes")
 
 def extract_target_from_text(text: str) -> str:
     """Intelligently extracts target network endpoint, URL, netcat connection, or artifact from description."""
@@ -545,28 +547,66 @@ async def privilege_decision(req: PrivilegeDecisionRequest, db: Session = Depend
 
 @router.get("/providers")
 def get_providers():
-    return [
-        {
+    from backend.providers.quota_manager import quota_manager
+    in_claude_window = quota_manager.is_in_claude_allowed_window()
+    next_batch_str = quota_manager.get_next_batch_time_str()
+
+    provider_list = []
+    for p in model_router.providers.values():
+        models_under_provider = [m for m, (pname, _) in model_router.MODEL_PROVIDER_MAP.items() if pname == p.name]
+        is_quota_limited = any(quota_manager.is_quota_limited_model(m) for m in models_under_provider)
+        
+        quota_label = "100% Available"
+        if is_quota_limited:
+            if in_claude_window:
+                quota_label = "3h Window Active (Trial Batch)"
+            else:
+                quota_label = f"Standby (Next Reset: {next_batch_str})"
+        elif p.name == "agentrouter_codex":
+            quota_label = "∞ Always Available (No Limit)"
+
+        provider_list.append({
             "name": p.name,
             "is_paid": p.is_paid,
-            "status": "healthy"
-        }
-        for p in model_router.providers.values()
-    ]
+            "status": "HEALTHY",
+            "models": models_under_provider,
+            "default_model": getattr(p, "default_model", getattr(p, "cli_binary_default", p.name)),
+            "quota": quota_label,
+            "is_quota_limited": is_quota_limited,
+            "in_batch_window": in_claude_window if is_quota_limited else True,
+            "transport": "CLI" if "agentrouter" in p.name else "API"
+        })
+    return provider_list
 
 @router.get("/providers/health")
 def get_providers_health():
+    from backend.providers.quota_manager import quota_manager
+    in_claude_window = quota_manager.is_in_claude_allowed_window()
+
     return {
         "paid_allowed": model_router.paid_allowed,
         "budget_usd": model_router.daily_budget_usd,
         "spent_usd": model_router.current_spent_usd,
+        "in_claude_allowed_window": in_claude_window,
+        "next_batch_replenishment": quota_manager.get_next_batch_time_str(),
+        "registered_models": [
+            {
+                "model_id": model_id,
+                "provider": p_info[0],
+                "transport": p_info[1],
+                "is_quota_limited": quota_manager.is_quota_limited_model(model_id),
+                "is_always_available": quota_manager.is_always_available_model(model_id) or not quota_manager.is_quota_limited_model(model_id),
+                "status": "ACTIVE" if (not quota_manager.is_quota_limited_model(model_id) or in_claude_window) else "STANDBY (Outside 3h Window)"
+            }
+            for model_id, p_info in model_router.MODEL_PROVIDER_MAP.items()
+        ],
         "providers": [
             {
                 "name": p.name,
                 "is_paid": p.is_paid,
-                "status": "healthy",
+                "status": "HEALTHY",
                 "default_model": getattr(p, "default_model", ""),
-                "latency_ms": 120 if "cerebras" in p.name else 420
+                "latency_ms": 120 if "cerebras" in p.name else (680 if "codex" in p.name else 420)
             }
             for p in model_router.providers.values()
         ]

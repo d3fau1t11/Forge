@@ -77,6 +77,7 @@ class AgentRouterCodexProvider(BaseCLIProvider):
             executable,
             "exec",
             "--skip-git-repo-check",
+            "--quiet",
             "--model", model_to_use,
             prompt
         ]
@@ -87,13 +88,20 @@ class AgentRouterCodexProvider(BaseCLIProvider):
         logger.info(f"[AgentRouter CLI] Starting Codex Subprocess PID... Model: {model_to_use}")
 
         try:
+            # Use CREATE_NO_WINDOW on Windows to prevent console popups
+            creation_flags = 0
+            import sys
+            if sys.platform == "win32":
+                creation_flags = 0x08000000  # CREATE_NO_WINDOW
+
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=temp_dir,
                 env=sub_env,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                **({'creationflags': creation_flags} if creation_flags else {})
             )
 
             try:

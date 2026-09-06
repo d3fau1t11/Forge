@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from backend.config import settings
 from backend.providers.base import BaseProvider, ProviderResponse
-from backend.providers.mock import MockProvider
+
 from backend.providers.real_providers import GeminiProvider, OpenAISpecProvider, HuggingFaceProvider, CloudflareProvider
 from backend.providers.cli.claude_code import AgentRouterClaudeCodeProvider
 from backend.providers.cli.codex import AgentRouterCodexProvider
@@ -33,28 +33,28 @@ class ModelRouter:
     """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
 
     DEFAULT_ROUTING_MAP = {
-        "recon": ["rapidapi_gpt55", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "rapidapi_gpt5_nano", "nvidia", "agentrouter_codex", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
-        "directory_enumeration": ["rapidapi_gpt54_mini", "rapidapi_gpt5_nano", "rapidapi_gpt55", "nvidia", "agentrouter_codex", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
-        "web_analysis": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "nvidia", "agentrouter_claude_code", "agentrouter_codex", "openrouter", "gemini", "cloudflare", "mock"],
-        "code_analysis": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
-        "reverse_engineering": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
-        "fast_reasoning": ["rapidapi_gpt54_mini", "rapidapi_gpt5_nano", "rapidapi_gpt55", "agentrouter_codex", "nvidia", "agentrouter_claude_code", "openrouter", "gemini", "cloudflare", "mock"],
-        "general_reasoning": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"],
-        "verification": ["rapidapi_gpt55", "rapidapi_deepseek_v32", "agentrouter_claude_code", "agentrouter_codex", "nvidia", "openrouter", "gemini", "cloudflare", "mock"]
+        "recon": ["agentrouter_codex", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "openrouter", "agentrouter_claude_code", "nvidia"],
+        "directory_enumeration": ["agentrouter_codex", "gemini", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "cloudflare", "openrouter", "agentrouter_claude_code", "nvidia"],
+        "web_analysis": ["gemini", "agentrouter_codex", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "openrouter", "agentrouter_claude_code", "nvidia"],
+        "code_analysis": ["agentrouter_codex", "gemini", "rapidapi_deepseek_v32", "cloudflare", "openrouter", "agentrouter_claude_code", "nvidia"],
+        "reverse_engineering": ["agentrouter_codex", "gemini", "rapidapi_deepseek_v32", "cloudflare", "openrouter", "agentrouter_claude_code", "nvidia"],
+        "fast_reasoning": ["agentrouter_codex", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "gemini", "cloudflare", "openrouter", "agentrouter_claude_code", "nvidia"],
+        "general_reasoning": ["gemini", "agentrouter_codex", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "openrouter", "agentrouter_claude_code", "nvidia"],
+        "verification": ["gemini", "agentrouter_codex", "rapidapi_deepseek_v32", "cloudflare", "openrouter", "agentrouter_claude_code", "nvidia"]
     }
 
     # Model to Provider/CLI Transport Mapping
     MODEL_PROVIDER_MAP = {
-        "gpt-5.5": ("rapidapi_gpt55", "GPT-5.5"),
+        "deepseek-v4-flash": ("agentrouter_codex", "codex"),
+        "glm-5.3": ("agentrouter_codex", "codex"),
+        "gpt-5.6": ("agentrouter_codex", "codex"),
+        "gpt-5.6-sol": ("agentrouter_codex", "codex"),
+        "claude-opus-5": ("agentrouter_claude_code", "claude_code"),
+        "claude-opus-4-8": ("agentrouter_claude_code", "claude_code"),
         "gpt-5.4-mini": ("rapidapi_gpt54_mini", "gpt-5.4-mini"),
         "deepseek-v3.2": ("rapidapi_deepseek_v32", "DeepSeek-V3.2"),
         "gpt-5-nano": ("rapidapi_gpt5_nano", "GPT-5-nano"),
-        "claude-opus-5": ("agentrouter_claude_code", "claude_code"),
-        "claude-opus-4-8": ("agentrouter_claude_code", "claude_code"),
-        "gpt-5.6": ("agentrouter_codex", "codex"),
-        "gpt-5.6-sol": ("agentrouter_codex", "codex"),
-        "glm-5.3": ("agentrouter_codex", "codex"),
-        "deepseek-v4-flash": ("agentrouter_codex", "codex"),
+        "gemini-1.5-pro": ("gemini", "gemini-1.5-pro"),
         "deepseek-v4-pro": ("nvidia", "deepseek-ai/deepseek-v4-pro-0813"),
         "nemotron-lightning": ("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b"),
         "nemotron-ultra": ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
@@ -63,7 +63,6 @@ class ModelRouter:
 
     def __init__(self):
         self.providers: Dict[str, BaseProvider] = {
-            "mock": MockProvider(),
             "agentrouter_claude_code": AgentRouterClaudeCodeProvider(),
             "agentrouter_codex": AgentRouterCodexProvider()
         }
@@ -73,18 +72,9 @@ class ModelRouter:
         self._initialize_env_providers()
 
     def _initialize_env_providers(self):
-        # 1. RapidAPI Verified Working Models (Priority 1)
+        # 1. RapidAPI Verified Working Models (Excluding deprecated/quota-exhausted GPT-5.5)
         rapidapi_key = (settings.RAPIDAPI_KEY or os.getenv("RAPIDAPI_KEY", "")).strip()
         if rapidapi_key:
-            self.register_provider("rapidapi_gpt55", OpenAISpecProvider(
-                name="rapidapi_gpt55",
-                is_paid=True,
-                api_key=rapidapi_key,
-                default_model="GPT-5.5",
-                base_url="https://gpt-5-5.p.rapidapi.com",
-                extra_headers={"x-rapidapi-host": "gpt-5-5.p.rapidapi.com", "x-rapidapi-key": rapidapi_key},
-                speed_tier="deep"
-            ))
             self.register_provider("rapidapi_gpt54_mini", OpenAISpecProvider(
                 name="rapidapi_gpt54_mini",
                 is_paid=True,
@@ -195,18 +185,16 @@ class ModelRouter:
         **kwargs
     ) -> ProviderResponse:
 
-        # 1. Direct Model Request (e.g. claude-opus-5, gpt-5.6)
+        # 1. Direct Model Request (e.g. claude-opus-5, gpt-5.6, deepseek-v4-flash)
         if target_model and target_model in self.MODEL_PROVIDER_MAP:
-            # Check if this model's quota is currently exhausted
-            if quota_manager.is_model_exhausted(target_model):
-                fallback_model = quota_manager.get_fallback_model(target_model)
-                next_batch = quota_manager.get_next_batch_time_str()
-                logger.warning(
-                    f"[ModelRouter] AgentRouter quota exhausted for '{target_model}'. "
-                    f"Auto-falling back to '{fallback_model}'. Next batch: {next_batch}"
+            # Check if this model is quota-limited and should be skipped (outside 3h window or exhausted)
+            if quota_manager.is_quota_limited_model(target_model) and quota_manager.should_skip_quota_limited_models():
+                fallback_model = quota_manager.get_fallback_model(target_model) or "deepseek-v4-flash"
+                logger.info(
+                    f"[ModelRouter] Model '{target_model}' skipped (outside 3h post-reset window or quota exhausted). "
+                    f"Directing to always-available Codex model '{fallback_model}'."
                 )
-                if fallback_model and fallback_model in self.MODEL_PROVIDER_MAP:
-                    target_model = fallback_model
+                target_model = fallback_model
 
             provider_name, cli_type = self.MODEL_PROVIDER_MAP[target_model]
             provider = self.providers.get(provider_name)
@@ -225,40 +213,43 @@ class ModelRouter:
 
                 # Detect AgentRouter 402 quota exhaustion from refusal reason
                 refusal = res.refusal_reason or ""
-                if quota_manager.detect_quota_error(refusal):
+                if quota_manager.detect_quota_error(refusal) or "402" in refusal or "budget" in refusal.lower():
                     quota_manager.record_quota_exhaustion(target_model, refusal)
-                    # Attempt auto-fallback to always-available model
-                    fallback_model = quota_manager.get_fallback_model(target_model)
-                    if fallback_model and fallback_model in self.MODEL_PROVIDER_MAP:
-                        logger.info(
-                            f"[ModelRouter] Quota 402 detected for '{target_model}'. "
-                            f"Retrying with fallback model '{fallback_model}'..."
+                    # Instant auto-fallback to Codex always-available model
+                    fallback_model = quota_manager.get_fallback_model(target_model) or "deepseek-v4-flash"
+                    logger.info(
+                        f"[ModelRouter] Quota 402 detected for '{target_model}'. "
+                        f"Instantly failing over to Codex model '{fallback_model}'..."
+                    )
+                    fb_provider_name, _ = self.MODEL_PROVIDER_MAP.get(fallback_model, ("agentrouter_codex", "codex"))
+                    fb_provider = self.providers.get(fb_provider_name)
+                    if fb_provider and await fb_provider.is_available():
+                        fb_res = await fb_provider.generate_response(
+                            prompt=prompt,
+                            system_instruction=system_instruction,
+                            capability=capability,
+                            model=fallback_model,
+                            **kwargs
                         )
-                        fb_provider_name, _ = self.MODEL_PROVIDER_MAP[fallback_model]
-                        fb_provider = self.providers.get(fb_provider_name)
-                        if fb_provider and await fb_provider.is_available():
-                            fb_res = await fb_provider.generate_response(
-                                prompt=prompt,
-                                system_instruction=system_instruction,
-                                capability=capability,
-                                model=fallback_model,
-                                **kwargs
-                            )
-                            if not fb_res.is_refusal:
-                                quota_manager.record_successful_request(fallback_model)
-                                return fb_res
+                        if not fb_res.is_refusal:
+                            quota_manager.record_successful_request(fallback_model)
+                            return fb_res
 
                 logger.warning(f"CLI Provider '{provider_name}' failed for model '{target_model}': {res.refusal_reason}. Falling back...")
 
         # 2. Capability Candidates Fallback Chain
         skip_quota_limited = quota_manager.should_skip_quota_limited_models()
-        candidates = list(self.DEFAULT_ROUTING_MAP.get(capability, ["cloudflare", "openrouter", "gemini", "mock"]))
+        candidates = list(self.DEFAULT_ROUTING_MAP.get(capability, ["agentrouter_codex", "gemini", "cloudflare", "openrouter"]))
 
         if speed_tier:
             # Sort providers matching requested speed_tier first
             candidates.sort(key=lambda p_name: 0 if getattr(self.providers.get(p_name), "speed_tier", "fast") == speed_tier else 1)
 
         for provider_name in candidates:
+            if skip_quota_limited and provider_name == "agentrouter_claude_code":
+                # Outside 3-hour batch window or exhausted: skip Claude Code immediately
+                continue
+
             provider = self.providers.get(provider_name)
             if not provider:
                 continue
@@ -305,11 +296,17 @@ class ModelRouter:
                     asyncio.create_task(_notify_fallback(provider_name, error_str))
                     continue
 
-        logger.info("Using offline mock provider fallback.")
-        return await self.providers["mock"].generate_response(
-            prompt=prompt,
-            system_instruction=system_instruction,
-            capability=capability
+        logger.error("[ModelRouter] ALL providers exhausted. No valid response obtained.")
+        return ProviderResponse(
+            provider_name="none",
+            model_name="none",
+            content="[FORGE ERROR] All providers exhausted for this request. Check provider keys and quota status.",
+            prompt_tokens=0,
+            completion_tokens=0,
+            estimated_cost_usd=0.0,
+            latency_ms=0.0,
+            is_refusal=True,
+            refusal_reason="All providers exhausted — no live provider could fulfill this request."
         )
 
 model_router = ModelRouter()

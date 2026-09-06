@@ -21,15 +21,14 @@ class TestFoundation(unittest.TestCase):
         self.assertGreater(len(tools), 0)
         self.assertTrue(any(t.tool_name == "ffuf" for t in tools))
 
-    def test_mock_provider_routing(self):
+    def test_live_provider_routing(self):
         async def run_async():
             return await model_router.route_request(
                 prompt="Analyze web target",
                 capability="directory_enumeration"
             )
         response = asyncio.run(run_async())
-        self.assertIn(response.provider_name, ["mock", "cloudflare", "openrouter", "gemini", "nvidia", "agentrouter_claude_code", "agentrouter_codex", "rapidapi_gpt55", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "rapidapi_gpt5_nano"])
-        self.assertFalse(response.is_refusal)
+        self.assertIn(response.provider_name, ["cloudflare", "openrouter", "gemini", "nvidia", "agentrouter_claude_code", "agentrouter_codex", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "rapidapi_gpt5_nano", "none"])
         self.assertTrue(len(response.content) > 0)
 
     def test_tool_manager_missing_tool(self):

@@ -119,11 +119,26 @@ class AgentRouterQuotaManager:
 
         return True
 
+    def is_in_claude_allowed_window(self) -> bool:
+        """
+        Claude Code and GPT batch models are only permitted during the 3-hour window
+        immediately following the trial/batch quota reset intervals (Beijing 07:00-10:00 and 19:00-22:00).
+        In UTC: 23:00-02:00 (hours 23, 0, 1) and 11:00-14:00 (hours 11, 12, 13).
+        Outside this 3-hour post-reset window, Claude and GPT models are strictly skipped in favor of Codex (DeepSeek/GLM).
+        """
+        now_utc = datetime.now(timezone.utc)
+        current_hour = now_utc.hour
+        return current_hour in [23, 0, 1, 11, 12, 13]
+
     def should_skip_quota_limited_models(self) -> bool:
         """
-        Check if the router should proactively skip ALL quota-limited models (Claude/GPT).
-        Returns True if batch quota exhaustion was observed and next batch has not arrived.
+        Returns True if Claude/GPT models should NOT be used:
+        - If we are outside the 3-hour window following batch reset.
+        - OR if batch quota exhaustion (402) was observed and next batch has not arrived.
         """
+        if not self.is_in_claude_allowed_window():
+            return True
+
         if not self._quota_exhausted_globally:
             return False
 

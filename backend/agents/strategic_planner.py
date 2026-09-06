@@ -483,32 +483,63 @@ class StrategicPlanner:
             f"}}"
         )
 
-        reviewer_model = "DeepSeek R1 / Strategic Reviewer"
+        reviewer_model = "Gemini 1.5 Pro / Strategic Reviewer"
         diagnosis = "Primary agent reached repetition limit on current endpoint. Pivoting attack methodology."
         pivot_strategy = "Construct specialized Python script to inspect alternative endpoints, response headers, and session tokens."
         new_tasks = []
 
+        # 1. Primary Stuck Analyzer: Query Gemini first
+        gemini_success = False
         try:
-            # Route to deep reasoning model for strategic review
-            review_resp = await model_router.route_request(
-                prompt=prompt,
-                capability="code_analysis",
-                system_instruction="You are a Principal Security Researcher conducting strategic exploit review. Output valid JSON only.",
-                speed_tier="deep"
-            )
-            raw_text = (review_resp.content or "").strip()
-            reviewer_model = getattr(review_resp, "model", getattr(review_resp, "provider_name", "DeepSeek-R1-Reviewer"))
-
-            json_match = re.search(r"\{[\s\S]*\}", raw_text)
-            if json_match:
-                parsed = json.loads(json_match.group(0))
-                if isinstance(parsed, dict):
-                    diagnosis = parsed.get("diagnosis", diagnosis)
-                    pivot_strategy = parsed.get("pivot_strategy", pivot_strategy)
-                    if "new_tasks" in parsed and isinstance(parsed["new_tasks"], list) and len(parsed["new_tasks"]) > 0:
-                        new_tasks = parsed["new_tasks"]
+            gemini_provider = model_router.providers.get("gemini")
+            if gemini_provider and await gemini_provider.is_available():
+                logger.info(f"[StrategicPlanner] Invoking Gemini 1.5 Pro to diagnose stuck state for {challenge_name}...")
+                gemini_resp = await gemini_provider.generate_response(
+                    prompt=prompt,
+                    system_instruction="You are a Principal Cyber Operations & Exploit Strategist. Analyze why the agent is stuck and output valid JSON only.",
+                    capability="general_reasoning"
+                )
+                if not gemini_resp.is_refusal and gemini_resp.content:
+                    raw_text = gemini_resp.content.strip()
+                    # Verify Gemini did not state inability to handle the problem
+                    if not any(neg in raw_text.lower() for neg in ["i cannot", "i can't", "unable to assist", "refuse", "against policy"]):
+                        json_match = re.search(r"\{[\s\S]*\}", raw_text)
+                        if json_match:
+                            parsed = json.loads(json_match.group(0))
+                            if isinstance(parsed, dict) and "diagnosis" in parsed:
+                                diagnosis = parsed.get("diagnosis", diagnosis)
+                                pivot_strategy = parsed.get("pivot_strategy", pivot_strategy)
+                                if "new_tasks" in parsed and isinstance(parsed["new_tasks"], list) and len(parsed["new_tasks"]) > 0:
+                                    new_tasks = parsed["new_tasks"]
+                                reviewer_model = getattr(gemini_resp, "model_name", "Gemini 1.5 Pro")
+                                gemini_success = True
         except Exception as e:
-            logger.warning(f"Strategic review model query failed: {e}. Applying rule-based adaptation.")
+            logger.warning(f"[StrategicPlanner] Gemini stuck analysis encountered error: {e}. Falling back to next best model.")
+
+        # 2. Fallback to Next Best Model (AgentRouter Codex DeepSeek-V4-Flash / GLM-5.3)
+        if not gemini_success:
+            try:
+                logger.info(f"[StrategicPlanner] Gemini unavailable or escalated; routing stuck review to AgentRouter Codex...")
+                review_resp = await model_router.route_request(
+                    prompt=prompt,
+                    capability="code_analysis",
+                    target_model="deepseek-v4-flash",
+                    system_instruction="You are a Principal Security Researcher conducting strategic exploit review. Output valid JSON only.",
+                    speed_tier="deep"
+                )
+                raw_text = (review_resp.content or "").strip()
+                reviewer_model = getattr(review_resp, "model", getattr(review_resp, "model_name", "DeepSeek-V4-Flash (Codex)"))
+
+                json_match = re.search(r"\{[\s\S]*\}", raw_text)
+                if json_match:
+                    parsed = json.loads(json_match.group(0))
+                    if isinstance(parsed, dict):
+                        diagnosis = parsed.get("diagnosis", diagnosis)
+                        pivot_strategy = parsed.get("pivot_strategy", pivot_strategy)
+                        if "new_tasks" in parsed and isinstance(parsed["new_tasks"], list) and len(parsed["new_tasks"]) > 0:
+                            new_tasks = parsed["new_tasks"]
+            except Exception as e:
+                logger.warning(f"Strategic review model query failed: {e}. Applying rule-based adaptation.")
 
         if not new_tasks:
             new_tasks = [
