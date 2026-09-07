@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Set
 
 from backend.database.session import SessionLocal
-from backend.database.models import RunModel, ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel
+from backend.database.models import RunModel, ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel, ToolExecutionModel
 from backend.providers.router import model_router
 from backend.tools.manager import tool_manager
 from backend.websocket.manager import ws_manager
@@ -95,6 +95,20 @@ class SwarmBlackboard:
         self.flag_candidates: List[Dict[str, str]] = []  # Unverified candidates
         self.flag_event = asyncio.Event()
         self.is_stopped = False
+        # Set true only by an operator Pause so run_swarm finalizes as PAUSED
+        # (resumable) rather than FAILED. Distinct from is_stopped, which also
+        # trips on flag capture / kill switch.
+        self.pause_requested = False
+        # Stall / refill / persistence state
+        self.stall_reason: Optional[str] = None
+        self.worker_states: Dict[str, Dict[str, Any]] = {}
+        self.refill_count = 0
+        self.max_refills = 6
+        self.refresh_interval = 15  # seconds between task-pool refill checks
+        self.last_activity_ts = time.time()
+        self.last_persist_ts = 0.0
+        self.persist_interval = 3.0
+        self.started_ts = time.time()
         self._lock = asyncio.Lock()
 
     async def add_task(self, category: str, description: str, priority: int = 1, metadata: Optional[Dict] = None) -> SwarmTask:
@@ -124,6 +138,7 @@ class SwarmBlackboard:
 
     async def complete_task(self, task_id: str, result: str, discoveries: Optional[Dict] = None):
         async with self._lock:
+            self.last_activity_ts = time.time()
             task = self.task_pool.get(task_id)
             if task:
                 task.status = "COMPLETED"
@@ -154,6 +169,7 @@ class SwarmBlackboard:
         async with self._lock:
             if not self.flag_captured:
                 self.flag_captured = flag
+                self.last_activity_ts = time.time()
                 self.flag_event.set()
                 logger.info(f"[SwarmBlackboard] 🚩 FLAG CAPTURED BY WORKER {worker_id}: {flag}")
                 _append_to_challenge_log(self.challenge_id, worker_id, f"🚩 FLAG CAPTURED: {flag}")
@@ -196,31 +212,198 @@ class SwarmBlackboard:
         if source == "tool_output":
             await self.record_flag(candidate, worker_id)
 
+    def _build_mission_plan(self) -> Dict[str, Any]:
+        """Build the current mission plan from the task pool (shared by broadcast + DB persist)."""
+        total_tasks = len(self.task_pool)
+        completed_tasks = sum(1 for t in self.task_pool.values() if t.status == "COMPLETED")
+        plan_tasks = []
+        for idx, t in enumerate(self.task_pool.values()):
+            plan_tasks.append({
+                "id": t.task_id,
+                "phase": t.category,
+                "title": t.description,
+                "tool": "bash",
+                "reasoning": f"Claimed by {t.claimed_by or 'swarm_pool'}",
+                "status": "COMPLETED" if t.status == "COMPLETED" else ("IN_PROGRESS" if t.status == "CLAIMED" else "PENDING"),
+                "output_summary": t.result or ""
+            })
+        return {
+            "challenge_id": self.challenge_id,
+            "status": "COMPLETED" if self.flag_captured else ("STALLED" if self.stall_reason else "IN_PROGRESS"),
+            "summary": f"Swarm Intelligence Solver active on {self.target_scope}"
+                       + (f" — STALLED: {self.stall_reason}" if self.stall_reason else ""),
+            "tasks": plan_tasks,
+            "strategic_reviews": [],
+            "stall_reason": self.stall_reason or "",
+            # Resume snapshot — rehydrated by run_swarm(resume=True) so a paused
+            # challenge continues aware of prior work instead of repeating it.
+            "blackboard_state": {
+                "discovered_endpoints": list(self.discovered_endpoints),
+                "extracted_headers": dict(self.extracted_headers),
+                "observed_cookies": dict(self.observed_cookies),
+                "deobfuscated_secrets": list(self.deobfuscated_secrets),
+                "executed_commands": list(self.executed_commands_dedup),
+                "flag_candidates": list(self.flag_candidates),
+            },
+        }
+
+    def load_snapshot(
+        self,
+        snapshot: Optional[Dict[str, Any]],
+        prior_commands: Optional[List[str]] = None,
+        prior_tasks: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, int]:
+        """Rehydrate blackboard state from a persisted mission_plan snapshot + prior
+        tool commands so a resumed swarm continues from where it left off.
+
+        Synchronous by design — call before any worker starts, so no lock/broadcast
+        is needed. Returns counts for logging.
+        """
+        counts = {"endpoints": 0, "headers": 0, "commands": 0, "completed_tasks": 0, "pending_tasks": 0}
+        snapshot = snapshot or {}
+
+        for ep in (snapshot.get("discovered_endpoints") or []):
+            if ep:
+                self.discovered_endpoints.add(ep)
+        for k, v in (snapshot.get("extracted_headers") or {}).items():
+            self.extracted_headers[k] = v
+        for k, v in (snapshot.get("observed_cookies") or {}).items():
+            self.observed_cookies[k] = v
+        for sec in (snapshot.get("deobfuscated_secrets") or []):
+            self.deobfuscated_secrets.append(sec)
+        for cand in (snapshot.get("flag_candidates") or []):
+            if cand not in self.flag_candidates:
+                self.flag_candidates.append(cand)
+
+        # Dedup set: prior executed commands from the snapshot + DB tool executions,
+        # so workers never re-run a command already tried in an earlier run.
+        for cmd in (snapshot.get("executed_commands") or []):
+            if cmd:
+                self.executed_commands_dedup.add(cmd)
+        for cmd in (prior_commands or []):
+            if cmd:
+                self.executed_commands_dedup.add(cmd)
+
+        # Rebuild the task pool, preserving COMPLETED so progress carries and finished
+        # work isn't repeated; anything unfinished is made claimable again.
+        for t in (prior_tasks or []):
+            title = t.get("title") or ""
+            if not title:
+                continue
+            t_id = t.get("id") or f"task_{uuid.uuid4().hex[:8]}"
+            task = SwarmTask(t_id, t.get("phase", "RECON"), title, priority=2)
+            if t.get("status") == "COMPLETED":
+                task.status = "COMPLETED"
+                task.result = t.get("output_summary", "")
+                counts["completed_tasks"] += 1
+            else:
+                task.status = "PENDING"
+                counts["pending_tasks"] += 1
+            self.task_pool[t_id] = task
+
+        counts["endpoints"] = len(self.discovered_endpoints)
+        counts["headers"] = len(self.extracted_headers)
+        counts["commands"] = len(self.executed_commands_dedup)
+        return counts
+
+    def _compute_progress(self) -> int:
+        """Progress percentage: 0-90 from task completion, 100 on flag capture."""
+        if self.flag_captured:
+            return 100
+        total_tasks = len(self.task_pool)
+        if total_tasks == 0:
+            return 0
+        completed_tasks = sum(1 for t in self.task_pool.values() if t.status == "COMPLETED")
+        return int((completed_tasks / total_tasks) * 90)
+
+    def _build_agent_states(self) -> List[Dict[str, Any]]:
+        """Live worker fleet state for /api/agents and AGENT_UPDATE events."""
+        states = []
+        runtime_seconds = int(time.time() - self.started_ts)
+        for worker_id, ws_ in self.worker_states.items():
+            states.append({
+                **ws_,
+                "worker_id": worker_id,
+                "challenge_id": self.challenge_id,
+                "run_id": self.run_id,
+                "runtime_seconds": runtime_seconds
+            })
+        return states
+
+    async def update_worker_state(self, worker_id: str, **fields):
+        """Update a worker's live telemetry row (status, current task, counts...)."""
+        async with self._lock:
+            state = self.worker_states.setdefault(worker_id, {
+                "status": "IDLE",
+                "current_task": "",
+                "current_capability": "",
+                "selected_model": "",
+                "last_tool": "",
+                "last_result": "",
+                "commands_run": 0,
+                "failures": 0,
+                "last_activity": time.time(),
+            })
+            state.update(fields)
+            state["last_activity"] = time.time()
+            self.last_activity_ts = time.time()
+
+    async def record_tool_execution(self, worker_id: str, command: str, res):
+        """Persist a swarm tool execution to ToolExecutionModel so terminal history survives restarts/refreshes."""
+        try:
+            db = SessionLocal()
+            try:
+                status = "SUCCESS" if res.exit_code == 0 else ("FAILED" if res.status != "TIMEOUT" else "TIMEOUT")
+                exec_row = ToolExecutionModel(
+                    run_id=self.run_id,
+                    agent=worker_id,
+                    tool_name=getattr(res, "tool_name", "bash") or "bash",
+                    capability="swarm_" + (worker_id or "worker"),
+                    command=(command or "")[:2000],
+                    privilege_level="SAFE",
+                    approved=True,
+                    status=status,
+                    stdout=(getattr(res, "stdout", "") or "")[:4000],
+                    stderr=(getattr(res, "stderr", "") or "")[:4000],
+                    exit_code=res.exit_code,
+                    duration_ms=float(getattr(res, "duration_ms", 0.0) or 0.0)
+                )
+                db.add(exec_row)
+                db.commit()
+            except Exception as e:
+                logger.debug(f"[SwarmBlackboard] Tool execution persist skip: {e}")
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+    async def _persist_progress_if_due(self, force: bool = False):
+        """Throttled DB persist of mission plan (task statuses) + progress so the UI is reload-safe."""
+        now = time.time()
+        if not force and (now - self.last_persist_ts) < self.persist_interval:
+            return
+        self.last_persist_ts = now
+        try:
+            db = SessionLocal()
+            try:
+                ch = db.query(ChallengeModel).filter(ChallengeModel.id == self.challenge_id).first()
+                if ch:
+                    ch.mission_plan = self._build_mission_plan()
+                    ch.progress = self._compute_progress()
+                    db.commit()
+            except Exception as e:
+                logger.debug(f"[SwarmBlackboard] Progress persist skip: {e}")
+            finally:
+                db.close()
+        except Exception:
+            pass
+
     async def _broadcast_blackboard(self):
         try:
             total_tasks = len(self.task_pool)
             completed_tasks = sum(1 for t in self.task_pool.values() if t.status == "COMPLETED")
-            progress = int((completed_tasks / max(total_tasks, 1)) * 90) if not self.flag_captured else 100
-
-            plan_tasks = []
-            for idx, t in enumerate(self.task_pool.values()):
-                plan_tasks.append({
-                    "id": t.task_id,
-                    "phase": t.category,
-                    "title": t.description,
-                    "tool": "bash",
-                    "reasoning": f"Claimed by {t.claimed_by or 'swarm_pool'}",
-                    "status": "COMPLETED" if t.status == "COMPLETED" else ("IN_PROGRESS" if t.status == "CLAIMED" else "PENDING"),
-                    "output_summary": t.result or ""
-                })
-
-            mission_plan = {
-                "challenge_id": self.challenge_id,
-                "status": "IN_PROGRESS" if not self.flag_captured else "COMPLETED",
-                "summary": f"Swarm Intelligence Solver active on {self.target_scope}",
-                "tasks": plan_tasks,
-                "strategic_reviews": []
-            }
+            progress = self._compute_progress()
+            mission_plan = self._build_mission_plan()
 
             # Broadcast plan update so frontend Todo List / Mission Plan renders live
             await ws_manager.broadcast({
@@ -237,6 +420,14 @@ class SwarmBlackboard:
                 "progress": progress
             })
 
+            # Broadcast live worker fleet state
+            await ws_manager.broadcast({
+                "event": "AGENT_UPDATE",
+                "challenge_id": self.challenge_id,
+                "run_id": self.run_id,
+                "agents": self._build_agent_states()
+            })
+
             # Broadcast swarm blackboard stats
             await ws_manager.broadcast({
                 "event": "SWARM_BLACKBOARD_UPDATE",
@@ -250,6 +441,9 @@ class SwarmBlackboard:
                 "flag_captured": bool(self.flag_captured),
                 "flag_candidates_count": len(self.flag_candidates)
             })
+
+            # Throttled DB persist keeps the todo list / progress reload-safe
+            await self._persist_progress_if_due()
         except Exception:
             pass
 
@@ -266,11 +460,12 @@ class SwarmOrchestrator:
         target_scope: str,
         working_directory: str,
         category: str = "WEB",
-        difficulty: str = "EASY"
+        difficulty: str = "EASY",
+        resume: bool = False
     ):
         """Dispatches parallel Swarm workers on the target."""
-        logger.info(f"[SwarmOrchestrator] 🚀 Starting Swarm for Challenge '{challenge_id}' on '{target_scope}'")
-        _append_to_challenge_log(challenge_id, "orchestrator", f"Swarm starting | target={target_scope} | category={category} | difficulty={difficulty}")
+        logger.info(f"[SwarmOrchestrator] 🚀 Starting Swarm for Challenge '{challenge_id}' on '{target_scope}' (resume={resume})")
+        _append_to_challenge_log(challenge_id, "orchestrator", f"Swarm {'resuming' if resume else 'starting'} | target={target_scope} | category={category} | difficulty={difficulty}")
 
         # Engage OS Keep-Awake lock
         keep_awake_manager.acquire(reason=f"Swarm Challenge {challenge_id}")
@@ -301,11 +496,40 @@ class SwarmOrchestrator:
                     board.extracted_headers[h_k] = str(h_v)
                 _append_to_challenge_log(challenge_id, "orchestrator", f"Turbo recon seeded: {len(board.discovered_endpoints)} endpoints, {len(board.extracted_headers)} headers")
 
-            # Seed Initial Swarm Tasks
-            await board.add_task("RECON", f"Initial crawler & header discovery on {target_scope}", priority=5)
-            await board.add_task("CODE_AUDIT", f"Inspect source code, HTML comments, and scripts on {target_scope}", priority=4)
-            await board.add_task("EXPLOIT", f"Test authentication endpoints and parameters on {target_scope}", priority=3)
-            _append_to_challenge_log(challenge_id, "orchestrator", "Initial task pool seeded (RECON, CODE_AUDIT, EXPLOIT)")
+            # Resume: rehydrate prior blackboard state + task pool so the swarm
+            # continues aware of earlier work instead of repeating it. Non-fatal —
+            # a rehydrate failure just falls through to a fresh start.
+            if resume:
+                try:
+                    ch_row = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+                    mp = (ch_row.mission_plan if ch_row else None) or {}
+                    snapshot = mp.get("blackboard_state")
+                    prior_tasks = mp.get("tasks")
+                    rows = (db.query(ToolExecutionModel.command)
+                            .join(RunModel, ToolExecutionModel.run_id == RunModel.id)
+                            .filter(RunModel.challenge_id == challenge_id).all())
+                    prior_cmds = [r[0] for r in rows if r and r[0]]
+                    counts = board.load_snapshot(snapshot, prior_cmds, prior_tasks)
+                    _append_to_challenge_log(
+                        challenge_id, "orchestrator",
+                        f"Resuming from prior progress: {counts['endpoints']} endpoints, "
+                        f"{counts['commands']} prior commands, {counts['completed_tasks']} completed tasks"
+                    )
+                    logger.info(f"[SwarmOrchestrator] Resuming challenge '{challenge_id}' with rehydrated state: {counts}")
+                except Exception as rehydrate_err:
+                    logger.warning(f"[SwarmOrchestrator] Resume rehydrate failed (starting fresh): {rehydrate_err}")
+
+            # Seed Initial Swarm Tasks — only when the pool has no pending work (a fresh
+            # start, or a resume where every prior task was already completed).
+            if not any(t.status == "PENDING" for t in board.task_pool.values()):
+                await board.add_task("RECON", f"Initial crawler & header discovery on {target_scope}", priority=5)
+                await board.add_task("CODE_AUDIT", f"Inspect source code, HTML comments, and scripts on {target_scope}", priority=4)
+                await board.add_task("EXPLOIT", f"Test authentication endpoints and parameters on {target_scope}", priority=3)
+                _append_to_challenge_log(challenge_id, "orchestrator", "Initial task pool seeded (RECON, CODE_AUDIT, EXPLOIT)")
+            else:
+                pending_n = sum(1 for t in board.task_pool.values() if t.status == "PENDING")
+                completed_n = sum(1 for t in board.task_pool.values() if t.status == "COMPLETED")
+                _append_to_challenge_log(challenge_id, "orchestrator", f"Resumed task pool: {pending_n} pending, {completed_n} completed")
 
             # Define Swarm Workers
             workers = [
@@ -314,18 +538,19 @@ class SwarmOrchestrator:
                 self._exploit_worker("worker_exploit_pwn", board, working_directory)
             ]
 
-            # Run workers concurrently until flag capture or cancellation.
+            # Run workers concurrently until flag capture, stall, or cancellation.
             # asyncio.gather() already returns an awaitable _GatheringFuture; use
             # ensure_future (NOT create_task, which rejects a Future) so it can be
             # passed to asyncio.wait() below alongside flag_task.
             worker_task = asyncio.ensure_future(asyncio.gather(*workers, return_exceptions=True))
             flag_task = asyncio.create_task(board.flag_event.wait())
+            refiller_task = asyncio.create_task(self._task_refiller(board, working_directory))
 
-            _append_to_challenge_log(challenge_id, "orchestrator", "All 3 swarm workers dispatched")
+            _append_to_challenge_log(challenge_id, "orchestrator", "All 3 swarm workers + task refiller dispatched")
 
-            # Wait for flag event or worker completion
+            # Wait for flag event, worker completion, or stall
             done, pending = await asyncio.wait(
-                [flag_task, worker_task],
+                [flag_task, worker_task, refiller_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
 
@@ -353,20 +578,57 @@ class SwarmOrchestrator:
                 if run_obj:
                     run_obj.status = "COMPLETED"
                     run_obj.completed_at = datetime.now(timezone.utc)
-                    run_obj.final_flag = board.flag_captured
                 if ch_obj:
                     ch_obj.status = "SOLVED"
                     ch_obj.flag = board.flag_captured
+                    ch_obj.progress = 100
+                    ch_obj.completed_at = datetime.now(timezone.utc)
                 db.commit()
+                await board._persist_progress_if_due(force=True)
                 _append_to_challenge_log(challenge_id, "orchestrator", f"🏁 SOLVED! Flag: {board.flag_captured}")
                 logger.info(f"[SwarmOrchestrator] 🏁 Swarm SOLVED challenge '{challenge_id}'! Flag: {board.flag_captured}")
+                await ws_manager.broadcast({
+                    "event": "RUN_COMPLETED",
+                    "challenge_id": challenge_id,
+                    "run_id": run_id,
+                    "flag": board.flag_captured
+                })
+            elif board.pause_requested:
+                # Operator paused — persist a resume snapshot and finalize as PAUSED
+                # (resumable), never FAILED. Progress and blackboard state are kept.
+                if run_obj:
+                    run_obj.status = "PAUSED"
+                if ch_obj:
+                    ch_obj.status = "PAUSED"
+                db.commit()
+                await board._persist_progress_if_due(force=True)
+                _append_to_challenge_log(challenge_id, "orchestrator", "Swarm PAUSED by operator — state saved for resume")
+                logger.info(f"[SwarmOrchestrator] Swarm PAUSED for '{challenge_id}' (resumable)")
+                await ws_manager.broadcast({
+                    "event": "RUN_PAUSED",
+                    "challenge_id": challenge_id,
+                    "run_id": run_id
+                })
             else:
+                stall_msg = board.stall_reason or "Swarm finished without a verified flag (task pool exhausted)"
                 if run_obj:
                     run_obj.status = "FAILED"
                     run_obj.completed_at = datetime.now(timezone.utc)
+                if ch_obj:
+                    ch_obj.status = "FAILED"
+                    ch_obj.completed_at = datetime.now(timezone.utc)
                 db.commit()
+                await board._persist_progress_if_due(force=True)
                 candidates_summary = ", ".join([c["flag"] for c in board.flag_candidates]) if board.flag_candidates else "none"
-                _append_to_challenge_log(challenge_id, "orchestrator", f"Swarm finished without verified flag. Candidates: {candidates_summary}")
+                _append_to_challenge_log(challenge_id, "orchestrator", f"Swarm finished without verified flag. {stall_msg} Candidates: {candidates_summary}")
+                logger.info(f"[SwarmOrchestrator] Swarm ended without flag for '{challenge_id}': {stall_msg}")
+                await ws_manager.broadcast({
+                    "event": "RUN_STALLED",
+                    "challenge_id": challenge_id,
+                    "run_id": run_id,
+                    "reason": stall_msg,
+                    "candidates": [c["flag"] for c in board.flag_candidates]
+                })
 
             # Generate structured report
             try:
@@ -393,16 +655,40 @@ class SwarmOrchestrator:
             keep_awake_manager.release(reason=f"Swarm Challenge {challenge_id} Ended")
             _append_to_challenge_log(challenge_id, "orchestrator", "Swarm shutdown complete")
 
+    async def request_pause(self, challenge_id: str) -> bool:
+        """Gracefully pause every active swarm for a challenge.
+
+        Signals workers to stop after their current step (no hard cancel, so no
+        orphaned tasks) and force-persists a resume snapshot. run_swarm then
+        finalizes the run as PAUSED. Returns True if an active swarm was found.
+        """
+        paused_any = False
+        for board in list(self.active_swarms.values()):
+            if board.challenge_id == challenge_id and not board.is_stopped:
+                board.pause_requested = True
+                board.is_stopped = True
+                try:
+                    await board._persist_progress_if_due(force=True)
+                except Exception:
+                    pass
+                paused_any = True
+                _append_to_challenge_log(challenge_id, "orchestrator", "Pause requested by operator — workers finishing current step")
+                logger.info(f"[SwarmOrchestrator] Pause requested for challenge '{challenge_id}'")
+        return paused_any
+
     async def _recon_worker(self, worker_id: str, board: SwarmBlackboard, workdir: str):
         """Worker 1: Fast Recon & Fuzzing (Uses Groq / Minimax / xKiro)."""
         logger.info(f"[Swarm Worker] {worker_id} started.")
         _append_to_challenge_log(board.challenge_id, worker_id, "Worker started")
+        await board.update_worker_state(worker_id, status="RUNNING", current_capability="recon",
+                                        selected_model="Groq Qwen / xKiro (free)", current_task="Booting recon worker")
         consecutive_errors = 0
         MAX_CONSECUTIVE_ERRORS = 5
         while not board.flag_captured and not board.is_stopped:
             task = await board.claim_task(worker_id, ["RECON"])
             if not task:
                 # No pending tasks — wait and check again
+                await board.update_worker_state(worker_id, status="IDLE", current_task="Idle — waiting for tasks")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     _append_to_challenge_log(board.challenge_id, worker_id, f"Too many errors ({consecutive_errors}), worker pausing for 30s")
                     await asyncio.sleep(30)
@@ -413,6 +699,7 @@ class SwarmOrchestrator:
 
             try:
                 _append_to_challenge_log(board.challenge_id, worker_id, f"Claimed task: {task.description[:100]}")
+                await board.update_worker_state(worker_id, status="ANALYZING", current_task=task.description[:140])
 
                 # Query model for next recon action
                 prompt = (
@@ -431,6 +718,9 @@ class SwarmOrchestrator:
                 if resp.is_refusal:
                     _append_to_challenge_log(board.challenge_id, worker_id, f"All providers exhausted: {resp.refusal_reason[:100]}")
                     consecutive_errors += 1
+                    await board.update_worker_state(worker_id, status="IDLE",
+                                                    failures=consecutive_errors,
+                                                    current_task=f"Provider error: {resp.refusal_reason[:80]}")
                     await board.complete_task(task.task_id, result=f"Provider error: {resp.refusal_reason[:80]}")
                     await asyncio.sleep(5)
                     continue
@@ -457,6 +747,14 @@ class SwarmOrchestrator:
                     _append_to_challenge_log(board.challenge_id, worker_id, f"Executing: {cmd[:200]}")
                     res = await tool_manager.execute_tool("bash", {"command": cmd}, timeout=25, working_directory=workdir)
                     output = res.stdout or res.stderr or ""
+
+                    # Persist the execution so terminal history survives refreshes/restarts
+                    await board.record_tool_execution(worker_id, cmd, res)
+                    await board.update_worker_state(
+                        worker_id, status="RUNNING", last_tool=cmd[:160],
+                        last_result=(output[:200] or f"[Exit {res.exit_code}] no output"),
+                        commands_run=board.worker_states.get(worker_id, {}).get("commands_run", 0) + 1
+                    )
 
                     _append_to_challenge_log(board.challenge_id, worker_id, f"Output ({len(output)} bytes, exit={res.exit_code}): {output[:300]}")
 
@@ -494,6 +792,8 @@ class SwarmOrchestrator:
                 consecutive_errors += 1
                 logger.warning(f"[{worker_id}] Error #{consecutive_errors}: {e}")
                 _append_to_challenge_log(board.challenge_id, worker_id, f"Error #{consecutive_errors}: {e}")
+                await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
+                                                current_task=f"Error: {str(e)[:100]}")
                 # Fail the task so it doesn't stay CLAIMED forever
                 if task:
                     await board.complete_task(task.task_id, result=f"Error: {str(e)[:100]}")
@@ -503,11 +803,14 @@ class SwarmOrchestrator:
         """Worker 2: Code Audit, Deobfuscation & Cryptanalysis (Uses Mistral Codestral)."""
         logger.info(f"[Swarm Worker] {worker_id} started.")
         _append_to_challenge_log(board.challenge_id, worker_id, "Worker started")
+        await board.update_worker_state(worker_id, status="RUNNING", current_capability="code_analysis",
+                                        selected_model="Mistral Codestral / xKiro", current_task="Booting code-crypto worker")
         consecutive_errors = 0
         MAX_CONSECUTIVE_ERRORS = 5
         while not board.flag_captured and not board.is_stopped:
             task = await board.claim_task(worker_id, ["CODE_AUDIT", "CRYPTO_DECODE"])
             if not task:
+                await board.update_worker_state(worker_id, status="IDLE", current_task="Idle — waiting for tasks")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     _append_to_challenge_log(board.challenge_id, worker_id, f"Too many errors ({consecutive_errors}), worker pausing for 30s")
                     await asyncio.sleep(30)
@@ -518,6 +821,7 @@ class SwarmOrchestrator:
 
             try:
                 _append_to_challenge_log(board.challenge_id, worker_id, f"Claimed task: {task.description[:100]}")
+                await board.update_worker_state(worker_id, status="ANALYZING", current_task=task.description[:140])
 
                 prompt = (
                     f"You are the Code & Cryptanalysis Specialist in a CTF Swarm.\n"
@@ -535,6 +839,8 @@ class SwarmOrchestrator:
                 if resp.is_refusal:
                     _append_to_challenge_log(board.challenge_id, worker_id, f"All providers exhausted: {resp.refusal_reason[:100]}")
                     consecutive_errors += 1
+                    await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
+                                                    current_task=f"Provider error: {resp.refusal_reason[:80]}")
                     await board.complete_task(task.task_id, result=f"Provider error: {resp.refusal_reason[:80]}")
                     await asyncio.sleep(5)
                     continue
@@ -575,6 +881,9 @@ class SwarmOrchestrator:
                     _append_to_challenge_log(board.challenge_id, worker_id, f"🔑 Header found: {h_name}: {h_val}")
                     await board.add_task("EXPLOIT", f"Inject header '{h_name}: {h_val}' into login and API endpoints on {board.target_scope}", priority=5)
 
+                await board.update_worker_state(worker_id, status="RUNNING",
+                                                last_result=(analysis[:200] or "Analysis complete"),
+                                                commands_run=board.worker_states.get(worker_id, {}).get("commands_run", 0) + 1)
                 await board.complete_task(task.task_id, result=analysis[:200])
                 consecutive_errors = 0
 
@@ -582,6 +891,8 @@ class SwarmOrchestrator:
                 consecutive_errors += 1
                 logger.warning(f"[{worker_id}] Error #{consecutive_errors}: {e}")
                 _append_to_challenge_log(board.challenge_id, worker_id, f"Error #{consecutive_errors}: {e}")
+                await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
+                                                current_task=f"Error: {str(e)[:100]}")
                 if task:
                     await board.complete_task(task.task_id, result=f"Error: {str(e)[:100]}")
                 await asyncio.sleep(min(3 * consecutive_errors, 15))
@@ -590,11 +901,14 @@ class SwarmOrchestrator:
         """Worker 3: Exploitation, PWN & Payload Delivery (Uses xKiro Qwen Coder / DeepSeek)."""
         logger.info(f"[Swarm Worker] {worker_id} started.")
         _append_to_challenge_log(board.challenge_id, worker_id, "Worker started")
+        await board.update_worker_state(worker_id, status="RUNNING", current_capability="web_testing",
+                                        selected_model="xKiro Qwen Coder / DeepSeek", current_task="Booting exploit worker")
         consecutive_errors = 0
         MAX_CONSECUTIVE_ERRORS = 5
         while not board.flag_captured and not board.is_stopped:
             task = await board.claim_task(worker_id, ["EXPLOIT", "PWN"])
             if not task:
+                await board.update_worker_state(worker_id, status="IDLE", current_task="Idle — waiting for tasks")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     _append_to_challenge_log(board.challenge_id, worker_id, f"Too many errors ({consecutive_errors}), worker pausing for 30s")
                     await asyncio.sleep(30)
@@ -605,6 +919,7 @@ class SwarmOrchestrator:
 
             try:
                 _append_to_challenge_log(board.challenge_id, worker_id, f"Claimed task: {task.description[:100]}")
+                await board.update_worker_state(worker_id, status="ANALYZING", current_task=task.description[:140])
 
                 headers_str = " ".join([f"-H '{k}: {v}'" for k, v in board.extracted_headers.items()])
                 prompt = (
@@ -622,6 +937,8 @@ class SwarmOrchestrator:
                 if resp.is_refusal:
                     _append_to_challenge_log(board.challenge_id, worker_id, f"All providers exhausted: {resp.refusal_reason[:100]}")
                     consecutive_errors += 1
+                    await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
+                                                    current_task=f"Provider error: {resp.refusal_reason[:80]}")
                     await board.complete_task(task.task_id, result=f"Provider error: {resp.refusal_reason[:80]}")
                     await asyncio.sleep(5)
                     continue
@@ -648,6 +965,14 @@ class SwarmOrchestrator:
                     _append_to_challenge_log(board.challenge_id, worker_id, f"Executing: {cmd[:200]}")
                     res = await tool_manager.execute_tool("bash", {"command": cmd}, timeout=25, working_directory=workdir)
                     output = res.stdout or res.stderr or ""
+
+                    # Persist the execution so terminal history survives refreshes/restarts
+                    await board.record_tool_execution(worker_id, cmd, res)
+                    await board.update_worker_state(
+                        worker_id, status="RUNNING", last_tool=cmd[:160],
+                        last_result=(output[:200] or f"[Exit {res.exit_code}] no output"),
+                        commands_run=board.worker_states.get(worker_id, {}).get("commands_run", 0) + 1
+                    )
 
                     _append_to_challenge_log(board.challenge_id, worker_id, f"Output ({len(output)} bytes, exit={res.exit_code}): {output[:300]}")
 
@@ -676,9 +1001,45 @@ class SwarmOrchestrator:
                 consecutive_errors += 1
                 logger.warning(f"[{worker_id}] Error #{consecutive_errors}: {e}")
                 _append_to_challenge_log(board.challenge_id, worker_id, f"Error #{consecutive_errors}: {e}")
+                await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
+                                                current_task=f"Error: {str(e)[:100]}")
                 if task:
                     await board.complete_task(task.task_id, result=f"Error: {str(e)[:100]}")
                 await asyncio.sleep(min(3 * consecutive_errors, 15))
+
+    async def _task_refiller(self, board: SwarmBlackboard, workdir: str):
+        """Keep the task pool fed with fresh exploratory tasks while the swarm runs.
+
+        The swarm must never stop on its own — it runs until the flag is captured or
+        the operator pauses / kills it. So the refiller cycles its prompt list
+        indefinitely (round-robin), re-seeding whenever the pool drains. It only adds
+        when there is no pending work, so a productive swarm isn't spammed, and the
+        15s interval + per-worker error backoff keep provider usage gentle during
+        outages instead of hammering.
+        """
+        refill_prompts = [
+            ("RECON", "Probe HTTP methods, headers, cookies, and hidden parameters on all discovered endpoints"),
+            ("CODE_AUDIT", "Analyze response headers, cookies, and any JS/source references for tokens or logic flaws"),
+            ("EXPLOIT", "Attempt auth bypass: default creds, SQLi, SSTI, JWT manipulation, and IDOR parameter fuzzing"),
+            ("RECON", "Enumerate additional paths and file extensions (php, bak, env, git, swagger) on the target"),
+            ("EXPLOIT", "Test for command injection, path traversal, and file read primitives"),
+            ("CODE_AUDIT", "Decode any base64/JWT/hex artifacts observed so far and check for hardcoded secrets"),
+        ]
+        logger.info(f"[SwarmOrchestrator] Task refiller started for challenge {board.challenge_id}")
+        _append_to_challenge_log(board.challenge_id, "refiller", "Task refiller started (runs until flag or operator stop)")
+        while not board.flag_captured and not board.is_stopped:
+            await asyncio.sleep(board.refresh_interval)
+            if board.flag_captured or board.is_stopped:
+                break
+            pending = sum(1 for t in board.task_pool.values() if t.status == "PENDING")
+            if pending == 0:
+                cat, prompt = refill_prompts[board.refill_count % len(refill_prompts)]
+                await board.add_task(cat, prompt, priority=2)
+                board.refill_count += 1
+                _append_to_challenge_log(board.challenge_id, "refiller",
+                                         f"Task pool refill #{board.refill_count}: {prompt[:100]}")
+                logger.info(f"[SwarmOrchestrator] Refill #{board.refill_count} for {board.challenge_id}: {prompt[:60]}")
+                await board._broadcast_blackboard()
 
     def _extract_command(self, text: str) -> Optional[str]:
         if not text:

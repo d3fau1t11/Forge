@@ -105,6 +105,7 @@ export interface AgentInfo {
   actionsCompleted: number;
   failures: number;
   checkpointStatus: string;
+  challengeId?: string;
 }
 
 export interface ToolItem {

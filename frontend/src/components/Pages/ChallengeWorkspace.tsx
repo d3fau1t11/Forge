@@ -19,13 +19,14 @@ import {
   Clock,
   Zap
 } from 'lucide-react';
-import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode } from '../../types';
+import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode, AgentInfo } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
 import { computeElapsedSeconds, formatDuration } from '../../utils/timeUtils';
 
 interface ChallengeWorkspaceProps {
   challenge: Challenge;
   target: Target;
+  agents: AgentInfo[];
   evidenceList: EvidenceItem[];
   decisions: AiDecision[];
   logs: TerminalLog[];
@@ -38,6 +39,7 @@ interface ChallengeWorkspaceProps {
 export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   challenge,
   target,
+  agents,
   evidenceList,
   decisions,
   logs,
@@ -145,6 +147,23 @@ ${evidenceText}
   };
 
   const currentPlan = challenge.missionPlan || challenge.mission_plan;
+
+  // Live swarm fleet — real worker telemetry from /api/agents + AGENT_UPDATE events.
+  // Falls back to the three role placeholders (STANDBY) when nothing is live.
+  const WORKER_ROLES: { name: string; icon: string; model: string; blurb: string }[] = [
+    { name: 'RECON', icon: '🛰️', model: 'Groq Qwen / xKiro (Zero Cost)', blurb: 'Port scanning, directory fuzzing & endpoint harvesting' },
+    { name: 'CRYPTO', icon: '🔬', model: 'Mistral Codestral / xKiro', blurb: 'Decompiling scripts, ROT13/JWT token & comment decoding' },
+    { name: 'PWN', icon: '⚡', model: 'xKiro Qwen Coder / DeepSeek', blurb: 'Crafting auth bypass headers, SQLi & payload delivery' }
+  ];
+  const fleetStatusClass = (status: string) => {
+    switch (status) {
+      case 'RUNNING': return 'text-cyber-emerald animate-pulse';
+      case 'ANALYZING': return 'text-cyber-cyan animate-pulse';
+      case 'FAILED': return 'text-cyber-rose';
+      default: return 'text-slate-500';
+    }
+  };
+  const hasLiveFleet = agents.length > 0;
 
   return (
     <div className="space-y-5 font-mono text-slate-100 pb-10">
@@ -345,44 +364,42 @@ ${evidenceText}
           <div className="glass-panel border border-slate-800 p-5 rounded-xl space-y-4">
             <h2 className="font-display font-bold text-slate-100 uppercase border-b border-slate-800 pb-2 text-sm neon-text-cyan flex items-center justify-between">
               <span>SWARM FLEET HUD</span>
-              <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-950 border border-cyber-cyan/50 text-cyber-cyan">3 PARALLEL WORKERS</span>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-950 border border-cyber-cyan/50 text-cyber-cyan">
+                {hasLiveFleet ? `${agents.length} LIVE WORKERS` : '3 PARALLEL WORKERS'}
+              </span>
             </h2>
             <div className="space-y-3">
-              {/* Swarm Worker 1 */}
-              <div className="p-3 rounded-lg bg-obsidian-950 border border-cyber-cyan/40 space-y-1">
-                <div className="flex justify-between font-bold text-cyber-cyan text-xs">
-                  <span>🛰️ RECON WORKER</span>
-                  <span className={challenge.status === 'RUNNING' ? 'text-cyber-emerald animate-pulse' : 'text-slate-500'}>
-                    {challenge.status === 'RUNNING' ? 'CRAWLING' : 'STANDBY'}
-                  </span>
-                </div>
-                <div className="text-[10px] text-purple-300 font-mono">Model: Groq Qwen / Minimax M3 (Zero Cost)</div>
-                <p className="text-[11px] text-slate-400">Port scanning, directory fuzzing & endpoint harvesting</p>
-              </div>
-
-              {/* Swarm Worker 2 */}
-              <div className="p-3 rounded-lg bg-obsidian-950 border border-cyber-cyan/40 space-y-1">
-                <div className="flex justify-between font-bold text-cyber-cyan text-xs">
-                  <span>🔬 CODE & CRYPTO AUDITOR</span>
-                  <span className={challenge.status === 'RUNNING' ? 'text-cyber-cyan animate-pulse' : 'text-slate-500'}>
-                    {challenge.status === 'RUNNING' ? 'DEOBFUSCATING' : 'STANDBY'}
-                  </span>
-                </div>
-                <div className="text-[10px] text-purple-300 font-mono">Model: Mistral Codestral (Specialist)</div>
-                <p className="text-[11px] text-slate-400">Decompiling scripts, ROT13/JWT token & comment decoding</p>
-              </div>
-
-              {/* Swarm Worker 3 */}
-              <div className="p-3 rounded-lg bg-obsidian-950 border border-cyber-cyan/40 space-y-1">
-                <div className="flex justify-between font-bold text-cyber-cyan text-xs">
-                  <span>⚡ EXPLOIT & PWN SOLVER</span>
-                  <span className={challenge.status === 'RUNNING' ? 'text-cyber-amber animate-pulse' : 'text-slate-500'}>
-                    {challenge.status === 'RUNNING' ? 'SYNTHESIZING' : 'STANDBY'}
-                  </span>
-                </div>
-                <div className="text-[10px] text-purple-300 font-mono">Model: xKiro Qwen Coder / DeepSeek V4</div>
-                <p className="text-[11px] text-slate-400">Crafting auth bypass headers, SQLi & payload delivery</p>
-              </div>
+              {/* Live Swarm Workers — real telemetry, or role placeholders on standby */}
+              {hasLiveFleet ? (
+                agents.map((a) => (
+                  <div key={a.id} className="p-3 rounded-lg bg-obsidian-950 border border-cyber-cyan/40 space-y-1">
+                    <div className="flex justify-between font-bold text-cyber-cyan text-xs">
+                      <span>{a.name} WORKER</span>
+                      <span className={fleetStatusClass(a.status)}>{a.status}</span>
+                    </div>
+                    <div className="text-[10px] text-purple-300 font-mono">Model: {a.selectedModel || 'FORGE Model Router'}</div>
+                    <p className="text-[11px] text-slate-400 truncate" title={a.currentObjective}>{a.currentObjective}</p>
+                    {a.lastTool && (
+                      <p className="text-[10px] text-slate-500 font-mono truncate" title={a.lastTool}>$ {a.lastTool}</p>
+                    )}
+                    <div className="flex justify-between text-[10px] text-slate-500 pt-0.5">
+                      <span>Runtime: <span className="text-slate-300">{a.runtime}</span></span>
+                      <span>Cmds: <span className="text-cyber-emerald">{a.actionsCompleted}</span> • Fails: <span className={a.failures > 0 ? 'text-cyber-rose' : 'text-slate-400'}>{a.failures}</span></span>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                WORKER_ROLES.map((role) => (
+                  <div key={role.name} className="p-3 rounded-lg bg-obsidian-950 border border-cyber-cyan/40 space-y-1">
+                    <div className="flex justify-between font-bold text-cyber-cyan text-xs">
+                      <span>{role.icon} {role.name} WORKER</span>
+                      <span className="text-slate-500">STANDBY</span>
+                    </div>
+                    <div className="text-[10px] text-purple-300 font-mono">Model: {role.model}</div>
+                    <p className="text-[11px] text-slate-400">{role.blurb}</p>
+                  </div>
+                ))
+              )}
 
               {/* Shared Blackboard State Summary */}
               <div className="p-3 rounded-lg bg-obsidian-900/80 border border-slate-700 space-y-1.5 mt-2">

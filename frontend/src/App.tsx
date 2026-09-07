@@ -38,6 +38,53 @@ import { KnowledgeCoverage } from './components/Pages/KnowledgeCoverage';
 import { apiService } from './services/api';
 import { AlertTriangle, X } from 'lucide-react';
 import { soundEngine } from './utils/soundEngine';
+import { formatDuration, parseUtcMs } from './utils/timeUtils';
+
+const SWARM_AGENT_NAMES: Record<string, string> = {
+  worker_recon: 'RECON',
+  worker_code_crypto: 'CRYPTO',
+  worker_exploit_pwn: 'PWN'
+};
+
+// Map live swarm worker state (from /api/agents + AGENT_UPDATE events) into AgentInfo cards.
+function mapSwarmAgents(swarmAgents: any[]): AgentInfo[] {
+  return swarmAgents.map((a: any) => {
+    const statusRaw = String(a.status || 'IDLE').toUpperCase();
+    const status = (['RUNNING', 'ANALYZING', 'IDLE', 'STANDBY', 'FAILED'] as const).includes(statusRaw as any)
+      ? (statusRaw as AgentInfo['status'])
+      : 'IDLE';
+    return {
+      id: a.worker_id || a.id || `swarm-${Math.random().toString(36).slice(2, 8)}`,
+      name: (SWARM_AGENT_NAMES[a.worker_id] || a.worker_id || 'AGENT').toUpperCase() as AgentInfo['name'],
+      status,
+      currentObjective: a.current_task || 'Idle — waiting for tasks',
+      currentCapability: a.current_capability || 'swarm',
+      selectedModel: a.selected_model || 'FORGE Model Router',
+      lastTool: a.last_tool || '',
+      lastResult: a.last_result || '',
+      runtime: formatDuration(Number(a.runtime_seconds) || 0),
+      actionsCompleted: Number(a.commands_run) || 0,
+      failures: Number(a.failures) || 0,
+      checkpointStatus: status === 'FAILED' ? 'DEGRADED' : (Number(a.commands_run) > 0 ? 'ACTIVE' : 'IDLE'),
+      challengeId: a.challenge_id
+    };
+  });
+}
+
+// Map persisted ToolExecutionModel rows (from /api/tools/executions) into TerminalLog entries.
+function mapToolExecutionsToLogs(executions: any[]): TerminalLog[] {
+  return executions.map((e: any) => ({
+    id: e.id || `exec-${Date.now()}-${Math.random()}`,
+    timestamp: e.created_at ? new Date(e.created_at).toLocaleTimeString() : new Date().toLocaleTimeString(),
+    command: e.command || '',
+    output: (e.stdout || e.stderr || `[Exit ${e.exit_code}] no output`).trim(),
+    exitCode: e.exit_code ?? -1,
+    duration: e.duration_ms != null ? `${(Number(e.duration_ms) / 1000).toFixed(1)}s` : '—',
+    type: 'EXECUTION',
+    agent: e.agent,
+    challengeId: e.challenge_id || undefined
+  }));
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('command');
@@ -55,7 +102,7 @@ export default function App() {
   // Application Data States
   const [challenges, setChallenges] = useState<Challenge[]>(INITIAL_CHALLENGES);
   const [targets, setTargets] = useState<Target[]>(INITIAL_TARGETS);
-  const [agents] = useState<AgentInfo[]>(INITIAL_AGENTS);
+  const [agents, setAgents] = useState<AgentInfo[]>(INITIAL_AGENTS);
   const [tools, setTools] = useState<ToolItem[]>(INITIAL_TOOLS);
   const [decisions, setDecisions] = useState<AiDecision[]>(INITIAL_AI_DECISIONS);
   const [routes] = useState<ModelRoute[]>(INITIAL_MODEL_ROUTES);
@@ -269,6 +316,24 @@ export default function App() {
                   }
                 : prev
             );
+          } else if (data.event === 'AGENT_UPDATE') {
+            if (Array.isArray(data.agents) && data.agents.length > 0) {
+              setAgents(mapSwarmAgents(data.agents));
+            }
+          } else if (data.event === 'RUN_STALLED' || data.event === 'RUN_FAILED') {
+            setChallenges((prev) =>
+              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'FAILED' } : c))
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id ? { ...prev, status: 'FAILED' } : prev
+            );
+          } else if (data.event === 'RUN_PAUSED' || data.event === 'CHALLENGE_PAUSED') {
+            setChallenges((prev) =>
+              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'PAUSED' } : c))
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id ? { ...prev, status: 'PAUSED' } : prev
+            );
           } else if (data.event === 'KILL_SWITCH_ACTIVATED') {
             setKillSwitchActive(true);
             setShowModalKillSwitch(true);
@@ -395,8 +460,33 @@ export default function App() {
       }
 
       const backendProviders = await apiService.getProviders();
-      if (backendProviders && Array.isArray(backendProviders)) {
-        setProviders(backendProviders);
+      const provList = Array.isArray(backendProviders)
+        ? backendProviders
+        : (backendProviders && Array.isArray((backendProviders as any).providers) ? (backendProviders as any).providers : []);
+      if (provList.length > 0) {
+        setProviders(provList.map((p: any) => ({
+          name: p.name || 'Provider',
+          status: p.status === 'HEALTHY' ? 'HEALTHY' : (p.status === 'DEGRADED' ? 'DEGRADED' : 'HEALTHY'),
+          model: p.default_model || p.model || p.name || '',
+          transport: p.transport === 'CLI' ? 'CLI' : 'API',
+          latency: p.latency_ms ? `${p.latency_ms}ms` : '—',
+          requests: 0,
+          quota: p.quota || '—',
+          lastError: 'None',
+          fallbackPriority: 0
+        })));
+      }
+
+      // Reload-safe terminal history (persisted tool executions from the swarm/orchestrator)
+      const backendExecutions = await apiService.getToolExecutions();
+      if (Array.isArray(backendExecutions) && backendExecutions.length > 0) {
+        setTerminalLogs(mapToolExecutionsToLogs(backendExecutions));
+      }
+
+      // Live swarm worker fleet (fallback: keep the idle placeholder fleet)
+      const backendAgents = await apiService.getAgents();
+      if (Array.isArray(backendAgents) && backendAgents.length > 0) {
+        setAgents(mapSwarmAgents(backendAgents));
       }
     } catch (e) {
       console.log('Backend sync active.');
@@ -460,18 +550,37 @@ export default function App() {
         setChallenges((prev) =>
           prev.map((c) => (c.id === createdLocally.id ? { ...c, id: resp.id } : c))
         );
+        // Resync from the API: the mission plan can race past the optimistic-id swap,
+        // so pull the freshly generated plan instead of relying on the WS event alone.
+        fetchBackendData();
       }
     } catch (e) {
       console.warn('Backend API challenge creation offline fallback:', e);
     }
   };
 
-  const handleToggleChallengeStatus = (id: string) => {
+  const handleToggleChallengeStatus = async (id: string) => {
+    const current = challenges.find((c) => c.id === id);
+    const isRunning = current?.status === 'RUNNING';
+    const nextStatus: Challenge['status'] = isRunning ? 'PAUSED' : 'RUNNING';
+
+    // Optimistic UI flip for both the list and the open workspace.
     setChallenges((prev) =>
-      prev.map((c) =>
-        c.id === id ? { ...c, status: c.status === 'RUNNING' ? 'PAUSED' : 'RUNNING' } : c
-      )
+      prev.map((c) => (c.id === id ? { ...c, status: nextStatus } : c))
     );
+    setActiveChallenge((prev) => (prev && prev.id === id ? { ...prev, status: nextStatus } : prev));
+
+    try {
+      if (isRunning) {
+        // Pause: gracefully suspends the live swarm and saves a resume snapshot.
+        await apiService.pauseChallenge(id);
+      } else {
+        // Start/Resume: backend decides fresh vs resume from persisted progress.
+        await apiService.startRun(id);
+      }
+    } catch (e) {
+      console.warn('Challenge start/pause backend call failed:', e);
+    }
   };
 
   const handleDeleteChallenge = async (id: string) => {
@@ -565,6 +674,18 @@ export default function App() {
     setActiveChallenge(null);
   };
 
+  // Newest RUNNING challenge first (avoids the dashboard locking onto the oldest zombie run);
+  // when nothing is RUNNING, fall back to the most recently started challenge.
+  const startTime = (c: Challenge) => {
+    const s = c.started_at || c.created_at;
+    return s ? parseUtcMs(s) ?? 0 : 0;
+  };
+  const currentActiveChallenge: Challenge | undefined =
+    [...challenges]
+      .filter((c) => c.status === 'RUNNING')
+      .sort((a, b) => startTime(b) - startTime(a))[0] ||
+    [...challenges].sort((a, b) => startTime(b) - startTime(a))[0];
+
   const currentTarget: Target = (activeChallenge ? targets.find((t) => t.challengeId === activeChallenge.id) : undefined) || targets[0] || {
     id: activeChallenge?.id || 'target-main',
     currentIp: activeChallenge?.target || '127.0.0.1',
@@ -637,6 +758,7 @@ export default function App() {
             <ChallengeWorkspace
               challenge={challenges.find((c) => c.id === activeChallenge.id) || activeChallenge}
               target={currentTarget}
+              agents={agents.filter((a) => !a.challengeId || a.challengeId === activeChallenge.id)}
               evidenceList={evidenceList.filter((e) => !e.challengeId || e.challengeId === activeChallenge.id)}
               decisions={decisions.filter((d) => !d.challengeId || d.challengeId === activeChallenge.id)}
               logs={terminalLogs.filter((l) => !l.challengeId || l.challengeId === activeChallenge.id)}
@@ -650,10 +772,11 @@ export default function App() {
             <>
               {activeTab === 'command' && (
                 <CommandCenter
-                  activeChallenge={challenges.find((c) => c.status === 'RUNNING') || challenges[0]}
-                  target={targets[0]}
+                  activeChallenge={currentActiveChallenge}
+                  target={targets.find((t) => t.challengeId === currentActiveChallenge?.id) || targets[0]}
                   agents={agents}
                   providers={providers}
+                  logs={terminalLogs}
                   onOpenWorkspace={handleOpenChallengeWorkspace}
                   onTriggerKillSwitch={handleTriggerKillSwitch}
                   killSwitchActive={killSwitchActive}

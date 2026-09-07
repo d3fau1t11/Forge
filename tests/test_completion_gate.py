@@ -9,7 +9,10 @@ import unittest
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
 from backend.database.session import SessionLocal
-from backend.database.models import ChallengeModel, RunModel
+from backend.database.models import (
+    ChallengeModel, RunModel, TargetProfileModel, AgentStateModel,
+    CheckpointModel, ToolExecutionModel, FindingModel, EvidenceModel
+)
 
 
 class TestDualGatedCompletion(unittest.TestCase):
@@ -19,11 +22,22 @@ class TestDualGatedCompletion(unittest.TestCase):
         self.db = SessionLocal()
 
     def tearDown(self):
-        # Clean up test data
-        self.db.query(RunModel).delete()
-        self.db.query(ChallengeModel).delete()
-        self.db.commit()
-        self.db.close()
+        # FK-safe cleanup: SQLite runs with PRAGMA foreign_keys=ON, and a bulk
+        # query().delete() does NOT honor ORM cascades — so children must be
+        # deleted before their parents. Earlier suites (e.g. the competition
+        # harness) leave checkpoint / tool-execution rows referencing runs, which
+        # made the old runs-then-challenges delete raise a FK IntegrityError and
+        # error every test in this class.
+        try:
+            for model in (
+                CheckpointModel, ToolExecutionModel, AgentStateModel,
+                EvidenceModel, FindingModel, TargetProfileModel,
+                RunModel, ChallengeModel,
+            ):
+                self.db.query(model).delete()
+            self.db.commit()
+        finally:
+            self.db.close()
 
     def test_flag_regex_captures_picoctf(self):
         """Flag regex should match picoCTF{...} format."""

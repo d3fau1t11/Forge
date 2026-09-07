@@ -11,7 +11,7 @@ from backend.tools.registry import tool_registry
 from backend.tools.manager import tool_manager
 from backend.agents.manager import agent_manager
 from backend.database.session import init_db, SessionLocal
-from backend.database.models import ChallengeModel
+from backend.database.models import ChallengeModel, RunModel
 from backend.checkpoints.manager import checkpoint_manager
 from backend.reporting.generator import report_generator
 
@@ -41,10 +41,18 @@ class TestForgeFullStack(unittest.TestCase):
             ch = ChallengeModel(name="Test Challenge", category="web")
             db.add(ch)
             db.commit()
-            
+
+            # Create the parent run the checkpoint references. checkpoints.run_id
+            # is a FK to runs.id and SQLite enforces it (PRAGMA foreign_keys=ON),
+            # so the run must exist first — the test must not rely on a stale row
+            # left in the shared test_forge.db by an earlier run.
+            run = RunModel(challenge_id=ch.id, status="RUNNING", current_phase="recon")
+            db.add(run)
+            db.commit()
+
             cp = checkpoint_manager.create_checkpoint(
                 db=db,
-                run_id="run-123",
+                run_id=run.id,
                 current_phase="recon",
                 current_agent="orchestrator",
                 last_action="nmap_scan",

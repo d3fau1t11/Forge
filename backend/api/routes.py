@@ -397,10 +397,16 @@ async def pause_challenge(challenge_id: str, db: Session = Depends(get_db)):
     challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
+
+    # Gracefully suspend any live swarm for this challenge and persist a resume
+    # snapshot. run_swarm finalizes the run as PAUSED; a later /start resumes it.
+    from backend.agents.swarm_orchestrator import swarm_orchestrator
+    paused_live = await swarm_orchestrator.request_pause(challenge_id)
+
     challenge.status = "PAUSED"
     db.commit()
-    await ws_manager.broadcast({"event": "CHALLENGE_PAUSED", "challenge_id": challenge_id})
-    return {"status": "PAUSED", "id": challenge_id}
+    await ws_manager.broadcast({"event": "CHALLENGE_PAUSED", "challenge_id": challenge_id, "paused_live_swarm": paused_live})
+    return {"status": "PAUSED", "id": challenge_id, "paused_live_swarm": paused_live}
 
 @router.post("/challenges/{challenge_id}/resume")
 async def resume_challenge(challenge_id: str, db: Session = Depends(get_db)):
@@ -507,6 +513,18 @@ async def start_run(challenge_id: str, db: Session = Depends(get_db)):
     target = db.query(TargetProfileModel).filter(TargetProfileModel.challenge_id == challenge_id).first()
     target_addr = target.current_address if target else "127.0.0.1"
 
+    # Decide fresh vs resume: if the challenge already has progress — a persisted
+    # blackboard snapshot, a non-zero progress bar, or prior tool executions — the
+    # swarm resumes aware of that work; otherwise it starts fresh.
+    mission_plan = challenge.mission_plan or {}
+    has_prior_exec = (
+        db.query(ToolExecutionModel.id)
+        .join(RunModel, ToolExecutionModel.run_id == RunModel.id)
+        .filter(RunModel.challenge_id == challenge_id)
+        .first() is not None
+    )
+    resume = bool(mission_plan.get("blackboard_state")) or (challenge.progress or 0) > 0 or has_prior_exec
+
     run = RunModel(
         challenge_id=challenge_id,
         status="RUNNING",
@@ -518,13 +536,14 @@ async def start_run(challenge_id: str, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(run)
 
-    workflow_runner.start_run(run.id, challenge_id, target_addr)
+    workflow_runner.start_run(run.id, challenge_id, target_addr, resume=resume)
 
     await ws_manager.broadcast({
         "event": "RUN_STARTED",
         "run_id": run.id,
         "challenge_id": challenge_id,
-        "target": target_addr
+        "target": target_addr,
+        "resume": resume
     })
 
     if challenge.mission_plan:
@@ -563,8 +582,44 @@ def list_tools():
     return [t.dict() for t in tool_registry.tools.values()]
 
 @router.get("/tools/executions")
-def list_tool_executions(db: Session = Depends(get_db)):
-    return db.query(ToolExecutionModel).order_by(ToolExecutionModel.created_at.desc()).all()
+def list_tool_executions(challenge_id: Optional[str] = None, limit: int = 200, db: Session = Depends(get_db)):
+    """Tool execution history, optionally filtered by challenge.
+
+    The swarm now persists every executed command here, so the terminal views can
+    be reload-safe instead of live-event-only.
+    """
+    # Single JOIN query (no per-row lazy loads) so reads stay fast while the swarm writes.
+    query = (db.query(ToolExecutionModel, RunModel.challenge_id)
+             .join(RunModel, ToolExecutionModel.run_id == RunModel.id))
+    if challenge_id:
+        query = query.filter(RunModel.challenge_id == challenge_id)
+    rows = query.order_by(ToolExecutionModel.created_at.desc()).limit(min(max(limit, 1), 500)).all()
+    return [{
+        "id": r.id,
+        "run_id": r.run_id,
+        "challenge_id": challenge_id_col,
+        "agent": r.agent,
+        "tool_name": r.tool_name,
+        "capability": r.capability,
+        "command": r.command,
+        "privilege_level": r.privilege_level,
+        "approved": r.approved,
+        "status": r.status,
+        "stdout": r.stdout,
+        "stderr": r.stderr,
+        "exit_code": r.exit_code,
+        "duration_ms": r.duration_ms,
+        "created_at": r.created_at.isoformat() if r.created_at else None
+    } for r, challenge_id_col in rows]
+
+@router.get("/agents")
+def get_agents():
+    """Live swarm worker fleet state. Empty when no swarms are active."""
+    from backend.agents.swarm_orchestrator import swarm_orchestrator
+    agents = []
+    for _run_id, board in swarm_orchestrator.active_swarms.items():
+        agents.extend(board._build_agent_states())
+    return agents
 
 @router.post("/tools/execute")
 async def execute_tool(req: ExecuteToolRequest):

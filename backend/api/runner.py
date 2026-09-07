@@ -28,7 +28,8 @@ class WorkflowRunner:
         challenge_id: str,
         target: str,
         engine_type: Optional[str] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        resume: bool = False
     ):
         self.active_runs[run_id] = {
             "run_id": run_id,
@@ -78,7 +79,8 @@ class WorkflowRunner:
                         target_scope=target,
                         working_directory=workdir,
                         category=category,
-                        difficulty=difficulty
+                        difficulty=difficulty,
+                        resume=resume
                     )
                 )
             else:

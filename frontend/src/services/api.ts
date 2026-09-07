@@ -175,6 +175,12 @@ export class ApiService {
     return await res.json();
   }
 
+  public async pauseChallenge(challengeId: string) {
+    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/pause`, { method: 'POST' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
   public async activateKillSwitch(runId?: string) {
     const res = await fetch(`${API_BASE_URL}/killswitch`, {
       method: 'POST',
@@ -199,9 +205,21 @@ export class ApiService {
     }
   }
 
-  public async getToolExecutions() {
+  public async getToolExecutions(challengeId?: string, limit: number = 200) {
     try {
-      const res = await fetch(`${API_BASE_URL}/tools/executions`);
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (challengeId) params.set('challenge_id', challengeId);
+      const res = await fetch(`${API_BASE_URL}/tools/executions?${params.toString()}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return [];
+    }
+  }
+
+  public async getAgents() {
+    try {
+      const res = await fetch(`${API_BASE_URL}/agents`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
