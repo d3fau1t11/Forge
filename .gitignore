@@ -28,6 +28,10 @@ ENV/
 *.sqlite
 *.sqlite3
 forge.db
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
 evidence/
 reports/*
 !reports/.gitkeep
@@ -40,6 +44,7 @@ CLAUDE.md
 backend/knowledge/playbooks/
 !backend/knowledge/playbooks/.gitkeep
 hacktricks/
+.freebuff/
 
 # Environment variables
 .env

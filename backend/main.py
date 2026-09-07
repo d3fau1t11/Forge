@@ -38,10 +38,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _mark_stale_runs_interrupted():
+    """On boot, mark runs/challenges left RUNNING by a previous session as INTERRUPTED.
+
+    Swarms are in-memory only, so any RUNNING row at startup is a zombie from a
+    crashed/stopped server. Without this sweep the Command Center keeps showing
+    dead challenges as live operations (fake uptime, "RUNNING" forever).
+    """
+    from backend.database.session import SessionLocal
+    from backend.database.models import RunModel, ChallengeModel
+    db = SessionLocal()
+    try:
+        runs = db.query(RunModel).filter(RunModel.status == "RUNNING").all()
+        challenges = db.query(ChallengeModel).filter(ChallengeModel.status == "RUNNING").all()
+        for r in runs:
+            r.status = "INTERRUPTED"
+        for c in challenges:
+            c.status = "INTERRUPTED"
+        if runs or challenges:
+            db.commit()
+            logger.info(f"[StartupRecovery] Marked {len(runs)} stale run(s) and {len(challenges)} challenge(s) as INTERRUPTED.")
+    except Exception as e:
+        logger.warning(f"[StartupRecovery] Stale-run sweep failed: {e}")
+    finally:
+        db.close()
+
 @app.on_event("startup")
 def on_startup():
     logger.info("Initializing database tables...")
     init_db()
+    _mark_stale_runs_interrupted()
     logger.info(f"{settings.PROJECT_NAME} initialized and ready.")
 
 app.include_router(api_router, prefix="/api")

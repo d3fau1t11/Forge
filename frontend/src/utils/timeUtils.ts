@@ -14,7 +14,11 @@ export const parseUtcMs = (dateStr?: string | null): number | null => {
   if (s.includes(' ') && !s.includes('T')) {
     s = s.replace(' ', 'T');
   }
-  if (!s.endsWith('Z') && !s.includes('+') && !s.includes('-0') && !s.includes('-1')) {
+  // Append 'Z' only when the string carries no explicit timezone designator
+  // (e.g. "2026-09-07T04:44:46.733788" -> UTC). A naive substring check breaks
+  // on dates like "2026-09-07" which contain "-0"/"-1" in the calendar part.
+  const hasTimezone = /(?:Z|[+-]\d{2}:\d{2}|[+-]\d{4})$/i.test(s);
+  if (!hasTimezone) {
     s += 'Z';
   }
 

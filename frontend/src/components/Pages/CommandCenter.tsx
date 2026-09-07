@@ -13,15 +13,17 @@ import {
   Radio,
   Sparkles
 } from 'lucide-react';
-import { Challenge, Target, AgentInfo, ProviderInfo } from '../../types';
+import { Challenge, Target, AgentInfo, ProviderInfo, TerminalLog } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
 import { computeElapsedSeconds, formatDuration } from '../../utils/timeUtils';
+import { apiService } from '../../services/api';
 
 interface CommandCenterProps {
   activeChallenge?: Challenge | null;
   target?: Target | null;
   agents: AgentInfo[];
   providers: ProviderInfo[];
+  logs?: TerminalLog[];
   onOpenWorkspace: (challenge: Challenge) => void;
   onTriggerKillSwitch: () => void;
   killSwitchActive: boolean;
@@ -32,6 +34,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   target,
   agents,
   providers,
+  logs = [],
   onOpenWorkspace,
   onTriggerKillSwitch,
   killSwitchActive
@@ -79,18 +82,30 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
     killSwitchActive
   ]);
 
-  const liveEvents = activeChallenge ? [
-    { time: '00:00:01', source: 'ORCHESTRATOR', text: `Target profile initialized (${target?.currentIp || '127.0.0.1'})`, color: 'text-cyber-cyan' },
-    { time: '00:00:03', source: 'RECON', text: 'Capability requested: network_scan', color: 'text-cyber-emerald' },
-    { time: '00:00:05', source: 'TOOL MANAGER', text: 'Standby for tool invocation', color: 'text-cyber-amber' },
-  ] : [
-    { time: '00:00:00', source: 'SYSTEM', text: 'FORGE Engine online. Standing by for new challenge registration...', color: 'text-cyber-cyan font-bold' }
-  ];
+  // Real terminal feed: persisted tool executions + live WS events (never canned placeholder lines).
+  const liveEvents = logs && logs.length > 0
+    ? logs.slice(0, 10).map((l) => ({
+        time: l.timestamp || '',
+        source: (l.agent || 'TOOL').toUpperCase(),
+        text: `$ ${l.command}${l.output ? ' — ' + l.output.replace(/\s+/g, ' ').slice(0, 100) : ''}`,
+        color: l.exitCode === 0 ? 'text-cyber-emerald' : 'text-cyber-amber'
+      }))
+    : [
+        { time: '00:00:00', source: 'SYSTEM', text: 'FORGE Engine online. Standing by for new challenge registration...', color: 'text-cyber-cyan font-bold' }
+      ];
 
-  const handleQuickAction = (actionName: string) => {
+  const activeAgent = agents.find((ag) => ag.status === 'RUNNING' || ag.status === 'ANALYZING');
+  const activeBrain = activeAgent?.selectedModel || 'FORGE Model Router';
+
+  const handleQuickAction = async (actionName: string, command: string) => {
     soundEngine.playClick();
-    setQuickNotice(`[COMMAND SENT] ${actionName} triggered on target ${target?.currentIp || 'SYSTEM'}`);
+    setQuickNotice(`[COMMAND SENT] ${actionName} on target ${target?.currentIp || 'SYSTEM'}`);
     setTimeout(() => setQuickNotice(null), 3500);
+    try {
+      await apiService.executeTerminalCommand(command, activeChallenge?.id);
+    } catch (e) {
+      console.warn('Quick action execution failed:', e);
+    }
   };
 
   return (
@@ -126,8 +141,8 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
 
               <div className="flex items-center space-x-3 text-xs">
                 <span className={`w-3 h-3 rounded-full ${killSwitchActive ? 'bg-cyber-rose' : 'bg-cyber-emerald animate-ping'}`}></span>
-                <span className={`font-bold tracking-wider ${killSwitchActive ? 'text-cyber-rose' : 'text-cyber-emerald'}`}>
-                  {killSwitchActive ? '● ENGINE LOCKDOWN (HALTED BY OPERATOR)' : '● AUTONOMOUS REASONING LOOP RUNNING'}
+                <span className={`font-bold tracking-wider ${killSwitchActive ? 'text-cyber-rose' : activeChallenge.status === 'RUNNING' ? 'text-cyber-emerald' : 'text-cyber-amber'}`}>
+                  {killSwitchActive ? '● ENGINE LOCKDOWN (HALTED BY OPERATOR)' : activeChallenge.status === 'RUNNING' ? '● AUTONOMOUS REASONING LOOP RUNNING' : `● ENGINE ${activeChallenge.status}`}
                 </span>
               </div>
             </div>
@@ -168,7 +183,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
             <div className="bg-obsidian-900/80 border border-slate-800 rounded-lg p-3.5 hover:border-cyber-emerald/40 transition-colors">
               <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider block mb-1">Active AI Brain</span>
               <span className="text-cyber-emerald font-semibold text-xs block">
-                Gemini 1.5 Pro + DeepSeek R1
+                {activeBrain}
               </span>
             </div>
 
@@ -196,19 +211,19 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
             </div>
             <div className="flex items-center space-x-2">
               <button
-                onClick={() => handleQuickAction('DEEP NMAP SCAN')}
+                onClick={() => handleQuickAction('DEEP HTTP PROBE', `curl -s -m 10 -i ${target?.currentIp || 'http://127.0.0.1'}`)}
                 className="px-2.5 py-1 rounded bg-obsidian-900 border border-slate-700 hover:border-cyber-cyan text-slate-300 hover:text-cyber-cyan text-[11px] font-semibold transition-colors"
               >
                 🔍 DEEP SCAN
               </button>
               <button
-                onClick={() => handleQuickAction('FLAG SEARCH BURST')}
+                onClick={() => handleQuickAction('FLAG SEARCH BURST', `curl -s -m 10 -i ${target?.currentIp || 'http://127.0.0.1'}/flag; curl -s -m 10 -i ${target?.currentIp || 'http://127.0.0.1'}/robots.txt`)}
                 className="px-2.5 py-1 rounded bg-obsidian-900 border border-slate-700 hover:border-cyber-emerald text-slate-300 hover:text-cyber-emerald text-[11px] font-semibold transition-colors"
               >
                 🚀 FLAG BURST
               </button>
               <button
-                onClick={() => handleQuickAction('PAYLOAD GENERATION')}
+                onClick={() => handleQuickAction('METHOD & HEADER PROBE', `curl -s -m 10 -i -X OPTIONS ${target?.currentIp || 'http://127.0.0.1'}`)}
                 className="px-2.5 py-1 rounded bg-obsidian-900 border border-slate-700 hover:border-cyber-amber text-slate-300 hover:text-cyber-amber text-[11px] font-semibold transition-colors"
               >
                 ⚡ SYNTH PAYLOAD
@@ -281,12 +296,12 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                     <span className="text-slate-500 font-bold">TASK:</span> {ag.currentObjective}
                   </p>
                   
-                  {/* Load / Activity Meter */}
+                  {/* Load / Activity Meter — driven by real actions completed, not fake percentages */}
                   <div className="space-y-1">
                     <div className="flex justify-between text-[10px] text-slate-400">
                       <span>WORKLOAD METER</span>
                       <span className="text-cyber-cyan font-bold">
-                        {ag.status === 'RUNNING' ? '84%' : ag.status === 'ANALYZING' ? '62%' : '0%'}
+                        {ag.status === 'RUNNING' ? Math.min(96, 20 + ag.actionsCompleted * 8) + '%' : ag.status === 'ANALYZING' ? Math.min(90, 15 + ag.actionsCompleted * 6) + '%' : '0%'}
                       </span>
                     </div>
                     <div className="w-full h-1.5 bg-obsidian-950 rounded-full overflow-hidden border border-slate-800">
@@ -296,7 +311,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                           ag.status === 'ANALYZING' ? 'bg-cyber-cyan' :
                           'bg-slate-700'
                         }`} 
-                        style={{ width: ag.status === 'RUNNING' ? '84%' : ag.status === 'ANALYZING' ? '62%' : '0%' }}
+                        style={{ width: ag.status === 'RUNNING' ? `${Math.min(96, 20 + ag.actionsCompleted * 8)}%` : ag.status === 'ANALYZING' ? `${Math.min(90, 15 + ag.actionsCompleted * 6)}%` : '0%' }}
                       ></div>
                     </div>
                   </div>
