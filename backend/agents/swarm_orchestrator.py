@@ -9,6 +9,8 @@ Features:
 """
 
 import asyncio
+import base64
+import codecs
 import json
 import re
 import os
@@ -45,6 +47,114 @@ FALSE_FLAG_PATTERNS = re.compile(
     r"(?:picoCTF\{\.\.\.\}|FLAG\{\.\.\.\}|HTB\{\.\.\.\}|CTF\{\.\.\.\}|"
     r"\{[a-z_]+_here\}|\{example[^}]*\}|\{your[^}]*\}|\{placeholder[^}]*\}|"
     r"\{some[^}]*\}|\{flag[^}]*format[^}]*\}|\{insert[^}]*\})",
+    re.IGNORECASE
+)
+
+# HTTP header names are token characters per RFC 7230 (no spaces, no exotic
+# punctuation). Values must be printable single-line ASCII. Anything else is
+# LLM prose, not a real header, so we refuse to record or inject it.
+_VALID_HEADER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+
+# Substrings that betray an LLM placeholder rather than a concrete header value.
+# These are the exact shapes that caused the X-Forwarded-For injection loop:
+# "127.0.0.1; [malicious payload]", "<the flag>", "127.0.0.1**", etc.
+_HEADER_VALUE_PLACEHOLDERS = re.compile(
+    r"(?:\[[^\]]*\]|<[^>]*>|\bmalicious\b|\bpayload\b|\bexample\b|\byour[_ ]|"
+    r"\bplaceholder\b|\binsert\b|\.\.\.|\*\*|`)",
+    re.IGNORECASE
+)
+
+
+def _is_meaningful_header(name: str, value: str) -> bool:
+    """True only for a concrete, injectable HTTP header.
+
+    Rejects the LLM 'suggestion' shapes — placeholder tokens ("[malicious
+    payload]", "<value>", "**") and prose — that previously got scraped back
+    into the task pool. It deliberately does NOT reject legitimate techniques
+    such as X-Forwarded-For: 127.0.0.1; the injection loop is prevented by
+    de-duplication (tried_header_signatures), so a real technique is tried once,
+    never dozens of times.
+    """
+    if not name or not value:
+        return False
+    name = name.strip()
+    value = value.strip()
+    if not _VALID_HEADER_NAME.match(name):
+        return False
+    # Printable single-line ASCII only.
+    if any(ord(c) < 0x20 or ord(c) > 0x7E for c in value):
+        return False
+    if len(value) > 256:
+        return False
+    if _HEADER_VALUE_PLACEHOLDERS.search(value):
+        return False
+    return True
+
+
+def _decode_artifacts(text: str) -> List[Dict[str, str]]:
+    """Deterministically decode ROT13 / base64 / hex artifacts found in text.
+
+    Returns a list of {"scheme", "input", "decoded"} for any decode that yields
+    readable ASCII differing from the input. This is what turns the challenge's
+    ROT13 hint ("NOTE: Jack - temporary bypass: use header ...") into a concrete
+    lead instead of relying on the LLM to carry the decode through.
+    """
+    results: List[Dict[str, str]] = []
+    if not text:
+        return results
+    seen: Set[str] = set()
+
+    def _readable(s: str) -> bool:
+        if len(s) < 4:
+            return False
+        printable = sum(1 for c in s if 0x20 <= ord(c) <= 0x7E)
+        return printable / max(len(s), 1) > 0.85
+
+    # ROT13 over the whole text — cheap and reversible; only keep if it changed
+    # the text into something readable (ROT13 of already-plain text is garbage).
+    try:
+        rot = codecs.decode(text, "rot_13")
+        if rot != text and _readable(rot):
+            key = ("rot13", rot[:200])
+            if key not in seen:
+                seen.add(key)
+                results.append({"scheme": "rot13", "input": text[:200], "decoded": rot[:400]})
+    except Exception:
+        pass
+
+    # base64 tokens (length divisible by 4, >= 12 chars to avoid short false hits)
+    for token in re.findall(r"[A-Za-z0-9+/]{12,}={0,2}", text):
+        if len(token) % 4 != 0:
+            continue
+        try:
+            dec = base64.b64decode(token, validate=True).decode("utf-8", "strict")
+        except Exception:
+            continue
+        if _readable(dec) and dec != token:
+            key = ("base64", dec[:200])
+            if key not in seen:
+                seen.add(key)
+                results.append({"scheme": "base64", "input": token[:200], "decoded": dec[:400]})
+
+    # hex strings (even length, >= 16 nybbles)
+    for token in re.findall(r"(?:[0-9a-fA-F]{2}){8,}", text):
+        try:
+            dec = bytes.fromhex(token).decode("utf-8", "strict")
+        except Exception:
+            continue
+        if _readable(dec) and dec != token:
+            key = ("hex", dec[:200])
+            if key not in seen:
+                seen.add(key)
+                results.append({"scheme": "hex", "input": token[:200], "decoded": dec[:400]})
+
+    return results
+
+
+# Recognizes an instruction like: use header "X-Dev-Access: yes" — the decoded
+# form of this challenge's hint. Pulls the concrete header out of decoded prose.
+_HEADER_HINT_RE = re.compile(
+    r"header[\"'\s:]*[\"']?([A-Za-z0-9][A-Za-z0-9-]{0,63})\s*:\s*([^\"'\n\r]{1,120})",
     re.IGNORECASE
 )
 
@@ -109,6 +219,9 @@ class SwarmBlackboard:
         self.last_persist_ts = 0.0
         self.persist_interval = 3.0
         self.started_ts = time.time()
+        # Signatures ("name: value") of header injections already queued, so the
+        # same lead is never re-added to the task pool (kills the injection loop).
+        self.tried_header_signatures: Set[str] = set()
         self._lock = asyncio.Lock()
 
     async def add_task(self, category: str, description: str, priority: int = 1, metadata: Optional[Dict] = None) -> SwarmTask:
@@ -211,6 +324,40 @@ class SwarmBlackboard:
         # Only auto-promote to captured if the source is actual tool/command output (not LLM prose)
         if source == "tool_output":
             await self.record_flag(candidate, worker_id)
+
+    async def note_exploit_header(self, name: str, value: str, worker_id: str) -> bool:
+        """Validate a candidate exploit header and, if genuinely new and concrete,
+        record it and queue a single injection task.
+
+        Returns True only if an injection task was queued. Rejects LLM-placeholder
+        shapes and de-dups by "name: value" signature, so a header can never spawn
+        the same injection task twice (the root cause of the observed loop).
+        """
+        name = (name or "").strip()
+        value = (value or "").strip().strip('"\'')
+        # Cut trailing prose the model appends after a concrete value, e.g.
+        # "127.0.0.1 (for bypassing IP restrictions)" -> "127.0.0.1".
+        value = re.split(r"\s\(|\s--\s|\s//\s|\s#\s|\s{2,}", value, maxsplit=1)[0].strip().strip('"\'')
+        if not _is_meaningful_header(name, value):
+            _append_to_challenge_log(self.challenge_id, worker_id, f"⚠ Ignored non-actionable header suggestion: {name}: {value}")
+            return False
+
+        signature = f"{name.lower()}: {value}"
+        async with self._lock:
+            if signature in self.tried_header_signatures:
+                return False
+            self.tried_header_signatures.add(signature)
+            self.extracted_headers[name] = value
+
+        _append_to_challenge_log(self.challenge_id, worker_id, f"🔑 Actionable header queued: {name}: {value}")
+        logger.info(f"[SwarmBlackboard] Actionable header queued by {worker_id}: {name}: {value}")
+        await self.add_task(
+            "EXPLOIT",
+            f"Inject header '{name}: {value}' into the homepage, login, and API endpoints on {self.target_scope}",
+            priority=6,
+            metadata={"header_name": name, "header_value": value},
+        )
+        return True
 
     def _build_mission_plan(self) -> Dict[str, Any]:
         """Build the current mission plan from the task pool (shared by broadcast + DB persist)."""
@@ -709,7 +856,8 @@ class SwarmOrchestrator:
                     f"Headers: {board.extracted_headers}\n"
                     f"Current Task: {task.description}\n"
                     f"Issue a single bash command (e.g. curl, ffuf, httpx) to uncover hidden routes, parameters, or robots.txt.\n"
-                    f"IMPORTANT: Output ONLY the command inside a ```bash code block. Do NOT include example flags or flag format references."
+                    f"For directory brute force, only reference wordlists you are sure exist; otherwise prefer curl-based checks or an inline heredoc wordlist so the command cannot fail on a missing file.\n"
+                    f"IMPORTANT: Output ONLY the command inside a ```bash code block. It MUST be directly executable — no placeholder tokens like [payload], <value>, or parenthetical notes. Do NOT include example flags or flag format references."
                 )
 
                 resp = await model_router.route_request(prompt=prompt, capability="recon", target_model="qwen-3.8-27b")
@@ -782,6 +930,10 @@ class SwarmOrchestrator:
                             c_clean = c.strip()
                             if len(c_clean) > 3:
                                 await board.add_task("CODE_AUDIT", f"Analyze suspicious HTML comment: '{c_clean[:120]}'", priority=4)
+                                # Deterministically decode the comment right away —
+                                # a ROT13/base64/hex hint becomes an actionable lead
+                                # without waiting on (or trusting) LLM formatting.
+                                await self._apply_decoded_directives(c_clean, board, worker_id)
 
                     await board.complete_task(task.task_id, result="Recon executed", discoveries={"endpoints": re.findall(r'href=["\'](/[^"\']+)["\']', output)})
                     consecutive_errors = 0  # Reset on success
@@ -823,14 +975,21 @@ class SwarmOrchestrator:
                 _append_to_challenge_log(board.challenge_id, worker_id, f"Claimed task: {task.description[:100]}")
                 await board.update_worker_state(worker_id, status="ANALYZING", current_task=task.description[:140])
 
+                # Deterministic decode FIRST: if the task carries a captured artifact
+                # (e.g. an HTML comment), decode ROT13/base64/hex and act on any
+                # concrete header/flag now — independent of how the LLM formats output.
+                await self._apply_decoded_directives(task.description, board, worker_id)
+
                 prompt = (
                     f"You are the Code & Cryptanalysis Specialist in a CTF Swarm.\n"
                     f"Task: {task.description}\n"
                     f"Target Headers: {board.extracted_headers}\n"
-                    f"Analyze any obfuscated strings, ROT13, Base64, JWT tokens, or JS scripts.\n"
-                    f"If you find an exploit header or bypass parameter, output it clearly as: HEADER: <Key>: <Value> or SECRET: <DecodedValue>.\n"
+                    f"Analyze any obfuscated strings, ROT13, Base64, JWT tokens, or JS scripts. Fully decode them.\n"
+                    f"If you decode or observe a concrete exploit header, output exactly one line: HEADER: <Key>: <Value>\n"
+                    f"The <Value> MUST be the literal, concrete value only — never a placeholder like [payload], <value>, "
+                    f"an IP you are guessing, or an explanatory note in parentheses. If you have no concrete header, omit the HEADER line.\n"
                     f"If you decode a real flag value, output it as: DECODED_FLAG: <the_actual_flag>\n"
-                    f"IMPORTANT: Do NOT output example or placeholder flags. Only output real decoded values."
+                    f"IMPORTANT: Do NOT output example, guessed, or placeholder values. Only output values you actually decoded or observed."
                 )
 
                 resp = await model_router.route_request(prompt=prompt, capability="code_analysis", target_model="codestral-latest")
@@ -872,14 +1031,13 @@ class SwarmOrchestrator:
                     if FLAG_REGEX.search(candidate):
                         await board.record_flag_candidate(candidate, worker_id, "llm_decoded")
 
-                # Check if model identified a header or bypass
+                # A model-suggested header is a *candidate*, not a discovery. Route it
+                # through note_exploit_header, which sanitizes the value, rejects
+                # placeholder prose (e.g. "127.0.0.1; [malicious payload]"), and de-dups
+                # by signature — so a suggestion can never spawn an injection loop.
                 header_match = re.search(r"HEADER:\s*([A-Za-z0-9_-]+)\s*:\s*([^\n\r]+)", analysis, re.IGNORECASE)
                 if header_match:
-                    h_name, h_val = header_match.group(1).strip(), header_match.group(2).strip()
-                    board.extracted_headers[h_name] = h_val
-                    logger.info(f"[Swarm Worker] 🔑 Extracted Header: {h_name}: {h_val}")
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"🔑 Header found: {h_name}: {h_val}")
-                    await board.add_task("EXPLOIT", f"Inject header '{h_name}: {h_val}' into login and API endpoints on {board.target_scope}", priority=5)
+                    await board.note_exploit_header(header_match.group(1), header_match.group(2), worker_id)
 
                 await board.update_worker_state(worker_id, status="RUNNING",
                                                 last_result=(analysis[:200] or "Analysis complete"),
@@ -928,7 +1086,7 @@ class SwarmOrchestrator:
                     f"Task: {task.description}\n"
                     f"Available Headers to inject: {board.extracted_headers}\n"
                     f"Construct a single curl command or Python solver payload to submit credentials, bypass authentication, and extract the CTF flag.\n"
-                    f"IMPORTANT: Output ONLY the command inside a ```bash code block. Do NOT include example flags or flag format references."
+                    f"IMPORTANT: Output ONLY the command inside a ```bash code block. It MUST be directly executable — no placeholder tokens like [payload], <value>, or parenthetical notes. Do NOT include example flags or flag format references."
                 )
 
                 resp = await model_router.route_request(prompt=prompt, capability="web_testing", target_model="xkiro-qwen-coder")
@@ -944,6 +1102,14 @@ class SwarmOrchestrator:
                     continue
 
                 cmd = self._extract_command(resp.content) or f"curl -s -i {headers_str} {board.target_scope}"
+
+                # If this task carries a concrete decoded/known header, guarantee it
+                # actually rides on the request — even if the model's command omitted
+                # it. This is what forces the winning "X-Dev-Access: yes" onto the wire.
+                h_name = task.metadata.get("header_name")
+                h_val = task.metadata.get("header_value")
+                if h_name and h_val and cmd.strip().startswith("curl") and h_name.lower() not in cmd.lower():
+                    cmd = cmd.replace("curl", f"curl -H '{h_name}: {h_val}'", 1)
 
                 # Broadcast AI Decision to UI
                 try:
@@ -1064,6 +1230,38 @@ class SwarmOrchestrator:
                 return
             # This is from tool output — high confidence, auto-promote to captured
             asyncio.create_task(board.record_flag_candidate(candidate, worker_id, "tool_output"))
+
+    async def _apply_decoded_directives(self, raw: str, board: SwarmBlackboard, worker_id: str) -> bool:
+        """Deterministically decode an artifact (HTML comment, task text) and act
+        on any concrete lead WITHOUT depending on the LLM to format its output.
+
+        - A header directive (e.g. the decoded 'use header "X-Dev-Access: yes"')
+          is queued as a prioritized injection task via note_exploit_header.
+        - A real flag hidden by an encoding is recorded as a candidate.
+
+        This is the deterministic path that turns the ROT13 comment into the
+        winning move, instead of hoping the model carries the decode through.
+        Returns True if any actionable lead was found.
+        """
+        acted = False
+        try:
+            for d in _decode_artifacts(raw):
+                decoded = d["decoded"]
+                _append_to_challenge_log(board.challenge_id, worker_id, f"🔓 {d['scheme']} decode: {decoded[:160]}")
+                # Flags hidden via an encoding inside a real captured artifact.
+                for fm in FLAG_REGEX.finditer(decoded):
+                    cand = fm.group(0).strip()
+                    if not FALSE_FLAG_PATTERNS.search(cand):
+                        await board.record_flag_candidate(cand, worker_id, "decoded_artifact")
+                        acted = True
+                # Header directives only when the decode explicitly names one.
+                if re.search(r"\bheader\b", decoded, re.IGNORECASE):
+                    for hm in _HEADER_HINT_RE.finditer(decoded):
+                        if await board.note_exploit_header(hm.group(1), hm.group(2), worker_id):
+                            acted = True
+        except Exception as e:
+            logger.debug(f"[{worker_id}] decode-directives skip: {e}")
+        return acted
 
 # Global Singleton
 swarm_orchestrator = SwarmOrchestrator()
