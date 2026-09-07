@@ -180,7 +180,7 @@ class PlaybookVault:
         if not clean_terms:
             return []
         
-        fts_query = " OR ".join(clean_terms)
+        fts_query = " OR ".join(f'"{t}"' for t in clean_terms)
         searchable_clause = "" if include_unpromoted else "AND is_searchable = 1"
         category_clause = "AND category = ?" if category else ""
 

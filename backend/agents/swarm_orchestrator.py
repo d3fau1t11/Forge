@@ -314,8 +314,11 @@ class SwarmOrchestrator:
                 self._exploit_worker("worker_exploit_pwn", board, working_directory)
             ]
 
-            # Run workers concurrently until flag capture or cancellation
-            worker_task = asyncio.create_task(asyncio.gather(*workers, return_exceptions=True))
+            # Run workers concurrently until flag capture or cancellation.
+            # asyncio.gather() already returns an awaitable _GatheringFuture; use
+            # ensure_future (NOT create_task, which rejects a Future) so it can be
+            # passed to asyncio.wait() below alongside flag_task.
+            worker_task = asyncio.ensure_future(asyncio.gather(*workers, return_exceptions=True))
             flag_task = asyncio.create_task(board.flag_event.wait())
 
             _append_to_challenge_log(challenge_id, "orchestrator", "All 3 swarm workers dispatched")

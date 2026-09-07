@@ -25,20 +25,31 @@ from backend.api.runner import workflow_runner
 from backend.websocket.manager import ws_manager
 from backend.reporting.generator import report_generator
 from backend.privilege.manager import privilege_manager
+from backend.utils.workspace import (
+    CTF_WORKSPACE_ROOT,
+    is_deletable_working_dir,
+    resolve_safe_working_dir,
+)
 
 router = APIRouter()
 logger = logging.getLogger("forge.routes")
 
 def _safe_delete_working_dir(working_dir: str):
-    """Safely delete a challenge working directory ensuring it's not a root or user home directory."""
+    """Delete a challenge working directory ONLY if it is safely inside the CTF workspace root.
+
+    Historic bug: challenges created before the ~/Documents/CTF hierarchy stored
+    working_directory="." which resolved to the project root, so rmtree wiped the
+    whole project. Path safety now lives in backend.utils.workspace and uses a
+    strict allowlist instead of a blocklist.
+    """
     if not working_dir or not isinstance(working_dir, str):
         return
     clean_path = os.path.abspath(working_dir.strip())
-    # Guard against deleting system roots or user home
-    user_home = os.path.abspath(os.path.expanduser("~"))
-    root_paths = ["/", "c:\\", "c:/", "\\", "d:\\", "d:/"]
-    if clean_path.lower() in [r.lower() for r in root_paths] or clean_path == user_home:
-        logger.warning(f"Prevented unsafe directory deletion of system/home path: {clean_path}")
+    if not is_deletable_working_dir(clean_path):
+        logger.warning(
+            f"Refused to delete working directory outside CTF workspace root: {clean_path} "
+            f"(workspace root: {CTF_WORKSPACE_ROOT})"
+        )
         return
     if os.path.exists(clean_path) and os.path.isdir(clean_path):
         try:
@@ -374,45 +385,12 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
 
     return challenge
 
-@router.delete("/challenges")
-def delete_all_challenges(db: Session = Depends(get_db)):
-    challenges = db.query(ChallengeModel).all()
-    for ch in challenges:
-        if ch.working_directory and os.path.exists(ch.working_directory):
-            try:
-                import shutil
-                shutil.rmtree(ch.working_directory, ignore_errors=True)
-            except Exception as e:
-                logger.warning(f"Failed to delete directory {ch.working_directory}: {e}")
-
-    db.query(TargetProfileModel).delete()
-    db.query(RunModel).delete()
-    db.query(EvidenceModel).delete()
-    db.query(FindingModel).delete()
-    db.query(ChallengeModel).delete()
-    db.commit()
-    return {"status": "ALL_CHALLENGES_DELETED"}
-
-@router.delete("/challenges/{challenge_id}")
-def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
-    challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
-    if not challenge:
-        raise HTTPException(status_code=404, detail="Challenge not found")
-
-    if challenge.working_directory and os.path.exists(challenge.working_directory):
-        try:
-            import shutil
-            shutil.rmtree(challenge.working_directory, ignore_errors=True)
-        except Exception as e:
-            logger.warning(f"Failed to delete working directory {challenge.working_directory}: {e}")
-
-    db.query(TargetProfileModel).filter(TargetProfileModel.challenge_id == challenge_id).delete()
-    db.query(RunModel).filter(RunModel.challenge_id == challenge_id).delete()
-    db.query(EvidenceModel).filter(EvidenceModel.challenge_id == challenge_id).delete()
-    db.query(FindingModel).filter(FindingModel.challenge_id == challenge_id).delete()
-    db.delete(challenge)
-    db.commit()
-    return {"status": "DELETED", "id": challenge_id}
+# NOTE: The guarded DELETE /challenges and DELETE /challenges/{challenge_id}
+# endpoints are defined earlier in this file (see delete_challenge /
+# delete_all_challenges near the top). Duplicate unguarded definitions that
+# called shutil.rmtree(working_directory) with no path validation used to live
+# here and were removed — they were the destructive path that could wipe the
+# project root. Do not reintroduce disk deletion without _safe_delete_working_dir.
 
 @router.post("/challenges/{challenge_id}/pause")
 async def pause_challenge(challenge_id: str, db: Session = Depends(get_db)):

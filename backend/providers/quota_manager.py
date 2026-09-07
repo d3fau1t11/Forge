@@ -52,15 +52,47 @@ BATCH_REPLENISH_UTC_HOURS = [23, 11]  # Beijing 07:00 and 19:00
 class AgentRouterQuotaManager:
     """Tracks AgentRouter quota exhaustion and provides intelligent fallback routing."""
 
+    # After this many consecutive rate-limit (429) hits, a provider is treated as
+    # persistently throttled (e.g. a free-tier model gated to limit=0) and gets a
+    # session cooldown so FORGE stops wasting a call on it every loop.
+    RATE_LIMIT_TRIP_THRESHOLD = 2
+
     def __init__(self):
         # Tracks when each model family was last observed as exhausted
         self._exhaustion_timestamps: Dict[str, float] = {}
         self._consecutive_402_counts: Dict[str, int] = {}
+        # Tracks consecutive 429 rate-limit hits per provider/model
+        self._consecutive_429_counts: Dict[str, int] = {}
         self._quota_exhausted_globally = False
         self._last_global_exhaustion_ts: float = 0.0
         # Session-Wide Circuit Breaker: Models/providers temporarily blacklisted
         # Maps identifier -> (expiry_timestamp, reason)
         self._session_blacklisted: Dict[str, Tuple[float, str]] = {}
+
+    def record_rate_limit(self, identifier: str, reason: str = "") -> bool:
+        """Record a 429 rate-limit hit for a provider/model.
+
+        Transient 429s recover on their own, so a single hit only skips the provider
+        for that request. But when the same provider returns 429 repeatedly (a free-tier
+        model gated to zero allowance never recovers), we trip a short session cooldown
+        after RATE_LIMIT_TRIP_THRESHOLD hits so FORGE routes around it fast instead of
+        re-hitting it every loop. Returns True if the provider was just blacklisted.
+        """
+        key = identifier.lower().strip()
+        self._consecutive_429_counts[key] = self._consecutive_429_counts.get(key, 0) + 1
+        count = self._consecutive_429_counts[key]
+        if count >= self.RATE_LIMIT_TRIP_THRESHOLD:
+            logger.warning(
+                f"[QuotaManager] Provider '{identifier}' hit {count} consecutive 429s — "
+                f"treating as persistently throttled and tripping session cooldown."
+            )
+            self.blacklist_for_session(identifier, reason or f"{count} consecutive 429 rate limits")
+            return True
+        logger.info(
+            f"[QuotaManager] Provider '{identifier}' rate-limited (429 #{count}/"
+            f"{self.RATE_LIMIT_TRIP_THRESHOLD}). Skipping for this request; will retry."
+        )
+        return False
 
     def blacklist_for_session(self, identifier: str, reason: str = "Quota/RateLimit Exceeded"):
         """Temporarily blacklists a provider/model with a time-limited cooldown.
@@ -142,6 +174,9 @@ class AgentRouterQuotaManager:
             del self._exhaustion_timestamps[model]
         if model in self._consecutive_402_counts:
             del self._consecutive_402_counts[model]
+        key = model.lower().strip()
+        if key in self._consecutive_429_counts:
+            del self._consecutive_429_counts[key]
 
         # Clear global flag if no more quota-limited models are exhausted
         if not any(m in QUOTA_LIMITED_MODELS for m in self._exhaustion_timestamps):

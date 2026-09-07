@@ -54,11 +54,21 @@ class WorkflowRunner:
                 from backend.database.session import SessionLocal
                 from backend.database.models import ChallengeModel
                 
+                from backend.utils.workspace import resolve_safe_working_dir
+
                 db = SessionLocal()
                 ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
-                workdir = ch.working_directory if ch else "."
                 category = ch.category if ch else "WEB"
                 difficulty = ch.difficulty if ch else "EASY"
+                # Never let a missing/"." working_directory resolve to the project
+                # root — resolve to a safe path strictly inside the CTF workspace.
+                workdir = resolve_safe_working_dir(
+                    ch.working_directory if ch else "",
+                    challenge_id,
+                    category,
+                    ch.name if ch else "",
+                )
+                os.makedirs(workdir, exist_ok=True)
                 db.close()
 
                 task = loop.create_task(

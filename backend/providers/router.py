@@ -31,16 +31,18 @@ class ModelRouter:
     """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
 
     DEFAULT_ROUTING_MAP = {
-        # Curated order: Groq (multi-key), xKiro (free CTF), Mistral (46 models), OpenRouter (GLM/DeepSeek), Gemini (18 keys), RapidAPI, Cloudflare, NVIDIA
-        "recon": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
-        "directory_enumeration": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
-        "web_analysis": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
-        "web_testing": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
-        "code_analysis": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia"],
-        "reverse_engineering": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia"],
-        "fast_reasoning": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "rapidapi_gpt54_mini", "nvidia"],
-        "general_reasoning": ["groq", "xkiro", "xkiro_planner", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia"],
-        "verification": ["groq", "xkiro", "mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia"]
+        # Curated order: Groq (multi-key), xKiro free models incl. Mistral/Ministral, OpenRouter (GLM/DeepSeek),
+        # Gemini (multi-key), RapidAPI, Cloudflare, NVIDIA. Direct Mistral API sits LAST among LLM options
+        # because its free-tier mistral-small/medium are gated to limit=0; xkiro_mistral serves them free.
+        "recon": ["groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
+        "directory_enumeration": ["groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
+        "web_analysis": ["groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
+        "web_testing": ["groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
+        "code_analysis": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "mistral"],
+        "reverse_engineering": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "mistral"],
+        "fast_reasoning": ["groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "rapidapi_gpt54_mini", "nvidia", "mistral"],
+        "general_reasoning": ["groq", "xkiro", "xkiro_planner", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
+        "verification": ["groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "mistral"]
     }
 
     # Model to Provider/Transport Mapping
@@ -84,7 +86,14 @@ class ModelRouter:
         "xkiro-deepseek-chat": ("xkiro", "deepseek/deepseek-chat-v3.1"),
         "xkiro-mistral-large": ("xkiro_planner", "mistralai/mistral-large-2512"),
         "xkiro-qwen-coder": ("xkiro_coder", "qwen/qwen3-coder-plus:free"),
-        "xkiro-minimax-m3": ("xkiro", "minimax/minimax-m3:free")
+        "xkiro-minimax-m3": ("xkiro", "minimax/minimax-m3:free"),
+        # xKiro-hosted Mistral family — free & unthrottled, unlike the direct Mistral API
+        # where mistral-small/medium are gated to limit=0 on the free tier.
+        "ministral-8b": ("xkiro_mistral", "mistralai/ministral-8b"),
+        "ministral-3b": ("xkiro_mistral", "mistralai/ministral-3b"),
+        "ministral-14b": ("xkiro_mistral", "mistralai/ministral-14b"),
+        "xkiro-mistral-small": ("xkiro_mistral", "mistralai/mistral-small-2603"),
+        "xkiro-mistral-medium": ("xkiro_mistral", "mistralai/mistral-medium-3.5")
     }
 
     def __init__(self):
@@ -182,12 +191,16 @@ class ModelRouter:
                 base_url="https://api.mistral.ai/v1",
                 speed_tier="fast"
             ))
-            # Mistral general - small/medium for reasoning & CTF tasks
+            # Mistral general - ministral-8b for reasoning & CTF tasks.
+            # NOTE: mistral-small/medium-latest are gated to limit=0 on the free tier
+            # (persistent 429). ministral-8b-latest is served on the same key, so it's
+            # the default here; the free ministral/mistral models on xKiro are preferred
+            # ahead of this provider in the routing chain anyway.
             self.register_provider("mistral", OpenAISpecProvider(
                 name="mistral",
                 is_paid=True,
                 api_key=mistral_key,
-                default_model="mistral-small-latest",
+                default_model="ministral-8b-latest",
                 base_url="https://api.mistral.ai/v1",
                 speed_tier="fast"
             ))
@@ -218,6 +231,17 @@ class ModelRouter:
                 is_paid=False,
                 api_key=xkiro_key,
                 default_model="mistralai/mistral-large-2512",
+                base_url="https://api.xkiro.com/v1",
+                speed_tier="fast"
+            ))
+            # Free Mistral/Ministral family via xKiro — replaces the direct Mistral API's
+            # free-tier models that are gated to limit=0 (mistral-small/medium). Confirmed
+            # 200 on: ministral-3b/8b/14b, mistral-small-2603, mistral-medium-3.5.
+            self.register_provider("xkiro_mistral", OpenAISpecProvider(
+                name="xkiro_mistral",
+                is_paid=False,
+                api_key=xkiro_key,
+                default_model="mistralai/ministral-8b",
                 base_url="https://api.xkiro.com/v1",
                 speed_tier="fast"
             ))
@@ -298,9 +322,20 @@ class ModelRouter:
                             quota_manager.record_successful_request(target_model)
                             return res
 
-                        # Detect AgentRouter 402 quota exhaustion from refusal reason
+                        # Separate a transient 429 rate-limit from real 402/budget quota exhaustion.
+                        # A 429 recovers on its own, so only trip a cooldown after repeated hits;
+                        # a 402 means the pool is drained → blacklist + fail over immediately.
                         refusal = res.refusal_reason or ""
-                        if quota_manager.detect_quota_error(refusal) or "402" in refusal or "budget" in refusal.lower():
+                        is_rate_limit = ("429" in refusal or "rate limit" in refusal.lower() or "rate_limited" in refusal.lower()) and "402" not in refusal
+                        is_quota = ("402" in refusal or "budget" in refusal.lower() or "insufficient_quota" in refusal.lower()
+                                    or "quota has been exhausted" in refusal.lower() or "budget pool" in refusal.lower())
+
+                        if is_rate_limit and not is_quota:
+                            # Persistent 429 (e.g. free-tier model gated to limit=0) trips a cooldown after N hits.
+                            quota_manager.record_rate_limit(provider_name, refusal)
+                            logger.warning(f"[ModelRouter] Rate limit (429) on '{target_model}' via '{provider_name}'. Falling back to capability chain...")
+                            asyncio.create_task(_notify_fallback(provider_name, refusal))
+                        elif is_quota:
                             quota_manager.record_quota_exhaustion(target_model, refusal)
                             quota_manager.blacklist_for_session(provider_name, refusal)
                             # Instant auto-fallback to OpenRouter always-available model
@@ -325,16 +360,21 @@ class ModelRouter:
                                         return fb_res
                                 except Exception as fb_err:
                                     logger.warning(f"[ModelRouter] Fallback model '{fallback_model}' also failed: {fb_err}")
-
-                        logger.warning(f"Provider '{provider_name}' failed for model '{target_model}': {res.refusal_reason}. Falling back to capability chain...")
-                        asyncio.create_task(_notify_fallback(provider_name, res.refusal_reason or "Direct model refusal"))
+                        else:
+                            # Generic refusal (not rate-limit, not quota) — just cascade to the capability chain.
+                            logger.warning(f"Provider '{provider_name}' failed for model '{target_model}': {res.refusal_reason}. Falling back to capability chain...")
+                            asyncio.create_task(_notify_fallback(provider_name, res.refusal_reason or "Direct model refusal"))
 
                     except Exception as direct_err:
                         # Direct model path crashed (network error, timeout, etc.) — fall through to capability chain
                         error_str = str(direct_err)
                         logger.warning(f"[ModelRouter] Direct model '{target_model}' via '{provider_name}' raised exception: {error_str}. Falling back to capability chain...")
-                        if "402" in error_str or quota_manager.detect_quota_error(error_str):
+                        # Blacklist only on confirmed quota/auth failure; a bare 429 is transient (count it instead).
+                        is_rl = ("429" in error_str or "rate limit" in error_str.lower() or "rate_limited" in error_str.lower()) and "402" not in error_str
+                        if "402" in error_str or "401" in error_str or (quota_manager.detect_quota_error(error_str) and not is_rl):
                             quota_manager.blacklist_for_session(provider_name, error_str)
+                        elif is_rl:
+                            quota_manager.record_rate_limit(provider_name, error_str)
                         asyncio.create_task(_notify_fallback(provider_name, error_str))
 
         # 2. Capability Candidates Fallback Chain
@@ -373,13 +413,18 @@ class ModelRouter:
                     
                     if response.is_refusal:
                         refusal = response.refusal_reason or ""
-                        # Only blacklist for confirmed quota exhaustion (402) or auth failure (401)
-                        # Do NOT blacklist for 429 rate limits — they're transient, just skip to next provider
-                        if quota_manager.detect_quota_error(refusal) or "402" in refusal:
+                        # Confirmed quota exhaustion (402) or auth failure (401) → immediate blacklist.
+                        if ("402" in refusal or "budget" in refusal.lower()) and quota_manager.detect_quota_error(refusal):
+                            quota_manager.blacklist_for_session(provider_name, refusal)
+                        elif "402" in refusal:
                             quota_manager.blacklist_for_session(provider_name, refusal)
                         elif "401" in refusal or "unauthorized" in refusal.lower():
                             quota_manager.blacklist_for_session(provider_name, refusal)
-                        # 429 and generic refusals: skip this provider for now but don't blacklist
+                        elif "429" in refusal or "rate limit" in refusal.lower() or "rate_limited" in refusal.lower():
+                            # Transient on the first hit, but a free-tier model gated to zero
+                            # never recovers — trip a cooldown after repeated 429s so we skip it fast.
+                            quota_manager.record_rate_limit(provider_name, refusal)
+                        # generic refusals: skip this provider for now but don't blacklist
                         logger.warning(f"Model refusal from {provider_name}: {response.refusal_reason}. Fallback...")
                         asyncio.create_task(_notify_fallback(provider_name, refusal or "Model Refusal / Quota Limit"))
                         continue
@@ -388,6 +433,7 @@ class ModelRouter:
                         self.current_spent_usd += response.estimated_cost_usd
 
                     quota_manager.record_successful_request(response.model_name)
+                    quota_manager.record_successful_request(provider_name)
                     return response
                 except Exception as e:
                     error_str = str(e)
@@ -396,6 +442,8 @@ class ModelRouter:
                         quota_manager.blacklist_for_session(provider_name, error_str)
                     elif "401" in error_str:
                         quota_manager.blacklist_for_session(provider_name, error_str)
+                    elif "429" in error_str or "rate limit" in error_str.lower() or "rate_limited" in error_str.lower():
+                        quota_manager.record_rate_limit(provider_name, error_str)
                     logger.error(f"Error calling provider {provider_name}: {error_str}. Fallback...")
                     asyncio.create_task(_notify_fallback(provider_name, error_str))
                     continue

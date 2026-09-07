@@ -36,6 +36,7 @@ logs/
 scratch/
 .serena/
 .agents/
+CLAUDE.md
 backend/knowledge/playbooks/
 !backend/knowledge/playbooks/.gitkeep
 hacktricks/
