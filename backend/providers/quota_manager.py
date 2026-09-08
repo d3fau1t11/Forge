@@ -68,6 +68,40 @@ class AgentRouterQuotaManager:
         # Session-Wide Circuit Breaker: Models/providers temporarily blacklisted
         # Maps identifier -> (expiry_timestamp, reason)
         self._session_blacklisted: Dict[str, Tuple[float, str]] = {}
+        # Latest passively-observed rate-limit snapshot per provider (from real response
+        # headers — see providers/rate_limits.py). Used to route away from a provider that
+        # is already near its (correctly-scoped) ceiling instead of discovering it via 429s.
+        self._ratelimit_snapshots: Dict[str, object] = {}
+
+    def record_ratelimit_snapshot(self, provider: str, snapshot) -> None:
+        """Store the latest rate-limit snapshot for a provider (no-op on None)."""
+        if provider and snapshot is not None:
+            self._ratelimit_snapshots[provider.lower().strip()] = snapshot
+
+    def get_ratelimit_snapshot(self, provider: str):
+        return self._ratelimit_snapshots.get((provider or "").lower().strip())
+
+    def get_headroom(self, provider: str) -> Optional[float]:
+        """Tightest remaining fraction (requests vs tokens) for a provider, or None if
+        never observed. 0.0 means effectively out; 1.0 means full."""
+        snap = self.get_ratelimit_snapshot(provider)
+        if snap is None:
+            return None
+        fracs = [f for f in (snap.request_headroom_fraction(), snap.token_headroom_fraction())
+                 if f is not None]
+        return min(fracs) if fracs else None
+
+    def is_near_ceiling(self, provider: str, frac: float = 0.1) -> bool:
+        """True only when we have a snapshot AND remaining headroom is at/below `frac`.
+        Absent data returns False so routing never penalizes an unobserved provider."""
+        hr = self.get_headroom(provider)
+        return hr is not None and hr <= frac
+
+    def ratelimit_summary(self) -> str:
+        """One-line, comma-joined headroom summary across observed providers (for logs)."""
+        if not self._ratelimit_snapshots:
+            return "no rate-limit headers observed yet"
+        return " | ".join(snap.summary() for snap in self._ratelimit_snapshots.values())
 
     def record_rate_limit(self, identifier: str, reason: str = "") -> bool:
         """Record a 429 rate-limit hit for a provider/model.

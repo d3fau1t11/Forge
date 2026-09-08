@@ -385,6 +385,11 @@ class ModelRouter:
             # Sort providers matching requested speed_tier first
             candidates.sort(key=lambda p_name: 0 if getattr(self.providers.get(p_name), "speed_tier", "fast") == speed_tier else 1)
 
+        # Proactively push providers already near their (correctly-scoped) rate-limit
+        # ceiling to the back — using headroom passively observed from real response headers
+        # (no probe calls). Stable sort preserves the curated order among un-throttled peers.
+        candidates.sort(key=lambda p_name: 1 if quota_manager.is_near_ceiling(p_name) else 0)
+
         for provider_name in candidates:
             # Time-limited circuit breaker check
             if quota_manager.is_blacklisted_for_session(provider_name):

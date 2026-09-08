@@ -6,6 +6,8 @@ import httpx
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
+from backend.agents.artifact_classifier import classify_http_response, save_artifact_binary
+
 logger = logging.getLogger("forge.turbo_recon")
 
 class TurboReconManager:
@@ -18,10 +20,10 @@ class TurboReconManager:
         """Retrieve pre-warmed recon results for a challenge if available."""
         return self._cache.get(challenge_id)
 
-    async def start_turbo_recon(self, challenge_id: str, target: str, category: str = "web") -> Dict[str, Any]:
+    async def start_turbo_recon(self, challenge_id: str, target: str, category: str = "web", working_directory: Optional[str] = None) -> Dict[str, Any]:
         """Launch non-blocking parallel reconnaissance burst before agent turn #1."""
         logger.info(f"[TurboRecon] Initiating pre-warmed recon burst for challenge {challenge_id} on target: {target}")
-        
+
         recon_result = {
             "challenge_id": challenge_id,
             "target": target,
@@ -32,6 +34,7 @@ class TurboReconManager:
             "interesting_files": [],
             "technologies": [],
             "binary_info": {},
+            "artifact": None,          # deterministic classifier verdict on the first fetch
             "raw_summary": ""
         }
 
@@ -41,7 +44,7 @@ class TurboReconManager:
         tasks = []
         for t in targets:
             if t.startswith("http://") or t.startswith("https://"):
-                tasks.append(self._probe_web_target(t, recon_result))
+                tasks.append(self._probe_web_target(t, recon_result, working_directory))
             elif os.path.exists(t):
                 tasks.append(self._probe_binary_target(t, recon_result))
             else:
@@ -66,15 +69,36 @@ class TurboReconManager:
         logger.info(f"[TurboRecon] Completed pre-warmed recon for {challenge_id}. Summary:\n{recon_result['raw_summary']}")
         return recon_result
 
-    async def _probe_web_target(self, url: str, result: Dict[str, Any]):
+    async def _probe_web_target(self, url: str, result: Dict[str, Any], working_directory: Optional[str] = None):
         """Parallel web probe for robots.txt, .git, headers, cookies, and tech stack."""
         base_url = url.rstrip("/")
         paths_to_check = ["/robots.txt", "/.git/HEAD", "/sitemap.xml", "/api", "/admin", "/login"]
-        
+
         async with httpx.AsyncClient(timeout=4.0, verify=False, follow_redirects=True) as client:
             # 1. Probe Base Target Headers & Content
             try:
                 r = await client.get(base_url)
+                # Deterministic binary pre-classifier on the FIRST response — flags a
+                # downloadable artifact (e.g. an S3 octet-stream) before any agent turn.
+                try:
+                    clf = classify_http_response(
+                        url=base_url,
+                        content_type=(r.headers.get("content-type") or "").lower(),
+                        server_header=(r.headers.get("server") or "").lower(),
+                        content_length=int(r.headers["content-length"]) if r.headers.get("content-length") else len(r.content or b""),
+                        response_body_prefix=(r.content or b"")[:512],
+                    )
+                    if clf.is_binary:
+                        result["artifact"] = {"is_binary": True, "type": clf.artifact_type, "reason": clf.reason}
+                        result["binary_info"]["format"] = clf.artifact_type
+                        if working_directory and r.content:
+                            saved = save_artifact_binary(
+                                r.content, working_directory,
+                                suggested_name=os.path.basename(base_url.split("?")[0]) or "artifact.bin")
+                            result["artifact"]["safe_file_path"] = saved
+                            logger.info(f"[TurboRecon] First-fetch binary artifact saved byte-exact: {saved}")
+                except Exception as clf_err:
+                    logger.debug(f"[TurboRecon] Classifier skip for {base_url}: {clf_err}")
                 for k, v in r.headers.items():
                     if k.lower() in ["server", "x-powered-by", "x-framework", "set-cookie", "content-type"]:
                         result["headers"][k] = v

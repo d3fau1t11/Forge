@@ -53,6 +53,38 @@ try:
         DAILY_BUDGET_USD: float = 5.00
         SESSION_BUDGET_USD: float = 2.00
 
+        # Agent execution budget — limits unbounded loops that exhaust shared rate limits.
+        # Override per-run via the challenge start form or the /settings endpoint.
+        # N tool-call iterations OR M wall-clock minutes, whichever fires first.
+        AGENT_MAX_ITERATIONS: int = 40      # default tool-call budget per run
+        AGENT_MAX_MINUTES: int = 30         # default wall-clock ceiling per run (minutes)
+
+        # HITL checkpoint interval in seconds (default: 5 minutes).
+        CHECKPOINT_INTERVAL_SECONDS: int = 300
+
+        # Default flag-pattern string shown in the challenge form and baked into
+        # agent prompts.  Users may override this per-challenge at start time.
+        # Pipe-separated list of regex prefixes; the agent uses this as a
+        # VALIDATION FILTER only — it must never construct strings to match.
+        DEFAULT_FLAG_PATTERNS: str = "picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}"
+
+        # Number of general-purpose agents spawned per run. Integer as a string, or
+        # "auto" -> min(cpu_cores-1, 4). Clamped to [1, 6] at dispatch.
+        AGENT_POOL_SIZE: str = "3"
+
+        # Max consecutive LOCAL execution failures (a command that never reached the
+        # target — Errno 2, SyntaxError, permission denied) before an agent aborts and
+        # reports a blocker, instead of burning its budget re-running a broken invocation.
+        LOCAL_EXEC_MAX_RETRIES: int = 2
+
+        # Floor on max_tokens for GLM-routed (reasoning) models. Too-low a ceiling
+        # starves the reasoning-token budget and returns HTTP 200 with empty content.
+        GLM_MIN_MAX_TOKENS: int = 2048
+
+        # Seconds before the platform instance-expiry deadline at which the swarm winds
+        # down (reports best findings and stops) rather than being cut off mid-command.
+        INSTANCE_WINDDOWN_BUFFER_SECONDS: int = 30
+
 except ImportError:
     class Settings:
         def __init__(self):
@@ -91,5 +123,16 @@ except ImportError:
             self.PAID_MODEL_ALLOWED = os.getenv("PAID_MODEL_ALLOWED", "true").lower() == "true"
             self.DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", 5.0))
             self.SESSION_BUDGET_USD = float(os.getenv("SESSION_BUDGET_USD", 2.0))
+            self.AGENT_MAX_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", 40))
+            self.AGENT_MAX_MINUTES = int(os.getenv("AGENT_MAX_MINUTES", 30))
+            self.CHECKPOINT_INTERVAL_SECONDS = int(os.getenv("CHECKPOINT_INTERVAL_SECONDS", 300))
+            self.DEFAULT_FLAG_PATTERNS = os.getenv(
+                "DEFAULT_FLAG_PATTERNS",
+                "picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}"
+            )
+            self.AGENT_POOL_SIZE = os.getenv("AGENT_POOL_SIZE", "3")
+            self.LOCAL_EXEC_MAX_RETRIES = int(os.getenv("LOCAL_EXEC_MAX_RETRIES", 2))
+            self.GLM_MIN_MAX_TOKENS = int(os.getenv("GLM_MIN_MAX_TOKENS", 2048))
+            self.INSTANCE_WINDDOWN_BUFFER_SECONDS = int(os.getenv("INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
 
 settings = Settings()

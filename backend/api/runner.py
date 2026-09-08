@@ -41,57 +41,60 @@ class WorkflowRunner:
         }
         self.kill_switches[run_id] = False
 
-        # Determine which execution engine to dispatch
-        # Default directly to Swarm Intelligence or ReAct loop (AgentRouter/Codex CLI completely purged)
-        selected_engine = engine_type or "swarm"
-        if selected_engine == "auto":
-            selected_engine = "swarm"
+        # Full replacement: every run dispatches the unified flexible-agent engine.
+        # The legacy ReAct loop (orchestrator_loop.run_autonomous_loop) is retired as
+        # a dispatched engine; its install/root-approval helpers remain in use by the
+        # API and the new engine.
+        selected_engine = "swarm"
 
         try:
             loop = asyncio.get_running_loop()
 
-            if selected_engine == "swarm":
-                from backend.agents.swarm_orchestrator import swarm_orchestrator
-                from backend.database.session import SessionLocal
-                from backend.database.models import ChallengeModel
-                
-                from backend.utils.workspace import resolve_safe_working_dir
+            from backend.agents.swarm_orchestrator import swarm_orchestrator
+            from backend.database.session import SessionLocal
+            from backend.database.models import ChallengeModel
+            from backend.utils.workspace import resolve_safe_working_dir
 
-                db = SessionLocal()
-                ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
-                category = ch.category if ch else "WEB"
-                difficulty = ch.difficulty if ch else "EASY"
-                # Never let a missing/"." working_directory resolve to the project
-                # root — resolve to a safe path strictly inside the CTF workspace.
-                workdir = resolve_safe_working_dir(
-                    ch.working_directory if ch else "",
-                    challenge_id,
-                    category,
-                    ch.name if ch else "",
-                )
-                os.makedirs(workdir, exist_ok=True)
-                db.close()
+            db = SessionLocal()
+            ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+            category = ch.category if ch else "WEB"
+            difficulty = ch.difficulty if ch else "EASY"
+            challenge_name = ch.name if ch else ""
+            platform = ch.platform_name if ch else ""
+            description = ch.description if ch else ""
+            # Per-run config (budget / flag pattern / uploaded artifacts / instance
+            # timer) is stashed in mission_plan.run_config at creation time.
+            run_config = (ch.mission_plan or {}).get("run_config", {}) if ch else {}
+            # Never let a missing/"." working_directory resolve to the project root —
+            # resolve to a safe path strictly inside the CTF workspace.
+            workdir = resolve_safe_working_dir(
+                ch.working_directory if ch else "",
+                challenge_id,
+                category,
+                ch.name if ch else "",
+            )
+            os.makedirs(workdir, exist_ok=True)
+            db.close()
 
-                task = loop.create_task(
-                    swarm_orchestrator.run_swarm(
-                        run_id=run_id,
-                        challenge_id=challenge_id,
-                        target_scope=target,
-                        working_directory=workdir,
-                        category=category,
-                        difficulty=difficulty,
-                        resume=resume
-                    )
+            task = loop.create_task(
+                swarm_orchestrator.run_swarm(
+                    run_id=run_id,
+                    challenge_id=challenge_id,
+                    target_scope=target,
+                    working_directory=workdir,
+                    category=category,
+                    difficulty=difficulty,
+                    resume=resume,
+                    challenge_name=challenge_name,
+                    platform=platform,
+                    description=description,
+                    flag_pattern=run_config.get("flag_pattern", ""),
+                    max_iterations=int(run_config.get("max_iterations", 0) or 0),
+                    max_minutes=int(run_config.get("max_minutes", 0) or 0),
+                    attached_file_paths=run_config.get("attached_file_paths", []),
+                    instance_expiry_ts=run_config.get("instance_expiry_ts"),
                 )
-            else:
-                from backend.agents.orchestrator_loop import orchestrator_loop
-                task = loop.create_task(
-                    orchestrator_loop.run_autonomous_loop(
-                        run_id=run_id,
-                        challenge_id=challenge_id,
-                        target=target
-                    )
-                )
+            )
 
             # Attach error callback so unhandled exceptions surface in logs
             def _on_task_done(t: asyncio.Task):

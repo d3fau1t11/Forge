@@ -101,11 +101,41 @@ export class ApiService {
     working_directory?: string;
     platform_name?: string;
     requires_root?: boolean;
+    flag_pattern?: string;
+    max_iterations?: number;
+    max_minutes?: number;
+    instance_expiry_minutes?: number;
+    attached_file_paths?: string[];
   }) {
     const res = await fetch(`${API_BASE_URL}/challenges`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async uploadArtifact(file: File): Promise<{ path: string; filename: string; size: number }> {
+    const form = new FormData();
+    form.append('file', file);
+    // No explicit Content-Type — the browser sets the multipart boundary.
+    const res = await fetch(`${API_BASE_URL}/challenges/upload`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async getCheckpoint(challengeId: string) {
+    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async respondToCheckpoint(challengeId: string, text: string) {
+    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint/respond`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();

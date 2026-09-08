@@ -128,8 +128,12 @@ class AutonomousOrchestrator:
             "discovered_endpoints": set(),
             "observed_cookies": set(),
             "headers_found": set(),
-            "repetition_warnings": 0
+            "detected_technologies": set(),
+            "repetition_warnings": 0,
+            "last_tool_output": ""
         }
+        attempted_playbook_ids: Set[str] = set()
+        active_playbook: Optional[Any] = None
 
         # ── Pre-flight Mission Planning Phase ──
         db_init: Session = SessionLocal()
@@ -221,19 +225,51 @@ class AutonomousOrchestrator:
                     "loop_warning": state_memory["repetition_warnings"] > 0
                 }, indent=2)
 
-                # Fetch matching playbooks from Playbook Vault for few-shot guidance
+                # Two-Stage Retrieval from Playbook Vault
                 playbook_context = ""
                 try:
-                    matching_pbs = playbook_vault.search_playbooks(
-                        f"{challenge.name} {challenge.category} {target}",
-                        category=challenge.category,
-                        top_k=2
-                    )
+                    if turn == 1:
+                        # Stage A (Pre-recon coarse retrieval): coarse category methodology query
+                        matching_pbs = playbook_vault.search_playbooks(
+                            query=f"{challenge.category} standard methodology",
+                            category=challenge.category,
+                            excluded_ids=attempted_playbook_ids,
+                            top_k=1
+                        )
+                    else:
+                        # Stage B (Post-recon primary retrieval): build query from real observed evidence
+                        obs_headers = " ".join(state_memory["headers_found"])
+                        obs_tech = " ".join(state_memory["detected_technologies"])
+                        obs_endpoints = " ".join(state_memory["discovered_endpoints"])
+                        recon_artifacts = f"{obs_headers}\n{obs_tech}\n{obs_endpoints}\n{state_memory['last_tool_output'][:1000]}"
+
+                        cand_tags = list(state_memory["detected_technologies"])
+                        if challenge.category:
+                            cand_tags.append(challenge.category.lower())
+
+                        evidence_query = f"{challenge.category} {obs_tech} {obs_headers}"
+                        matching_pbs = playbook_vault.search_playbooks(
+                            query=evidence_query,
+                            category=challenge.category,
+                            recon_artifacts=recon_artifacts,
+                            candidate_tags=cand_tags,
+                            excluded_ids=attempted_playbook_ids,
+                            top_k=2
+                        )
+
                     if matching_pbs:
+                        active_playbook = matching_pbs[0]
                         pb_snippets = []
                         for pb in matching_pbs:
-                            pb_snippets.append(f"### Playbook: {pb.id} ({pb.category})\nTags: {', '.join(pb.tags)}\nTemplate:\n{pb.exploit_template[:400]}")
+                            pb_snippets.append(
+                                f"### Playbook: {pb.id} ({pb.category})\n"
+                                f"Tags: {', '.join(pb.tags)}\n"
+                                f"Trigger Signatures: {', '.join(pb.trigger_signatures) if pb.trigger_signatures else 'None'}\n"
+                                f"Template:\n{pb.exploit_template[:400]}"
+                            )
                         playbook_context = "\n\n--- FEW-SHOT CTF EXPLOIT PLAYBOOKS ---\n" + "\n\n".join(pb_snippets)
+                    else:
+                        active_playbook = None
                 except Exception as pb_err:
                     logger.debug(f"Playbook vault retrieval skip: {pb_err}")
 
@@ -601,7 +637,22 @@ class AutonomousOrchestrator:
                 dir_changes = self._diff_dir_snapshots(dir_before, dir_after)
 
                 # Update Structured State Memory from Command Output
-                self._update_state_memory(state_memory, stdout_text)
+                state_memory["last_tool_output"] = stdout_text or log_output
+                self._update_state_memory(state_memory, stdout_text or log_output)
+
+                # Gate 2: Intermediate Expected Outcome Signature Verification
+                if active_playbook and active_playbook.expected_outcome_signatures:
+                    raw_combined_output = (stdout_text or "") + " " + (stderr_text or "")
+                    outcome_matched = False
+                    for outcome_sig in active_playbook.expected_outcome_signatures:
+                        if re.search(outcome_sig, raw_combined_output, re.IGNORECASE):
+                            outcome_matched = True
+                            break
+
+                    if not outcome_matched and (tool_res.exit_code != 0 or "error" in raw_combined_output.lower()):
+                        logger.info(f"[ANTI-HALLUCINATION GATE 2] Active playbook '{active_playbook.id}' failed expected outcome verification. Adding to failure exclusion set.")
+                        attempted_playbook_ids.add(active_playbook.id)
+                        active_playbook = None
 
                 # Append Full AI Conversation, Timings & Telemetry to Dedicated Challenge Log File
                 logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
@@ -926,22 +977,45 @@ class AutonomousOrchestrator:
         """Parse command stdout to update structured target state memory."""
         if not output_text:
             return
-        
+
         # Extract Discovered URLs / Endpoints
         urls = re.findall(r"https?://[^\s\"'>]+", output_text)
         for u in urls:
             if len(u) < 120:
                 state_memory["discovered_endpoints"].add(u)
-        
+
         # Extract Cookies
         cookies = re.findall(r"Set-Cookie:\s*([^;\r\n]+)", output_text, re.IGNORECASE)
         for c in cookies:
             state_memory["observed_cookies"].add(c.strip())
 
         # Extract Server / Tech Headers
-        headers = re.findall(r"(?:Server|X-Powered-By|X-Framework):\s*([^\r\n]+)", output_text, re.IGNORECASE)
+        headers = re.findall(r"(?:Server|X-Powered-By|X-Framework|X-AspNet-Version):\s*([^\r\n]+)", output_text, re.IGNORECASE)
         for h in headers:
-            state_memory["headers_found"].add(h.strip())
+            clean_h = h.strip()
+            state_memory["headers_found"].add(clean_h)
+            for part in re.split(r"[\s/\-_,;]+", clean_h):
+                if len(part) > 2 and not part.isdigit():
+                    state_memory["detected_technologies"].add(part.lower())
+
+        # Extract Technology clues from HTML / output
+        tech_indicators = {
+            "jinja2": ["jinja", "werkzeug", "{{", "}}", "render_template_string"],
+            "flask": ["flask", "werkzeug"],
+            "express": ["express", "connect.sid"],
+            "nodejs": ["node.js", "nodejs", "npm"],
+            "php": ["php", "phpsessid", "x-powered-by: php"],
+            "django": ["csrftoken", "django"],
+            "jwt": ["bearer eyj", "jwt", "eyJ"],
+            "graphql": ["graphql", "schema", "query {"],
+            "mysql": ["mysql", "mariadb"],
+            "sqlite": ["sqlite3", "sqlite"],
+            "postgres": ["postgresql", "pg_"]
+        }
+        output_lower = output_text.lower()
+        for tech_tag, markers in tech_indicators.items():
+            if any(m.lower() in output_lower for m in markers):
+                state_memory["detected_technologies"].add(tech_tag)
 
 orchestrator_loop = AutonomousOrchestrator()
 

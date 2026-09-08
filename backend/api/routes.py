@@ -3,11 +3,11 @@ import re
 import asyncio
 import logging
 import shutil
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone
 
 from backend.database.session import get_db
 from backend.database.models import (
@@ -104,6 +104,12 @@ class CreateChallengeRequest(BaseModel):
     working_directory: Optional[str] = ""
     platform_name: Optional[str] = ""
     requires_root: bool = False
+    # Per-run agent config (flexible-agent engine + HITL checkpoint).
+    flag_pattern: Optional[str] = ""            # VALIDATION FILTER only, never a target
+    max_iterations: Optional[int] = 0           # 0 -> config default AGENT_MAX_ITERATIONS
+    max_minutes: Optional[int] = 0              # 0 -> config default AGENT_MAX_MINUTES
+    instance_expiry_minutes: Optional[int] = 0  # minutes from now the instance dies; 0 -> none
+    attached_file_paths: Optional[List[str]] = None   # server paths from /challenges/upload
 
 class UpdateTargetAddressRequest(BaseModel):
     new_address: str
@@ -285,6 +291,19 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
     working_dir = os.path.abspath(os.path.join(ctf_root_dir, platform, category, difficulty, name))
     os.makedirs(working_dir, exist_ok=True)
 
+    # Move any operator-uploaded artifacts (staged by POST /challenges/upload) into
+    # the challenge workspace byte-for-byte, and collect their final paths.
+    attached_final: List[str] = []
+    for _src in (req.attached_file_paths or []):
+        try:
+            if _src and os.path.isfile(_src):
+                _dest = os.path.join(working_dir, os.path.basename(_src))
+                if os.path.abspath(_src) != os.path.abspath(_dest):
+                    shutil.move(_src, _dest)
+                attached_final.append(_dest)
+        except Exception as _move_err:
+            logger.warning(f"Could not stage uploaded artifact '{_src}': {_move_err}")
+
     challenge = ChallengeModel(
         name=name,
         category=category,
@@ -344,10 +363,31 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
     except Exception as plan_err:
         logger.warning(f"Initial plan creation fallback: {plan_err}")
 
+    # Persist per-run agent config into mission_plan.run_config so WorkflowRunner can
+    # thread budget / flag pattern / uploaded artifacts / instance timer into run_swarm.
+    expiry_ts = None
+    if req.instance_expiry_minutes and req.instance_expiry_minutes > 0:
+        expiry_ts = datetime.now(timezone.utc).timestamp() + (req.instance_expiry_minutes * 60)
+    run_config = {
+        "flag_pattern": (req.flag_pattern or "").strip(),
+        "max_iterations": int(req.max_iterations or 0),
+        "max_minutes": int(req.max_minutes or 0),
+        "attached_file_paths": attached_final,
+        "instance_expiry_ts": expiry_ts,
+    }
+    try:
+        mp = dict(challenge.mission_plan or {})
+        mp["run_config"] = run_config
+        challenge.mission_plan = mp
+        db.commit()
+        db.refresh(challenge)
+    except Exception as rc_err:
+        logger.warning(f"Could not persist run_config: {rc_err}")
+
     # Phase 3 Turbo Recon: Pre-warm recon in background immediately
     from backend.recon.turbo_recon import turbo_recon
     if resolved_target:
-        asyncio.create_task(turbo_recon.start_turbo_recon(challenge.id, resolved_target, category.lower()))
+        asyncio.create_task(turbo_recon.start_turbo_recon(challenge.id, resolved_target, category.lower(), working_directory=working_dir))
 
     workflow_runner.start_run(run.id, challenge.id, resolved_target)
 
@@ -384,6 +424,80 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
         })
 
     return challenge
+
+
+@router.post("/challenges/upload")
+async def upload_artifact(file: UploadFile = File(...)):
+    """Byte-safe upload of a challenge artifact. Streams to a staging dir under the
+    CTF workspace and returns its absolute path; create_challenge then moves it into
+    the challenge workspace. Bytes never pass through any text-decoding layer."""
+    import uuid as _uuid
+    safe_name = os.path.basename(file.filename or "artifact.bin").replace("\\", "_").replace("/", "_")
+    safe_name = "".join(c for c in safe_name if c not in '<>:"|?*').strip() or "artifact.bin"
+    staging_dir = os.path.join(CTF_WORKSPACE_ROOT, "_uploads", _uuid.uuid4().hex[:12])
+    os.makedirs(staging_dir, exist_ok=True)
+    dest = os.path.join(staging_dir, safe_name)
+    try:
+        with open(dest, "wb") as fh:                     # wb — byte-for-byte, never decoded
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+    finally:
+        await file.close()
+    size = os.path.getsize(dest) if os.path.exists(dest) else 0
+    logger.info(f"[upload] staged artifact {dest} ({size} bytes)")
+    return {"path": dest, "filename": safe_name, "size": size}
+
+
+@router.get("/challenges/{challenge_id}/checkpoint")
+def get_checkpoint(challenge_id: str, db: Session = Depends(get_db)):
+    """Latest HITL checkpoint report for a challenge (operator copies it out to a
+    stronger external model, then pastes the response back)."""
+    run_ids = [r[0] for r in db.query(RunModel.id).filter(RunModel.challenge_id == challenge_id).all()]
+    if not run_ids:
+        return {"has_checkpoint": False}
+    cps = (db.query(CheckpointModel)
+           .filter(CheckpointModel.run_id.in_(run_ids))
+           .order_by(CheckpointModel.created_at.desc())
+           .limit(30).all())
+    cp = next((c for c in cps
+               if isinstance(c.state_snapshot, dict) and c.state_snapshot.get("kind") == "hitl_checkpoint"), None)
+    if not cp:
+        return {"has_checkpoint": False}
+    snap = cp.state_snapshot or {}
+    return {
+        "has_checkpoint": True,
+        "cycle": snap.get("cycle_n"),
+        "report": snap.get("report", ""),
+        "agent_ids": snap.get("agent_ids", []),
+        "created_at": cp.created_at.isoformat() if cp.created_at else None,
+    }
+
+
+class CheckpointRespondRequest(BaseModel):
+    text: str = ""
+
+
+@router.post("/challenges/{challenge_id}/checkpoint/respond")
+async def respond_checkpoint(challenge_id: str, req: CheckpointRespondRequest, db: Session = Depends(get_db)):
+    """Deliver the operator's pasted external-model response to a waiting swarm. The
+    orchestrator parses '--- suggestion: {agent} ---' blocks, routes each directive by
+    its own label, and resumes. Any flag still passes the normal validation gate."""
+    from backend.agents.swarm_orchestrator import swarm_orchestrator
+    result = await swarm_orchestrator.submit_checkpoint_response(challenge_id, req.text or "")
+    if not result.get("accepted"):
+        raise HTTPException(status_code=409, detail=result.get("reason", "No active checkpoint is awaiting a response."))
+    await ws_manager.broadcast({
+        "event": "CHECKPOINT_RESPONSE_ACCEPTED",
+        "challenge_id": challenge_id,
+        "parsed": result.get("parsed"),
+        "routed": result.get("routed", []),
+        "fallback": result.get("fallback"),
+    })
+    return result
+
 
 # NOTE: The guarded DELETE /challenges and DELETE /challenges/{challenge_id}
 # endpoints are defined earlier in this file (see delete_challenge /

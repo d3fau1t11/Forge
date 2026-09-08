@@ -59,7 +59,7 @@ export interface Challenge {
   category: string;
   difficulty: 'EASY' | 'MEDIUM' | 'HARD' | 'INSANE';
   target: string;
-  status: 'RUNNING' | 'PAUSED' | 'WAITING' | 'SOLVED' | 'FAILED' | 'COMPLETED' | 'QUEUED' | 'AWAITING_FLAG';
+  status: 'RUNNING' | 'PAUSED' | 'WAITING' | 'WAITING_FOR_USER' | 'SOLVED' | 'FAILED' | 'COMPLETED' | 'QUEUED' | 'AWAITING_FLAG';
   progress: number; // 0 - 100
   lastActivity: string;
   flagStatus: 'UNFOUND' | 'CAPTURED' | 'VERIFYING';

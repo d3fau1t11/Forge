@@ -11,6 +11,7 @@ Features:
 import asyncio
 import base64
 import codecs
+import hashlib
 import json
 import re
 import os
@@ -23,14 +24,20 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Set
 
 from backend.database.session import SessionLocal
-from backend.database.models import RunModel, ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel, ToolExecutionModel
+from backend.database.models import RunModel, ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel, ToolExecutionModel, CheckpointModel
 from backend.providers.router import model_router
-from backend.tools.manager import tool_manager
+from backend.tools.manager import tool_manager, LOCAL_EXEC_CATEGORIES
 from backend.websocket.manager import ws_manager
 from backend.engine.keep_awake import keep_awake_manager
 from backend.reporting.generator import report_generator
 from backend.knowledge.playbook_vault import playbook_vault
 from backend.recon.turbo_recon import turbo_recon
+from backend.config import settings
+from backend.environment.detector import environment_detector
+from backend.agents.agent_prompt import AgentContext, build_agent_prompt, make_context_from_env
+from backend.agents.artifact_acquisition import acquire_artifacts
+from backend.agents import checkpoint_pipeline
+from backend.agents.checkpoint_pipeline import AgentCheckpointRecord
 
 logger = logging.getLogger("forge.swarm")
 
@@ -159,6 +166,14 @@ _HEADER_HINT_RE = re.compile(
 )
 
 
+def _effective_elapsed_minutes(started_ts: float, now: float, paused_seconds: float) -> float:
+    """Wall-clock minutes an agent has actually been WORKING — total elapsed minus any
+    time it sat idle at a checkpoint pause. Pure/synchronous so it is unit-testable and
+    so the budget gate and the BUDGET_EXHAUSTED message stay consistent."""
+    worked = (now - started_ts) - max(0.0, paused_seconds or 0.0)
+    return max(0.0, worked) / 60.0
+
+
 def _get_challenge_log_path(challenge_id: str) -> str:
     """Resolve the path to the challenge log file."""
     logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
@@ -222,7 +237,54 @@ class SwarmBlackboard:
         # Signatures ("name: value") of header injections already queued, so the
         # same lead is never re-added to the task pool (kills the injection loop).
         self.tried_header_signatures: Set[str] = set()
+        # Candidate Entities Tracking (Usernames, tokens, and decode deduplication)
+        self.candidate_usernames: Set[str] = set()
+        self.candidate_tokens: Set[str] = set()
+        self.tested_user_combinations: Set[str] = set()
+        self.processed_decode_hashes: Set[str] = set()
+        self.last_target_rejection: Optional[str] = None
         self._lock = asyncio.Lock()
+
+        # ── Unified flexible-agent challenge context ────────────────────────────
+        # Populated by run_swarm before agents start; baked into every agent's
+        # full-context prompt via build_agent_prompt(). No per-role framing.
+        self.challenge_name: str = ""
+        self.platform: str = ""
+        self.category: str = "WEB"
+        self.difficulty: str = "EASY"
+        self.description: str = ""
+        self.flag_pattern: str = getattr(settings, "DEFAULT_FLAG_PATTERNS",
+                                         "picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}")
+        self.max_iterations: int = getattr(settings, "AGENT_MAX_ITERATIONS", 40)
+        self.max_minutes: int = getattr(settings, "AGENT_MAX_MINUTES", 30)
+        self.attached_file_paths: List[str] = []
+        self.artifact_classification = None            # ClassificationResult | None
+        self.env_info: Dict[str, Any] = {}
+
+        # ── Per-agent live state (arbitrary N agents, not fixed roles) ──────────
+        self.agent_ids: List[str] = []
+        self.agent_transcripts: Dict[str, List[str]] = {}   # agent_id -> transcript lines
+        self.agent_directives: Dict[str, str] = {}          # agent_id -> injected directive
+        self.agent_iterations: Dict[str, int] = {}          # agent_id -> tool-call count
+        self.agent_started_ts: Dict[str, float] = {}        # agent_id -> wall-clock start
+        # Wall-clock seconds each agent spent idle at a checkpoint pause. Subtracted from
+        # elapsed so a 3.5-min operator pause never counts against a 5-min work budget.
+        self.agent_paused_seconds: Dict[str, float] = {}    # agent_id -> accumulated pause secs
+        # Consecutive LOCAL execution failures (command never reached the target) per agent.
+        # Reset the moment a command actually reaches the target; caps unbounded identical retries.
+        self.agent_local_fail_streak: Dict[str, int] = {}   # agent_id -> streak count
+
+        # ── HITL checkpoint state (hard pause & wait) ───────────────────────────
+        # checkpoint_pause is a RESUMABLE wait (distinct from is_stopped /
+        # pause_requested): agents idle at a checkpoint and resume on operator paste.
+        self.checkpoint_pause = False
+        self.checkpoint_active = False
+        self.checkpoint_response_event = asyncio.Event()
+        self.latest_pasted_response: Optional[str] = None
+        self.cycle_n = 0
+        self.last_checkpoint_report: str = ""
+        self.instance_expiry_ts: Optional[float] = None     # epoch secs, or None
+        self.cycle_window_start_ts: float = time.time()     # start of the current report window
 
     async def add_task(self, category: str, description: str, priority: int = 1, metadata: Optional[Dict] = None) -> SwarmTask:
         async with self._lock:
@@ -360,24 +422,44 @@ class SwarmBlackboard:
         return True
 
     def _build_mission_plan(self) -> Dict[str, Any]:
-        """Build the current mission plan from the task pool (shared by broadcast + DB persist)."""
-        total_tasks = len(self.task_pool)
-        completed_tasks = sum(1 for t in self.task_pool.values() if t.status == "COMPLETED")
+        """Build the current mission plan for UI + DB persist.
+
+        The claim-and-solve task pool was removed with the fixed-worker model, so
+        the 'tasks' rows are now derived from live per-agent state (one row per
+        active agent) — the frontend Todo/Mission Plan renders these unchanged.
+        """
         plan_tasks = []
-        for idx, t in enumerate(self.task_pool.values()):
+        for agent_id in (self.agent_ids or list(self.worker_states.keys())):
+            ws_ = self.worker_states.get(agent_id, {})
+            raw_status = (ws_.get("status") or "PENDING").upper()
+            if self.flag_captured:
+                row_status = "COMPLETED"
+            elif raw_status in ("RUNNING", "ANALYZING", "EXECUTING"):
+                row_status = "IN_PROGRESS"
+            else:
+                row_status = "PENDING"
             plan_tasks.append({
-                "id": t.task_id,
-                "phase": t.category,
-                "title": t.description,
+                "id": agent_id,
+                "phase": "AGENT",
+                "title": ws_.get("current_task") or "General-purpose CTF agent",
                 "tool": "bash",
-                "reasoning": f"Claimed by {t.claimed_by or 'swarm_pool'}",
-                "status": "COMPLETED" if t.status == "COMPLETED" else ("IN_PROGRESS" if t.status == "CLAIMED" else "PENDING"),
-                "output_summary": t.result or ""
+                "reasoning": f"Model: {ws_.get('selected_model', 'auto')} | iterations: {self.agent_iterations.get(agent_id, 0)}",
+                "status": row_status,
+                "output_summary": ws_.get("last_result", ""),
             })
+        if self.checkpoint_active:
+            status = "WAITING_FOR_USER"
+        elif self.flag_captured:
+            status = "COMPLETED"
+        elif self.stall_reason:
+            status = "STALLED"
+        else:
+            status = "IN_PROGRESS"
         return {
             "challenge_id": self.challenge_id,
-            "status": "COMPLETED" if self.flag_captured else ("STALLED" if self.stall_reason else "IN_PROGRESS"),
-            "summary": f"Swarm Intelligence Solver active on {self.target_scope}"
+            "status": status,
+            "summary": f"Flexible agent swarm active on {self.target_scope}"
+                       + (f" — awaiting operator checkpoint response (cycle {self.cycle_n})" if self.checkpoint_active else "")
                        + (f" — STALLED: {self.stall_reason}" if self.stall_reason else ""),
             "tasks": plan_tasks,
             "strategic_reviews": [],
@@ -391,6 +473,19 @@ class SwarmBlackboard:
                 "deobfuscated_secrets": list(self.deobfuscated_secrets),
                 "executed_commands": list(self.executed_commands_dedup),
                 "flag_candidates": list(self.flag_candidates),
+                "candidate_usernames": list(self.candidate_usernames),
+                "agent_directives": dict(self.agent_directives),
+                # Full per-agent reasoning history so a resumed run continues each agent's
+                # thread instead of restarting recon from scratch (#4). Capped to keep the
+                # snapshot small; outputs are already truncated by record_agent_step.
+                "agent_transcripts": {aid: lines[-20:] for aid, lines in self.agent_transcripts.items()},
+                "execution_history": [
+                    {"agent": h.get("agent", ""), "command": h.get("command", ""),
+                     "output": (h.get("output") or "")[:800], "ts": h.get("ts", ""), "note": h.get("note", "")}
+                    for h in self.execution_history[-60:]
+                ],
+                "agent_ids": list(self.agent_ids),
+                "cycle_n": self.cycle_n,
             },
         }
 
@@ -406,7 +501,8 @@ class SwarmBlackboard:
         Synchronous by design — call before any worker starts, so no lock/broadcast
         is needed. Returns counts for logging.
         """
-        counts = {"endpoints": 0, "headers": 0, "commands": 0, "completed_tasks": 0, "pending_tasks": 0}
+        counts = {"endpoints": 0, "headers": 0, "commands": 0, "completed_tasks": 0,
+                  "pending_tasks": 0, "transcript_lines": 0}
         snapshot = snapshot or {}
 
         for ep in (snapshot.get("discovered_endpoints") or []):
@@ -431,37 +527,46 @@ class SwarmBlackboard:
             if cmd:
                 self.executed_commands_dedup.add(cmd)
 
-        # Rebuild the task pool, preserving COMPLETED so progress carries and finished
-        # work isn't repeated; anything unfinished is made claimable again.
-        for t in (prior_tasks or []):
-            title = t.get("title") or ""
-            if not title:
-                continue
-            t_id = t.get("id") or f"task_{uuid.uuid4().hex[:8]}"
-            task = SwarmTask(t_id, t.get("phase", "RECON"), title, priority=2)
-            if t.get("status") == "COMPLETED":
-                task.status = "COMPLETED"
-                task.result = t.get("output_summary", "")
-                counts["completed_tasks"] += 1
-            else:
-                task.status = "PENDING"
-                counts["pending_tasks"] += 1
-            self.task_pool[t_id] = task
+        # Restore candidate usernames + prior operator directives + checkpoint cycle
+        # (the claim-and-solve task pool was removed with the flexible-agent model).
+        for u in (snapshot.get("candidate_usernames") or []):
+            if u:
+                self.candidate_usernames.add(u)
+        for aid, directive in (snapshot.get("agent_directives") or {}).items():
+            if directive:
+                self.agent_directives[aid] = directive
+
+        # Restore each agent's actual reasoning history (#4): per-agent transcripts + the
+        # shared execution history, so build_history_context shows "Your recent steps" and
+        # agents resume their thread instead of re-running the same initial recon commands.
+        for aid, lines in (snapshot.get("agent_transcripts") or {}).items():
+            if lines:
+                self.agent_transcripts.setdefault(aid, []).extend(list(lines))
+        for h in (snapshot.get("execution_history") or []):
+            if h:
+                self.execution_history.append(h)
+        for aid in (snapshot.get("agent_ids") or []):
+            if aid and aid not in self.agent_ids:
+                self.agent_ids.append(aid)
+
+        try:
+            self.cycle_n = int(snapshot.get("cycle_n") or 0)
+        except (TypeError, ValueError):
+            self.cycle_n = 0
 
         counts["endpoints"] = len(self.discovered_endpoints)
         counts["headers"] = len(self.extracted_headers)
         counts["commands"] = len(self.executed_commands_dedup)
+        counts["transcript_lines"] = sum(len(v) for v in self.agent_transcripts.values())
         return counts
 
     def _compute_progress(self) -> int:
-        """Progress percentage: 0-90 from task completion, 100 on flag capture."""
+        """Progress: 100 on flag capture, else a soft function of agent activity
+        (distinct executed commands) capped at 90 — no fixed task pool to measure."""
         if self.flag_captured:
             return 100
-        total_tasks = len(self.task_pool)
-        if total_tasks == 0:
-            return 0
-        completed_tasks = sum(1 for t in self.task_pool.values() if t.status == "COMPLETED")
-        return int((completed_tasks / total_tasks) * 90)
+        commands = len(self.executed_commands_dedup)
+        return min(90, commands * 4)
 
     def _build_agent_states(self) -> List[Dict[str, Any]]:
         """Live worker fleet state for /api/agents and AGENT_UPDATE events."""
@@ -523,6 +628,86 @@ class SwarmBlackboard:
                 db.close()
         except Exception:
             pass
+
+    def record_agent_step(self, agent_id: str, command: str = "", output: str = "", note: str = ""):
+        """Append one agent step to its transcript + shared execution history.
+
+        Feeds both build_history_context() (cross-agent awareness in the prompt)
+        and snapshot_agent_records() (the checkpoint report). Verbatim — no
+        paraphrasing, so the report's factual fields stay un-fabricated.
+        """
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        parts = [f"[{ts}]"]
+        if command:
+            parts.append(f"CMD: {command}")
+        if output:
+            parts.append(f"OUT: {output[:600]}")
+        if note:
+            parts.append(note)
+        self.agent_transcripts.setdefault(agent_id, []).append(" ".join(parts))
+        self.execution_history.append({
+            "agent": agent_id, "command": command,
+            "output": (output or "")[:2000], "ts": ts, "note": note,
+        })
+
+    def build_history_context(self, agent_id: str) -> str:
+        """Shared blackboard state + this agent's and peers' recent steps, injected
+        into the full-context prompt each turn (replaces the old task-pool routing)."""
+        lines: List[str] = []
+        if self.discovered_endpoints:
+            lines.append("Discovered endpoints: " + ", ".join(sorted(self.discovered_endpoints)[:15]))
+        if self.extracted_headers:
+            lines.append("Known / exploit headers: " + "; ".join(f"{k}: {v}" for k, v in list(self.extracted_headers.items())[:10]))
+        if self.observed_cookies:
+            lines.append("Cookies: " + "; ".join(f"{k}={v}" for k, v in list(self.observed_cookies.items())[:8]))
+        if self.deobfuscated_secrets:
+            lines.append("Decoded secrets: " + "; ".join(str(s)[:120] for s in self.deobfuscated_secrets[:6]))
+        if self.candidate_usernames:
+            lines.append("Candidate usernames discovered (try these before generic 'admin'): " + ", ".join(sorted(self.candidate_usernames)))
+        if self.candidate_tokens:
+            lines.append("Candidate tokens: " + ", ".join(list(self.candidate_tokens)[:6]))
+        if self.last_target_rejection:
+            lines.append(f"Last target rejection signal: {self.last_target_rejection} — reconcile this with the evidence above (e.g. a 'user not found' means try a discovered username).")
+        if self.flag_candidates:
+            lines.append("Unverified flag candidates so far (MUST be reproduced from real output before accepting): "
+                         + ", ".join(c.get("flag", "") for c in self.flag_candidates[:5]))
+        own = self.agent_transcripts.get(agent_id, [])
+        if own:
+            lines.append("Your recent steps:")
+            lines.extend("  " + l for l in own[-8:])
+        others = []
+        for aid, tr in self.agent_transcripts.items():
+            if aid == agent_id or not tr:
+                continue
+            others.append(f"  [{aid}] {tr[-1]}")
+        if others:
+            lines.append("Other agents' latest steps (coordinate — don't duplicate):")
+            lines.extend(others[:6])
+        return "\n".join(lines) if lines else "No shared findings yet."
+
+    def snapshot_agent_records(self) -> List[AgentCheckpointRecord]:
+        """Build the deterministic per-agent records for a consolidated checkpoint
+        report — verbatim evidence/commands + this agent's flag candidate (if any)."""
+        records: List[AgentCheckpointRecord] = []
+        for agent_id in self.agent_ids:
+            hist = [h for h in self.execution_history if h.get("agent") == agent_id]
+            evidence = [h["output"] for h in hist if h.get("output")][-5:]
+            tried = [f"{h.get('command', '')} -> {(h.get('output') or '')[:120]}"
+                     for h in hist if h.get("command")][-6:]
+            fc = fs = None
+            for c in reversed(self.flag_candidates):
+                if c.get("worker") == agent_id:
+                    fc, fs = c.get("flag"), c.get("source")
+                    break
+            records.append(AgentCheckpointRecord(
+                agent_id=agent_id,
+                evidence=evidence,
+                tried=tried,
+                transcript="\n".join(self.agent_transcripts.get(agent_id, [])),
+                flag_candidate=fc,
+                flag_source=fs,
+            ))
+        return records
 
     async def _persist_progress_if_due(self, force: bool = False):
         """Throttled DB persist of mission plan (task statuses) + progress so the UI is reload-safe."""
@@ -608,10 +793,19 @@ class SwarmOrchestrator:
         working_directory: str,
         category: str = "WEB",
         difficulty: str = "EASY",
-        resume: bool = False
+        resume: bool = False,
+        challenge_name: str = "",
+        platform: str = "",
+        description: str = "",
+        flag_pattern: str = "",
+        max_iterations: int = 0,
+        max_minutes: int = 0,
+        attached_file_paths: Optional[List[str]] = None,
+        instance_expiry_ts: Optional[float] = None,
     ):
-        """Dispatches parallel Swarm workers on the target."""
-        logger.info(f"[SwarmOrchestrator] 🚀 Starting Swarm for Challenge '{challenge_id}' on '{target_scope}' (resume={resume})")
+        """Dispatch N general-purpose full-context agents on the target (flexible-agent
+        engine; no fixed recon/crypto/exploit roles or hardcoded task checklist)."""
+        logger.info(f"[SwarmOrchestrator] 🚀 Starting flexible-agent swarm for Challenge '{challenge_id}' on '{target_scope}' (resume={resume})")
         _append_to_challenge_log(challenge_id, "orchestrator", f"Swarm {'resuming' if resume else 'starting'} | target={target_scope} | category={category} | difficulty={difficulty}")
 
         # Engage OS Keep-Awake lock
@@ -619,6 +813,21 @@ class SwarmOrchestrator:
 
         board = SwarmBlackboard(challenge_id, run_id, target_scope)
         self.active_swarms[run_id] = board
+
+        # Challenge context → baked into every agent's full-context prompt.
+        board.challenge_name = challenge_name or challenge_id
+        board.platform = platform
+        board.category = category
+        board.difficulty = difficulty
+        board.description = description
+        if flag_pattern:
+            board.flag_pattern = flag_pattern
+        if max_iterations:
+            board.max_iterations = max_iterations
+        if max_minutes:
+            board.max_minutes = max_minutes
+        board.attached_file_paths = list(attached_file_paths or [])
+        board.instance_expiry_ts = instance_expiry_ts
 
         db = SessionLocal()
         try:
@@ -631,7 +840,7 @@ class SwarmOrchestrator:
 
             # Pre-warmed Turbo Recon (Initial seed — non-fatal)
             try:
-                turbo_data = await turbo_recon.start_turbo_recon(challenge_id, target_scope, category.lower())
+                turbo_data = await turbo_recon.start_turbo_recon(challenge_id, target_scope, category.lower(), working_directory=working_directory)
             except Exception as recon_err:
                 logger.warning(f"[SwarmOrchestrator] Turbo recon seed failed (non-fatal): {recon_err}")
                 _append_to_challenge_log(challenge_id, "orchestrator", f"Turbo recon skipped: {recon_err}")
@@ -660,49 +869,68 @@ class SwarmOrchestrator:
                     _append_to_challenge_log(
                         challenge_id, "orchestrator",
                         f"Resuming from prior progress: {counts['endpoints']} endpoints, "
-                        f"{counts['commands']} prior commands, {counts['completed_tasks']} completed tasks"
+                        f"{counts['commands']} prior commands, {counts['transcript_lines']} restored "
+                        f"transcript lines (agents resume their reasoning thread, not just counters)"
                     )
                     logger.info(f"[SwarmOrchestrator] Resuming challenge '{challenge_id}' with rehydrated state: {counts}")
                 except Exception as rehydrate_err:
                     logger.warning(f"[SwarmOrchestrator] Resume rehydrate failed (starting fresh): {rehydrate_err}")
 
-            # Seed Initial Swarm Tasks — only when the pool has no pending work (a fresh
-            # start, or a resume where every prior task was already completed).
-            if not any(t.status == "PENDING" for t in board.task_pool.values()):
-                await board.add_task("RECON", f"Initial crawler & header discovery on {target_scope}", priority=5)
-                await board.add_task("CODE_AUDIT", f"Inspect source code, HTML comments, and scripts on {target_scope}", priority=4)
-                await board.add_task("EXPLOIT", f"Test authentication endpoints and parameters on {target_scope}", priority=3)
-                _append_to_challenge_log(challenge_id, "orchestrator", "Initial task pool seeded (RECON, CODE_AUDIT, EXPLOIT)")
-            else:
-                pending_n = sum(1 for t in board.task_pool.values() if t.status == "PENDING")
-                completed_n = sum(1 for t in board.task_pool.values() if t.status == "COMPLETED")
-                _append_to_challenge_log(challenge_id, "orchestrator", f"Resumed task pool: {pending_n} pending, {completed_n} completed")
+            # ── Artifact acquisition (Part 2) — deterministic, before any agent ──
+            # Binary-safe: downloads/uploads never pass through tool_manager's
+            # text-decoding capture. If binary, the prompt flips to BINARY MODE.
+            try:
+                board.env_info = environment_detector.detect_environment()
+            except Exception as env_err:
+                logger.warning(f"[SwarmOrchestrator] Env detect failed (non-fatal): {env_err}")
+                board.env_info = {}
+            try:
+                targets = [t.strip() for t in target_scope.split("+") if t.strip()]
+                manifest = await acquire_artifacts(targets, working_directory, board.attached_file_paths)
+                for note in manifest.notes:
+                    _append_to_challenge_log(challenge_id, "orchestrator", f"[artifact] {note}")
+                for p in manifest.saved_paths:
+                    if p not in board.attached_file_paths:
+                        board.attached_file_paths.append(p)
+                if manifest.primary is not None:
+                    board.artifact_classification = manifest.primary
+                    _append_to_challenge_log(
+                        challenge_id, "orchestrator",
+                        f"BINARY ARTIFACT MODE engaged: {manifest.primary.artifact_type} "
+                        f"@ {manifest.primary.safe_file_path or '(header-only)'}")
+            except Exception as art_err:
+                logger.warning(f"[SwarmOrchestrator] Artifact acquisition failed (non-fatal): {art_err}")
 
-            # Define Swarm Workers
-            workers = [
-                self._recon_worker("worker_recon", board, working_directory),
-                self._code_crypto_worker("worker_code_crypto", board, working_directory),
-                self._exploit_worker("worker_exploit_pwn", board, working_directory)
+            # ── Spawn N general-purpose agents (config-driven; not roles) ──────────
+            pool_size = self._resolve_pool_size(board.env_info)
+            board.agent_ids = [f"agent_{i+1}" for i in range(pool_size)]
+            # Capabilities rotate only for provider diversity/throughput across the
+            # free-tier chain — every agent gets the SAME full-context prompt.
+            cap_cycle = ["web_analysis", "code_analysis", "general_reasoning",
+                         "reverse_engineering", "fast_reasoning"]
+            agents = [
+                self._agent_worker(aid, board, working_directory, cap_cycle[i % len(cap_cycle)])
+                for i, aid in enumerate(board.agent_ids)
             ]
 
-            # Run workers concurrently until flag capture, stall, or cancellation.
-            # asyncio.gather() already returns an awaitable _GatheringFuture; use
-            # ensure_future (NOT create_task, which rejects a Future) so it can be
-            # passed to asyncio.wait() below alongside flag_task.
-            worker_task = asyncio.ensure_future(asyncio.gather(*workers, return_exceptions=True))
+            # Run agents concurrently until flag capture, all-budget-exhaustion, or
+            # cancellation. ensure_future (not create_task) wraps the gather Future so
+            # it can sit in asyncio.wait() alongside the flag + checkpoint tasks.
+            worker_task = asyncio.ensure_future(asyncio.gather(*agents, return_exceptions=True))
             flag_task = asyncio.create_task(board.flag_event.wait())
-            refiller_task = asyncio.create_task(self._task_refiller(board, working_directory))
+            checkpoint_task = asyncio.create_task(self._checkpoint_coordinator(board, working_directory))
 
-            _append_to_challenge_log(challenge_id, "orchestrator", "All 3 swarm workers + task refiller dispatched")
+            _append_to_challenge_log(challenge_id, "orchestrator", f"{pool_size} flexible-agent workers + checkpoint coordinator dispatched")
 
-            # Wait for flag event, worker completion, or stall
+            # Wait for flag event, all agents finishing, or coordinator exit.
             done, pending = await asyncio.wait(
-                [flag_task, worker_task, refiller_task],
+                [flag_task, worker_task, checkpoint_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
 
-            # If flag was captured, cancel any remaining tasks
+            # Stop everything and release any coordinator hard-wait so it can exit.
             board.is_stopped = True
+            board.checkpoint_response_event.set()
             for p in pending:
                 p.cancel()
 
@@ -814,6 +1042,9 @@ class SwarmOrchestrator:
             if board.challenge_id == challenge_id and not board.is_stopped:
                 board.pause_requested = True
                 board.is_stopped = True
+                # Release a coordinator that is hard-waiting at a checkpoint so it
+                # can observe is_stopped and exit cleanly instead of hanging.
+                board.checkpoint_response_event.set()
                 try:
                     await board._persist_progress_if_due(force=True)
                 except Exception:
@@ -823,389 +1054,455 @@ class SwarmOrchestrator:
                 logger.info(f"[SwarmOrchestrator] Pause requested for challenge '{challenge_id}'")
         return paused_any
 
-    async def _recon_worker(self, worker_id: str, board: SwarmBlackboard, workdir: str):
-        """Worker 1: Fast Recon & Fuzzing (Uses Groq / Minimax / xKiro)."""
-        logger.info(f"[Swarm Worker] {worker_id} started.")
-        _append_to_challenge_log(board.challenge_id, worker_id, "Worker started")
-        await board.update_worker_state(worker_id, status="RUNNING", current_capability="recon",
-                                        selected_model="Groq Qwen / xKiro (free)", current_task="Booting recon worker")
+    def _resolve_pool_size(self, env_info: Dict[str, Any]) -> int:
+        """How many general-purpose agents to spawn. Config AGENT_POOL_SIZE (int),
+        or the string 'auto' -> min(cpu_cores-1, 4). Clamped to [1, 6]."""
+        raw = getattr(settings, "AGENT_POOL_SIZE", 3)
+        if isinstance(raw, str) and raw.strip().lower() == "auto":
+            cores = int(env_info.get("cpu_cores") or 2)
+            size = min(max(cores - 1, 1), 4)
+        else:
+            try:
+                size = int(raw)
+            except (TypeError, ValueError):
+                size = 3
+        return max(1, min(size, 6))
+
+    def _build_agent_context(self, board: "SwarmBlackboard", workdir: str, agent_id: str) -> AgentContext:
+        """Full challenge context for one agent this turn (identical template for all;
+        only history_context + injected_directive differ per agent)."""
+        return make_context_from_env(
+            env_info=board.env_info or {},
+            challenge_name=board.challenge_name,
+            platform=board.platform,
+            category=board.category,
+            difficulty=board.difficulty,
+            description=board.description,
+            target_url=board.target_scope,
+            working_directory=workdir,
+            max_iterations=board.max_iterations,
+            max_minutes=board.max_minutes,
+            flag_pattern=board.flag_pattern,
+            attached_file_paths=list(board.attached_file_paths),
+            artifact_classification=board.artifact_classification,
+            history_context=board.build_history_context(agent_id),
+            injected_directive=board.agent_directives.get(agent_id, ""),
+        )
+
+    async def _agent_worker(self, agent_id: str, board: "SwarmBlackboard", workdir: str, capability: str):
+        """One general-purpose, full-context agent running a budget-bounded ReAct
+        loop. No fixed role: it reasons about THIS challenge from the shared
+        blackboard context and decides its own next command / solver / flag."""
+        logger.info(f"[Agent] {agent_id} started (capability route: {capability}).")
+        _append_to_challenge_log(board.challenge_id, agent_id, f"Agent started (provider route: {capability})")
+        board.agent_started_ts[agent_id] = time.time()
+        board.agent_iterations[agent_id] = 0
+        board.agent_paused_seconds[agent_id] = 0.0
+        board.agent_local_fail_streak[agent_id] = 0
+        await board.update_worker_state(agent_id, status="RUNNING", current_capability=capability,
+                                        selected_model="auto (capability chain)", current_task="Booting agent")
         consecutive_errors = 0
         MAX_CONSECUTIVE_ERRORS = 5
+
         while not board.flag_captured and not board.is_stopped:
-            task = await board.claim_task(worker_id, ["RECON"])
-            if not task:
-                # No pending tasks — wait and check again
-                await board.update_worker_state(worker_id, status="IDLE", current_task="Idle — waiting for tasks")
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"Too many errors ({consecutive_errors}), worker pausing for 30s")
-                    await asyncio.sleep(30)
-                    consecutive_errors = 0  # Reset after long pause
-                else:
-                    await asyncio.sleep(2.0)
+            # Hard-pause at a checkpoint: idle until the operator response resumes us.
+            # Time spent idle here is accumulated and subtracted from the work budget so a
+            # multi-minute operator pause never counts against the M working-minute clock.
+            if board.checkpoint_pause:
+                pause_started = time.time()
+                await board.update_worker_state(agent_id, status="IDLE", current_task="Paused at operator checkpoint")
+                while board.checkpoint_pause and not board.is_stopped and not board.flag_captured:
+                    await asyncio.sleep(1.0)
+                board.agent_paused_seconds[agent_id] = (
+                    board.agent_paused_seconds.get(agent_id, 0.0) + (time.time() - pause_started)
+                )
                 continue
 
-            try:
-                _append_to_challenge_log(board.challenge_id, worker_id, f"Claimed task: {task.description[:100]}")
-                await board.update_worker_state(worker_id, status="ANALYZING", current_task=task.description[:140])
+            # Instance-expiry hard wind-down — the CTF platform kills the target on its own
+            # timer (as short as ~15 min). Stop and report best findings a buffer before that
+            # deadline rather than being cut off mid-command.
+            if board.instance_expiry_ts:
+                buffer = int(getattr(settings, "INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
+                if time.time() >= board.instance_expiry_ts - buffer:
+                    reason = "WINDING_DOWN: platform instance expiry approaching — reporting best findings"
+                    board.record_agent_step(agent_id, note=reason)
+                    _append_to_challenge_log(board.challenge_id, agent_id, reason)
+                    await board.update_worker_state(agent_id, status="DONE", current_task=reason)
+                    if not board.stall_reason:
+                        board.stall_reason = "Platform instance expiry reached"
+                    break
 
-                # Query model for next recon action
-                prompt = (
-                    f"You are the Reconnaissance Worker in a parallel CTF Swarm.\n"
-                    f"Target: {board.target_scope}\n"
-                    f"Discovered Endpoints: {list(board.discovered_endpoints)}\n"
-                    f"Headers: {board.extracted_headers}\n"
-                    f"Current Task: {task.description}\n"
-                    f"Issue a single bash command (e.g. curl, ffuf, httpx) to uncover hidden routes, parameters, or robots.txt.\n"
-                    f"For directory brute force, only reference wordlists you are sure exist; otherwise prefer curl-based checks or an inline heredoc wordlist so the command cannot fail on a missing file.\n"
-                    f"IMPORTANT: Output ONLY the command inside a ```bash code block. It MUST be directly executable — no placeholder tokens like [payload], <value>, or parenthetical notes. Do NOT include example flags or flag format references."
+            # Budget gate — N iterations OR M working-minutes, whichever first. Working-minutes
+            # exclude checkpoint-pause idle time (see agent_paused_seconds / #3).
+            elapsed_min = _effective_elapsed_minutes(
+                board.agent_started_ts[agent_id], time.time(),
+                board.agent_paused_seconds.get(agent_id, 0.0),
+            )
+            iters = board.agent_iterations.get(agent_id, 0)
+            if iters >= board.max_iterations or elapsed_min >= board.max_minutes:
+                reason = (f"BUDGET_EXHAUSTED (iterations={iters}/{board.max_iterations}, "
+                          f"minutes={elapsed_min:.1f}/{board.max_minutes})")
+                board.record_agent_step(agent_id, note=reason)
+                _append_to_challenge_log(board.challenge_id, agent_id, reason)
+                await board.update_worker_state(agent_id, status="DONE", current_task=reason)
+                if not board.stall_reason:
+                    board.stall_reason = "Agents exhausted their iteration/time budget without a verified flag"
+                break
+
+            try:
+                ctx = self._build_agent_context(board, workdir, agent_id)
+                system_instruction, user_prompt = build_agent_prompt(ctx)
+                await board.update_worker_state(agent_id, status="ANALYZING",
+                                                current_task=f"Deciding next action (iter {iters + 1})")
+
+                resp = await model_router.route_request(
+                    prompt=user_prompt,
+                    system_instruction=system_instruction,
+                    capability=capability,
                 )
 
-                resp = await model_router.route_request(prompt=prompt, capability="recon", target_model="qwen-3.8-27b")
-
-                # Detect ALL_EXHAUSTED / refusal — don't waste time on garbage
                 if resp.is_refusal:
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"All providers exhausted: {resp.refusal_reason[:100]}")
                     consecutive_errors += 1
-                    await board.update_worker_state(worker_id, status="IDLE",
-                                                    failures=consecutive_errors,
+                    _append_to_challenge_log(board.challenge_id, agent_id, f"Provider exhausted/refusal: {resp.refusal_reason[:100]}")
+                    await board.update_worker_state(agent_id, status="IDLE", failures=consecutive_errors,
                                                     current_task=f"Provider error: {resp.refusal_reason[:80]}")
-                    await board.complete_task(task.task_id, result=f"Provider error: {resp.refusal_reason[:80]}")
-                    await asyncio.sleep(5)
-                    continue
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        await asyncio.sleep(30)
+                        consecutive_errors = 0
+                    else:
+                        await asyncio.sleep(5)
+                    continue  # provider errors do not consume the iteration budget
 
-                cmd = self._extract_command(resp.content) or f"curl -s -i {board.target_scope}"
+                content = resp.content or ""
+                model_name = getattr(resp, "model_name", capability)
 
-                # Broadcast AI Decision to UI
-                try:
-                    await ws_manager.broadcast({
-                        "event": "AI_DECISION",
-                        "challenge_id": board.challenge_id,
-                        "agent": "SWARM_RECON",
-                        "goal": task.description,
-                        "capability": "recon",
-                        "result": cmd,
-                        "confidence": 92,
-                        "model": getattr(resp, "model_name", "qwen-3.8-27b")
-                    })
-                except Exception:
-                    pass
+                # ── Parse the agent's single action per the prompt output contract ──
+                if re.search(r"\bBUDGET_EXHAUSTED\b", content):
+                    board.record_agent_step(agent_id, note=f"Model reported BUDGET_EXHAUSTED: {content[:200]}")
+                    await board.update_worker_state(agent_id, status="DONE", current_task="Budget exhausted (model-reported)")
+                    break
 
-                if cmd not in board.executed_commands_dedup:
-                    board.executed_commands_dedup.add(cmd)
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"Executing: {cmd[:200]}")
-                    res = await tool_manager.execute_tool("bash", {"command": cmd}, timeout=25, working_directory=workdir)
-                    output = res.stdout or res.stderr or ""
+                # Explicit FLAG: line is an LLM claim → candidate only, never auto-captured.
+                flag_line = re.search(r"FLAG:\s*(\S+)", content)
+                if flag_line:
+                    cand = flag_line.group(1).strip()
+                    if FLAG_REGEX.search(cand) and not FALSE_FLAG_PATTERNS.search(cand):
+                        await board.record_flag_candidate(cand, agent_id, "llm_reported")
+                        board.record_agent_step(agent_id, note=f"Agent reported flag candidate (unverified): {cand}")
 
-                    # Persist the execution so terminal history survives refreshes/restarts
-                    await board.record_tool_execution(worker_id, cmd, res)
-                    await board.update_worker_state(
-                        worker_id, status="RUNNING", last_tool=cmd[:160],
-                        last_result=(output[:200] or f"[Exit {res.exit_code}] no output"),
-                        commands_run=board.worker_states.get(worker_id, {}).get("commands_run", 0) + 1
-                    )
-
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"Output ({len(output)} bytes, exit={res.exit_code}): {output[:300]}")
-
-                    # Broadcast Terminal Log to UI
+                # A Python solver block -> write solve.py and run it byte-safely.
+                py_match = re.search(r"```python\s*\n(.*?)\n```", content, re.DOTALL)
+                if py_match:
+                    script = py_match.group(1)
+                    # Content-hash the filename so a REVISED script actually runs (its command
+                    # string differs), while a byte-identical retry still dedups. Without this,
+                    # every revised solver reused one filename -> one command string -> silently
+                    # skipped by the dedup set.
+                    script_hash = hashlib.md5(script.encode("utf-8", "replace")).hexdigest()[:8]
+                    solver_path = os.path.join(workdir, f"solve_{agent_id}_{script_hash}.py")
                     try:
-                        await ws_manager.broadcast({
-                            "event": "LOG_OUTPUT",
-                            "challenge_id": board.challenge_id,
-                            "run_id": board.run_id,
-                            "command": cmd,
-                            "output": output[:3000] if output else f"[Exit Code {res.exit_code}] Execution complete with no output.",
-                            "exit_code": res.exit_code,
-                            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S")
-                        })
-                    except Exception:
-                        pass
-
-                    # Only scan TOOL OUTPUT for flags (never LLM prose)
-                    self._check_tool_output_for_flags(output, board, worker_id)
-
-                    # Discover comments or potential leads
-                    if "<!--" in output:
-                        comments = re.findall(r"<!--(.*?)-->", output, re.DOTALL)
-                        for c in comments:
-                            c_clean = c.strip()
-                            if len(c_clean) > 3:
-                                await board.add_task("CODE_AUDIT", f"Analyze suspicious HTML comment: '{c_clean[:120]}'", priority=4)
-                                # Deterministically decode the comment right away —
-                                # a ROT13/base64/hex hint becomes an actionable lead
-                                # without waiting on (or trusting) LLM formatting.
-                                await self._apply_decoded_directives(c_clean, board, worker_id)
-
-                    await board.complete_task(task.task_id, result="Recon executed", discoveries={"endpoints": re.findall(r'href=["\'](/[^"\']+)["\']', output)})
-                    consecutive_errors = 0  # Reset on success
+                        with open(solver_path, "w", encoding="utf-8") as fh:
+                            fh.write(script)
+                    except OSError as werr:
+                        board.record_agent_step(agent_id, note=f"Could not write solver: {werr}")
+                        board.agent_iterations[agent_id] = iters + 1
+                        continue
+                    # Quote the path — the workspace path can contain spaces (e.g.
+                    # .../WEB/EASY/Old Sessions), which otherwise splits into [Errno 2].
+                    cmd = f'python "{solver_path}"'
                 else:
-                    await board.complete_task(task.task_id, result="Command skipped (dedup)")
+                    cmd = self._extract_command(content)
+                    if not cmd:
+                        board.record_agent_step(agent_id, note="No executable command produced this turn")
+                        board.agent_iterations[agent_id] = iters + 1
+                        await board.update_worker_state(agent_id, status="RUNNING",
+                                                        current_task="No command produced; re-planning")
+                        await asyncio.sleep(1.0)
+                        continue
 
-            except Exception as e:
-                consecutive_errors += 1
-                logger.warning(f"[{worker_id}] Error #{consecutive_errors}: {e}")
-                _append_to_challenge_log(board.challenge_id, worker_id, f"Error #{consecutive_errors}: {e}")
-                await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
-                                                current_task=f"Error: {str(e)[:100]}")
-                # Fail the task so it doesn't stay CLAIMED forever
-                if task:
-                    await board.complete_task(task.task_id, result=f"Error: {str(e)[:100]}")
-                await asyncio.sleep(min(3 * consecutive_errors, 15))
-
-    async def _code_crypto_worker(self, worker_id: str, board: SwarmBlackboard, workdir: str):
-        """Worker 2: Code Audit, Deobfuscation & Cryptanalysis (Uses Mistral Codestral)."""
-        logger.info(f"[Swarm Worker] {worker_id} started.")
-        _append_to_challenge_log(board.challenge_id, worker_id, "Worker started")
-        await board.update_worker_state(worker_id, status="RUNNING", current_capability="code_analysis",
-                                        selected_model="Mistral Codestral / xKiro", current_task="Booting code-crypto worker")
-        consecutive_errors = 0
-        MAX_CONSECUTIVE_ERRORS = 5
-        while not board.flag_captured and not board.is_stopped:
-            task = await board.claim_task(worker_id, ["CODE_AUDIT", "CRYPTO_DECODE"])
-            if not task:
-                await board.update_worker_state(worker_id, status="IDLE", current_task="Idle — waiting for tasks")
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"Too many errors ({consecutive_errors}), worker pausing for 30s")
-                    await asyncio.sleep(30)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(2.0)
-                continue
-
-            try:
-                _append_to_challenge_log(board.challenge_id, worker_id, f"Claimed task: {task.description[:100]}")
-                await board.update_worker_state(worker_id, status="ANALYZING", current_task=task.description[:140])
-
-                # Deterministic decode FIRST: if the task carries a captured artifact
-                # (e.g. an HTML comment), decode ROT13/base64/hex and act on any
-                # concrete header/flag now — independent of how the LLM formats output.
-                await self._apply_decoded_directives(task.description, board, worker_id)
-
-                prompt = (
-                    f"You are the Code & Cryptanalysis Specialist in a CTF Swarm.\n"
-                    f"Task: {task.description}\n"
-                    f"Target Headers: {board.extracted_headers}\n"
-                    f"Analyze any obfuscated strings, ROT13, Base64, JWT tokens, or JS scripts. Fully decode them.\n"
-                    f"If you decode or observe a concrete exploit header, output exactly one line: HEADER: <Key>: <Value>\n"
-                    f"The <Value> MUST be the literal, concrete value only — never a placeholder like [payload], <value>, "
-                    f"an IP you are guessing, or an explanatory note in parentheses. If you have no concrete header, omit the HEADER line.\n"
-                    f"If you decode a real flag value, output it as: DECODED_FLAG: <the_actual_flag>\n"
-                    f"IMPORTANT: Do NOT output example, guessed, or placeholder values. Only output values you actually decoded or observed."
-                )
-
-                resp = await model_router.route_request(prompt=prompt, capability="code_analysis", target_model="codestral-latest")
-
-                # Detect ALL_EXHAUSTED / refusal
-                if resp.is_refusal:
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"All providers exhausted: {resp.refusal_reason[:100]}")
-                    consecutive_errors += 1
-                    await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
-                                                    current_task=f"Provider error: {resp.refusal_reason[:80]}")
-                    await board.complete_task(task.task_id, result=f"Provider error: {resp.refusal_reason[:80]}")
-                    await asyncio.sleep(5)
-                    continue
-
-                analysis = resp.content
-
-                _append_to_challenge_log(board.challenge_id, worker_id, f"Analysis ({len(analysis)} chars): {analysis[:300]}")
-
-                # Broadcast AI Decision to UI
                 try:
                     await ws_manager.broadcast({
-                        "event": "AI_DECISION",
-                        "challenge_id": board.challenge_id,
-                        "agent": "SWARM_CODE_CRYPTO",
-                        "goal": task.description,
-                        "capability": "code_analysis",
-                        "result": analysis[:250],
-                        "confidence": 95,
-                        "model": getattr(resp, "model_name", "codestral-latest")
+                        "event": "AI_DECISION", "challenge_id": board.challenge_id, "agent": agent_id,
+                        "goal": f"{board.category} challenge next step", "capability": capability,
+                        "result": cmd[:250], "confidence": 90, "model": model_name,
                     })
                 except Exception:
                     pass
 
-                # Do NOT scan LLM prose with FLAG_REGEX — it produces false positives.
-                # Instead, only check if the model explicitly declared a decoded flag via DECODED_FLAG: prefix.
-                decoded_flag_match = re.search(r"DECODED_FLAG:\s*(\S+)", analysis)
-                if decoded_flag_match:
-                    candidate = decoded_flag_match.group(1).strip()
-                    if FLAG_REGEX.search(candidate):
-                        await board.record_flag_candidate(candidate, worker_id, "llm_decoded")
+                board.agent_iterations[agent_id] = iters + 1
 
-                # A model-suggested header is a *candidate*, not a discovery. Route it
-                # through note_exploit_header, which sanitizes the value, rejects
-                # placeholder prose (e.g. "127.0.0.1; [malicious payload]"), and de-dups
-                # by signature — so a suggestion can never spawn an injection loop.
-                header_match = re.search(r"HEADER:\s*([A-Za-z0-9_-]+)\s*:\s*([^\n\r]+)", analysis, re.IGNORECASE)
-                if header_match:
-                    await board.note_exploit_header(header_match.group(1), header_match.group(2), worker_id)
+                if cmd in board.executed_commands_dedup:
+                    board.record_agent_step(agent_id, command=cmd, note="skipped (already executed by the swarm)")
+                    await asyncio.sleep(0.5)
+                    continue
+                board.executed_commands_dedup.add(cmd)
 
-                await board.update_worker_state(worker_id, status="RUNNING",
-                                                last_result=(analysis[:200] or "Analysis complete"),
-                                                commands_run=board.worker_states.get(worker_id, {}).get("commands_run", 0) + 1)
-                await board.complete_task(task.task_id, result=analysis[:200])
+                _append_to_challenge_log(board.challenge_id, agent_id, f"Executing: {cmd[:200]}")
+                res = await tool_manager.execute_tool("bash", {"command": cmd}, timeout=25,
+                                                      working_directory=workdir, canonical_target=board.target_scope)
+                output = res.stdout or res.stderr or ""
+                if getattr(res, "execution_failure", False):
+                    _append_to_challenge_log(board.challenge_id, agent_id,
+                                             f"Execution failure ({getattr(res, 'failure_category', 'UNKNOWN')}): {res.stderr[:200]}")
+
+                await board.record_tool_execution(agent_id, cmd, res)
+                board.record_agent_step(agent_id, command=cmd, output=output)
+
+                # Local execution failures (Errno 2 / SyntaxError / permission / missing dep)
+                # never reached the target — a broken invocation, not a target response. Don't
+                # let identical retries burn the shared free-tier budget: inject a corrective
+                # note and abort the agent after LOCAL_EXEC_MAX_RETRIES consecutive hits.
+                fail_cat = getattr(res, "failure_category", None)
+                if getattr(res, "execution_failure", False) and fail_cat in LOCAL_EXEC_CATEGORIES:
+                    board.agent_local_fail_streak[agent_id] = board.agent_local_fail_streak.get(agent_id, 0) + 1
+                    streak = board.agent_local_fail_streak[agent_id]
+                    board.record_agent_step(agent_id, note=(
+                        f"LOCAL EXECUTION ERROR ({fail_cat}) — this command never reached the target; "
+                        f"it is a local invocation problem, not a target response. Fix the invocation "
+                        f"(e.g. quote any path with a space: python \"my dir/solve.py\") or try a different "
+                        f"approach. Do NOT re-run the same command."))
+                    max_local = int(getattr(settings, "LOCAL_EXEC_MAX_RETRIES", 2))
+                    if streak >= max_local:
+                        blocker = (f"ABORTING agent after {streak} consecutive local execution failures "
+                                   f"({fail_cat}) — blocked on local tooling; reporting instead of retrying.")
+                        board.record_agent_step(agent_id, note=blocker)
+                        _append_to_challenge_log(board.challenge_id, agent_id, blocker)
+                        await board.update_worker_state(agent_id, status="DONE", current_task=blocker)
+                        if not board.stall_reason:
+                            board.stall_reason = f"An agent was blocked on a local tooling error ({fail_cat})"
+                        break
+                else:
+                    # Command reached the target (or a non-local failure) — reset the streak.
+                    board.agent_local_fail_streak[agent_id] = 0
+
+                await board.update_worker_state(
+                    agent_id, status="RUNNING", last_tool=cmd[:160],
+                    last_result=(output[:200] or f"[Exit {res.exit_code}] no output"),
+                    commands_run=board.worker_states.get(agent_id, {}).get("commands_run", 0) + 1,
+                )
+                _append_to_challenge_log(board.challenge_id, agent_id, f"Output ({len(output)} bytes, exit={res.exit_code}): {output[:300]}")
+
+                try:
+                    await ws_manager.broadcast({
+                        "event": "LOG_OUTPUT", "challenge_id": board.challenge_id, "run_id": board.run_id,
+                        "command": cmd,
+                        "output": output[:3000] if output else f"[Exit Code {res.exit_code}] Execution complete with no output.",
+                        "exit_code": res.exit_code, "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                    })
+                except Exception:
+                    pass
+
+                # Flags/leads come ONLY from real tool output — never from LLM prose.
+                self._check_tool_output_for_flags(output, board, agent_id)
+                self._check_tool_output_for_rejections(output, board, agent_id)
+                await self._apply_decoded_directives(output, board, agent_id)
+                if "<!--" in output:
+                    for c in re.findall(r"<!--(.*?)-->", output, re.DOTALL):
+                        c_clean = c.strip()
+                        if len(c_clean) > 3:
+                            await self._apply_decoded_directives(c_clean, board, agent_id)
+                for ep in re.findall(r'href=["\'](/[^"\']+)["\']', output):
+                    board.discovered_endpoints.add(ep)
+
                 consecutive_errors = 0
+                await board._broadcast_blackboard()
 
             except Exception as e:
                 consecutive_errors += 1
-                logger.warning(f"[{worker_id}] Error #{consecutive_errors}: {e}")
-                _append_to_challenge_log(board.challenge_id, worker_id, f"Error #{consecutive_errors}: {e}")
-                await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
+                logger.warning(f"[{agent_id}] Error #{consecutive_errors}: {e}")
+                _append_to_challenge_log(board.challenge_id, agent_id, f"Error #{consecutive_errors}: {e}")
+                await board.update_worker_state(agent_id, status="IDLE", failures=consecutive_errors,
                                                 current_task=f"Error: {str(e)[:100]}")
-                if task:
-                    await board.complete_task(task.task_id, result=f"Error: {str(e)[:100]}")
                 await asyncio.sleep(min(3 * consecutive_errors, 15))
 
-    async def _exploit_worker(self, worker_id: str, board: SwarmBlackboard, workdir: str):
-        """Worker 3: Exploitation, PWN & Payload Delivery (Uses xKiro Qwen Coder / DeepSeek)."""
-        logger.info(f"[Swarm Worker] {worker_id} started.")
-        _append_to_challenge_log(board.challenge_id, worker_id, "Worker started")
-        await board.update_worker_state(worker_id, status="RUNNING", current_capability="web_testing",
-                                        selected_model="xKiro Qwen Coder / DeepSeek", current_task="Booting exploit worker")
-        consecutive_errors = 0
-        MAX_CONSECUTIVE_ERRORS = 5
-        while not board.flag_captured and not board.is_stopped:
-            task = await board.claim_task(worker_id, ["EXPLOIT", "PWN"])
-            if not task:
-                await board.update_worker_state(worker_id, status="IDLE", current_task="Idle — waiting for tasks")
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"Too many errors ({consecutive_errors}), worker pausing for 30s")
-                    await asyncio.sleep(30)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(2.0)
-                continue
+        await board.update_worker_state(agent_id, status="DONE", current_task="Agent finished")
 
+    # ── HITL checkpoint coordinator (hard pause & wait) ─────────────────────────
+
+    def _make_summarizer(self):
+        """Async callable for the strictly-extractive Gemini narrative pass. Returns
+        None on any failure so the report still renders deterministically."""
+        async def _summarize(prompt: str) -> Optional[str]:
             try:
-                _append_to_challenge_log(board.challenge_id, worker_id, f"Claimed task: {task.description[:100]}")
-                await board.update_worker_state(worker_id, status="ANALYZING", current_task=task.description[:140])
+                resp = await model_router.route_request(
+                    prompt=prompt, capability="general_reasoning", target_model="gemini-3.6-flash")
+                if resp and not resp.is_refusal:
+                    return resp.content
+            except Exception:
+                return None
+            return None
+        return _summarize
 
-                headers_str = " ".join([f"-H '{k}: {v}'" for k, v in board.extracted_headers.items()])
-                prompt = (
-                    f"You are the Exploitation Solver in a CTF Swarm.\n"
-                    f"Target: {board.target_scope}\n"
-                    f"Task: {task.description}\n"
-                    f"Available Headers to inject: {board.extracted_headers}\n"
-                    f"Construct a single curl command or Python solver payload to submit credentials, bypass authentication, and extract the CTF flag.\n"
-                    f"IMPORTANT: Output ONLY the command inside a ```bash code block. It MUST be directly executable — no placeholder tokens like [payload], <value>, or parenthetical notes. Do NOT include example flags or flag format references."
-                )
+    def _wind_down_for_expiry(self, board: "SwarmBlackboard"):
+        """Stop the run cleanly as the platform instance-expiry deadline nears. Agents
+        self-stop on the same deadline (see _agent_worker); this signals run_swarm to
+        finalize with best findings instead of the coordinator hard-waiting on a paste."""
+        board.stall_reason = board.stall_reason or "Platform instance expiry reached"
+        _append_to_challenge_log(board.challenge_id, "checkpoint",
+                                 "Instance expiry within wind-down buffer — stopping run with best findings")
+        board.is_stopped = True
+        board.checkpoint_response_event.set()
 
-                resp = await model_router.route_request(prompt=prompt, capability="web_testing", target_model="xkiro-qwen-coder")
-
-                # Detect ALL_EXHAUSTED / refusal
-                if resp.is_refusal:
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"All providers exhausted: {resp.refusal_reason[:100]}")
-                    consecutive_errors += 1
-                    await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
-                                                    current_task=f"Provider error: {resp.refusal_reason[:80]}")
-                    await board.complete_task(task.task_id, result=f"Provider error: {resp.refusal_reason[:80]}")
-                    await asyncio.sleep(5)
-                    continue
-
-                cmd = self._extract_command(resp.content) or f"curl -s -i {headers_str} {board.target_scope}"
-
-                # If this task carries a concrete decoded/known header, guarantee it
-                # actually rides on the request — even if the model's command omitted
-                # it. This is what forces the winning "X-Dev-Access: yes" onto the wire.
-                h_name = task.metadata.get("header_name")
-                h_val = task.metadata.get("header_value")
-                if h_name and h_val and cmd.strip().startswith("curl") and h_name.lower() not in cmd.lower():
-                    cmd = cmd.replace("curl", f"curl -H '{h_name}: {h_val}'", 1)
-
-                # Broadcast AI Decision to UI
-                try:
-                    await ws_manager.broadcast({
-                        "event": "AI_DECISION",
-                        "challenge_id": board.challenge_id,
-                        "agent": "SWARM_EXPLOIT",
-                        "goal": task.description,
-                        "capability": "web_testing",
-                        "result": cmd,
-                        "confidence": 90,
-                        "model": getattr(resp, "model_name", "xkiro-qwen-coder")
-                    })
-                except Exception:
-                    pass
-
-                if cmd not in board.executed_commands_dedup:
-                    board.executed_commands_dedup.add(cmd)
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"Executing: {cmd[:200]}")
-                    res = await tool_manager.execute_tool("bash", {"command": cmd}, timeout=25, working_directory=workdir)
-                    output = res.stdout or res.stderr or ""
-
-                    # Persist the execution so terminal history survives refreshes/restarts
-                    await board.record_tool_execution(worker_id, cmd, res)
-                    await board.update_worker_state(
-                        worker_id, status="RUNNING", last_tool=cmd[:160],
-                        last_result=(output[:200] or f"[Exit {res.exit_code}] no output"),
-                        commands_run=board.worker_states.get(worker_id, {}).get("commands_run", 0) + 1
-                    )
-
-                    _append_to_challenge_log(board.challenge_id, worker_id, f"Output ({len(output)} bytes, exit={res.exit_code}): {output[:300]}")
-
-                    # Broadcast Terminal Log to UI
-                    try:
-                        await ws_manager.broadcast({
-                            "event": "LOG_OUTPUT",
-                            "challenge_id": board.challenge_id,
-                            "run_id": board.run_id,
-                            "command": cmd,
-                            "output": output[:3000] if output else f"[Exit Code {res.exit_code}] Execution complete with no output.",
-                            "exit_code": res.exit_code,
-                            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S")
-                        })
-                    except Exception:
-                        pass
-
-                    # Only scan TOOL OUTPUT for flags (never LLM prose)
-                    self._check_tool_output_for_flags(output, board, worker_id)
-                    await board.complete_task(task.task_id, result=f"Exploit response code {res.exit_code}")
-                    consecutive_errors = 0
-                else:
-                    await board.complete_task(task.task_id, result="Command skipped (dedup)")
-
-            except Exception as e:
-                consecutive_errors += 1
-                logger.warning(f"[{worker_id}] Error #{consecutive_errors}: {e}")
-                _append_to_challenge_log(board.challenge_id, worker_id, f"Error #{consecutive_errors}: {e}")
-                await board.update_worker_state(worker_id, status="IDLE", failures=consecutive_errors,
-                                                current_task=f"Error: {str(e)[:100]}")
-                if task:
-                    await board.complete_task(task.task_id, result=f"Error: {str(e)[:100]}")
-                await asyncio.sleep(min(3 * consecutive_errors, 15))
-
-    async def _task_refiller(self, board: SwarmBlackboard, workdir: str):
-        """Keep the task pool fed with fresh exploratory tasks while the swarm runs.
-
-        The swarm must never stop on its own — it runs until the flag is captured or
-        the operator pauses / kills it. So the refiller cycles its prompt list
-        indefinitely (round-robin), re-seeding whenever the pool drains. It only adds
-        when there is no pending work, so a productive swarm isn't spammed, and the
-        15s interval + per-worker error backoff keep provider usage gentle during
-        outages instead of hammering.
-        """
-        refill_prompts = [
-            ("RECON", "Probe HTTP methods, headers, cookies, and hidden parameters on all discovered endpoints"),
-            ("CODE_AUDIT", "Analyze response headers, cookies, and any JS/source references for tokens or logic flaws"),
-            ("EXPLOIT", "Attempt auth bypass: default creds, SQLi, SSTI, JWT manipulation, and IDOR parameter fuzzing"),
-            ("RECON", "Enumerate additional paths and file extensions (php, bak, env, git, swagger) on the target"),
-            ("EXPLOIT", "Test for command injection, path traversal, and file read primitives"),
-            ("CODE_AUDIT", "Decode any base64/JWT/hex artifacts observed so far and check for hardcoded secrets"),
-        ]
-        logger.info(f"[SwarmOrchestrator] Task refiller started for challenge {board.challenge_id}")
-        _append_to_challenge_log(board.challenge_id, "refiller", "Task refiller started (runs until flag or operator stop)")
+    async def _checkpoint_coordinator(self, board: "SwarmBlackboard", workdir: str):
+        """Every CHECKPOINT_INTERVAL_SECONDS (or as the instance timer nears expiry,
+        or immediately on a verified flag), hard-pause all agents, emit ONE
+        consolidated report, and wait for the operator's pasted guidance."""
+        _append_to_challenge_log(board.challenge_id, "checkpoint", "Checkpoint coordinator started")
         while not board.flag_captured and not board.is_stopped:
-            await asyncio.sleep(board.refresh_interval)
+            interval = int(getattr(settings, "CHECKPOINT_INTERVAL_SECONDS", 300))
+            buffer = int(getattr(settings, "INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
+            # Too close to instance expiry to run an interactive (operator-paste) checkpoint
+            # — wind down instead of hard-waiting for a paste that can't complete in time.
+            if board.instance_expiry_ts and (board.instance_expiry_ts - time.time()) <= buffer:
+                self._wind_down_for_expiry(board)
+                break
+            if board.instance_expiry_ts:
+                secs_left = board.instance_expiry_ts - time.time()
+                if secs_left > 0:
+                    interval = min(interval, max(10, int(secs_left - buffer)))
+            try:
+                await asyncio.wait_for(board.flag_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
             if board.flag_captured or board.is_stopped:
                 break
-            pending = sum(1 for t in board.task_pool.values() if t.status == "PENDING")
-            if pending == 0:
-                cat, prompt = refill_prompts[board.refill_count % len(refill_prompts)]
-                await board.add_task(cat, prompt, priority=2)
-                board.refill_count += 1
-                _append_to_challenge_log(board.challenge_id, "refiller",
-                                         f"Task pool refill #{board.refill_count}: {prompt[:100]}")
-                logger.info(f"[SwarmOrchestrator] Refill #{board.refill_count} for {board.challenge_id}: {prompt[:60]}")
-                await board._broadcast_blackboard()
+            # Crossed into the expiry buffer while waiting → wind down, don't hard-wait.
+            if board.instance_expiry_ts and (board.instance_expiry_ts - time.time()) <= buffer:
+                self._wind_down_for_expiry(board)
+                break
+            try:
+                await self._run_checkpoint_cycle(board, workdir)
+            except Exception as e:
+                logger.warning(f"[checkpoint] cycle error (non-fatal): {e}")
+                _append_to_challenge_log(board.challenge_id, "checkpoint", f"Cycle error (non-fatal): {e}")
+                board.checkpoint_pause = False
+                board.checkpoint_active = False
+        _append_to_challenge_log(board.challenge_id, "checkpoint", "Checkpoint coordinator stopped")
+
+    async def _run_checkpoint_cycle(self, board: "SwarmBlackboard", workdir: str):
+        cycle_start = board.cycle_window_start_ts
+        board.checkpoint_pause = True
+        board.checkpoint_active = True
+        board.cycle_n += 1
+        board.checkpoint_response_event.clear()
+        board.latest_pasted_response = None
+        _append_to_challenge_log(board.challenge_id, "checkpoint", f"=== Checkpoint cycle {board.cycle_n}: pausing agents ===")
+        # Passive provider-headroom summary (from real response headers; no extra calls).
+        try:
+            from backend.providers.quota_manager import quota_manager as _qm
+            _append_to_challenge_log(board.challenge_id, "checkpoint", f"Provider headroom: {_qm.ratelimit_summary()}")
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)  # brief quiesce so in-flight steps land
+
+        records = board.snapshot_agent_records()
+        start_str = datetime.fromtimestamp(cycle_start, tz=timezone.utc).strftime("%H:%M:%S")
+        end_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        report = await checkpoint_pipeline.build_consolidated_report(
+            challenge_name=board.challenge_name, category=board.category, difficulty=board.difficulty,
+            target=board.target_scope, cycle_n=board.cycle_n, start_time=start_str, end_time=end_str,
+            records=records, summarizer=self._make_summarizer(),
+        )
+        board.last_checkpoint_report = report
+
+        db = SessionLocal()
+        try:
+            db.add(CheckpointModel(
+                run_id=board.run_id,
+                state_snapshot={"kind": "hitl_checkpoint", "cycle_n": board.cycle_n,
+                                "report": report, "agent_ids": list(board.agent_ids)},
+                last_successful_action=f"checkpoint_cycle_{board.cycle_n}",
+                resumable=True,
+            ))
+            run_obj = db.query(RunModel).filter(RunModel.id == board.run_id).first()
+            if run_obj:
+                run_obj.status = "WAITING_FOR_USER"
+            ch_obj = db.query(ChallengeModel).filter(ChallengeModel.id == board.challenge_id).first()
+            if ch_obj:
+                ch_obj.status = "WAITING_FOR_USER"
+            db.commit()
+        except Exception as e:
+            logger.debug(f"[checkpoint] persist skip: {e}")
+        finally:
+            db.close()
+
+        await ws_manager.broadcast({
+            "event": "CHECKPOINT_REACHED", "challenge_id": board.challenge_id, "run_id": board.run_id,
+            "cycle": board.cycle_n, "report": report,
+        })
+        _append_to_challenge_log(board.challenge_id, "checkpoint",
+                                 f"Report emitted for cycle {board.cycle_n}; awaiting operator paste")
+
+        # HARD WAIT for the operator's pasted external-model response.
+        await board.checkpoint_response_event.wait()
+        if board.is_stopped or board.flag_captured:
+            board.checkpoint_pause = False
+            board.checkpoint_active = False
+            return
+
+        pasted = board.latest_pasted_response or ""
+        parsed = checkpoint_pipeline.parse_suggestions(pasted, board.agent_ids)
+        if parsed.parsed:
+            async with board._lock:
+                for aid, directive in parsed.directives.items():
+                    prev = board.agent_directives.get(aid, "")
+                    board.agent_directives[aid] = (prev + "\n\n" + directive).strip() if prev else directive
+            _append_to_challenge_log(board.challenge_id, "checkpoint",
+                                     f"Routed directives to: {', '.join(sorted(parsed.directives.keys()))}"
+                                     + (f" | {parsed.note}" if parsed.note else ""))
+            await ws_manager.broadcast({
+                "event": "CHECKPOINT_RESUMED", "challenge_id": board.challenge_id, "run_id": board.run_id,
+                "cycle": board.cycle_n, "routed": sorted(parsed.directives.keys()),
+                "unknown_labels": parsed.unknown_labels,
+            })
+        else:
+            if parsed.fallback and parsed.fallback_text:
+                async with board._lock:
+                    for aid in board.agent_ids:
+                        prev = board.agent_directives.get(aid, "")
+                        add = "[GENERAL GUIDANCE] " + parsed.fallback_text
+                        board.agent_directives[aid] = (prev + "\n\n" + add).strip() if prev else add
+            _append_to_challenge_log(board.challenge_id, "checkpoint",
+                                     f"UNPARSEABLE paste — {parsed.note} Applied as general guidance to all agents.")
+            await ws_manager.broadcast({
+                "event": "CHECKPOINT_PARSE_ERROR", "challenge_id": board.challenge_id, "run_id": board.run_id,
+                "cycle": board.cycle_n, "note": parsed.note, "applied_as_general": bool(parsed.fallback_text),
+            })
+
+        board.checkpoint_pause = False
+        board.checkpoint_active = False
+        board.latest_pasted_response = None
+        db = SessionLocal()
+        try:
+            run_obj = db.query(RunModel).filter(RunModel.id == board.run_id).first()
+            if run_obj:
+                run_obj.status = "RUNNING"
+            ch_obj = db.query(ChallengeModel).filter(ChallengeModel.id == board.challenge_id).first()
+            if ch_obj:
+                ch_obj.status = "RUNNING"
+            db.commit()
+        except Exception:
+            pass
+        finally:
+            db.close()
+        board.cycle_window_start_ts = time.time()
+        _append_to_challenge_log(board.challenge_id, "checkpoint", f"=== Checkpoint cycle {board.cycle_n}: agents resumed ===")
+
+    async def submit_checkpoint_response(self, challenge_id: str, text: str) -> Dict[str, Any]:
+        """Deliver the operator's pasted external-model response to a waiting swarm.
+        Called by the API. Parsing/injection happens in the coordinator on wake."""
+        for board in list(self.active_swarms.values()):
+            if board.challenge_id == challenge_id and board.checkpoint_active:
+                board.latest_pasted_response = text or ""
+                preview = checkpoint_pipeline.parse_suggestions(text or "", board.agent_ids)
+                board.checkpoint_response_event.set()
+                return {
+                    "accepted": True, "parsed": preview.parsed,
+                    "routed": sorted(preview.directives.keys()),
+                    "fallback": preview.fallback, "unknown_labels": preview.unknown_labels,
+                    "note": preview.note,
+                }
+        return {"accepted": False, "reason": "No active checkpoint is awaiting a response for this challenge."}
 
     def _extract_command(self, text: str) -> Optional[str]:
         if not text:
@@ -1215,6 +1512,17 @@ class SwarmOrchestrator:
             return match.group(1).strip()
         lines = [l.strip() for l in text.strip().split("\n") if l.strip().startswith(("curl", "python", "ffuf", "nmap", "sqlmap"))]
         return lines[0] if lines else None
+
+    def _check_tool_output_for_rejections(self, text: str, board: SwarmBlackboard, worker_id: str):
+        """Detect target rejection signals (e.g., 'User not found', 'Invalid token')."""
+        if not text:
+            return
+        text_lower = text.lower()
+        if "user not found" in text_lower or "unknown user" in text_lower or "no such user" in text_lower or "user does not exist" in text_lower:
+            board.last_target_rejection = "USER_NOT_FOUND"
+            _append_to_challenge_log(board.challenge_id, worker_id, "ℹ Target rejected username ('User not found'). Triggering candidate entity priority refill.")
+        elif "invalid token" in text_lower or "token expired" in text_lower:
+            board.last_target_rejection = "INVALID_TOKEN"
 
     def _check_tool_output_for_flags(self, text: str, board: SwarmBlackboard, worker_id: str):
         """Scan ONLY tool/command output for flag patterns. Never call this on LLM prose."""
@@ -1233,16 +1541,22 @@ class SwarmOrchestrator:
 
     async def _apply_decoded_directives(self, raw: str, board: SwarmBlackboard, worker_id: str) -> bool:
         """Deterministically decode an artifact (HTML comment, task text) and act
-        on any concrete lead WITHOUT depending on the LLM to format its output.
+        on concrete leads (headers, candidate usernames, flags).
 
-        - A header directive (e.g. the decoded 'use header "X-Dev-Access: yes"')
-          is queued as a prioritized injection task via note_exploit_header.
-        - A real flag hidden by an encoding is recorded as a candidate.
-
-        This is the deterministic path that turns the ROT13 comment into the
-        winning move, instead of hoping the model carries the decode through.
-        Returns True if any actionable lead was found.
+        - Caches hash of input to prevent 15x duplicate decode loops on unchanged input.
+        - Harvests candidate usernames and queues targeted exploit tasks.
+        - Extracts header directives (e.g. 'use header "X-Dev-Access: yes"').
         """
+        if not raw or not raw.strip():
+            return False
+
+        import hashlib
+        raw_hash = hashlib.md5(raw.strip().encode("utf-8")).hexdigest()
+        async with board._lock:
+            if raw_hash in board.processed_decode_hashes:
+                return False
+            board.processed_decode_hashes.add(raw_hash)
+
         acted = False
         try:
             for d in _decode_artifacts(raw):
@@ -1254,6 +1568,17 @@ class SwarmOrchestrator:
                     if not FALSE_FLAG_PATTERNS.search(cand):
                         await board.record_flag_candidate(cand, worker_id, "decoded_artifact")
                         acted = True
+
+                # Harvest candidate usernames (e.g. 'NOTE: Jack', 'username: Jack', 'dev: Jack', 'account: Jack')
+                user_matches = re.findall(r"\b(?:user(?:name)?|developer|account|NOTE)\s*[:=\-]\s*['\"]?([A-Za-z0-9_\-\.]{3,24})", decoded, re.IGNORECASE)
+                for u in user_matches:
+                    u_clean = u.strip().strip("'\".,;:()")
+                    if u_clean.lower() not in ["not", "the", "found", "error", "true", "false", "null", "undefined", "header", "temporary", "bypass", "access"]:
+                        if u_clean not in board.candidate_usernames:
+                            board.candidate_usernames.add(u_clean)
+                            _append_to_challenge_log(board.challenge_id, worker_id, f"👤 Candidate username discovered: {u_clean}")
+                            logger.info(f"[SwarmBlackboard] Candidate username discovered by {worker_id}: {u_clean}")
+
                 # Header directives only when the decode explicitly names one.
                 if re.search(r"\bheader\b", decoded, re.IGNORECASE):
                     for hm in _HEADER_HINT_RE.finditer(decoded):

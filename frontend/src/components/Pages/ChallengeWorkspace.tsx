@@ -32,6 +32,8 @@ interface ChallengeWorkspaceProps {
   logs: TerminalLog[];
   findings: Finding[];
   workflowNodes: WorkflowNode[];
+  checkpoint?: { cycle: number; report: string };
+  onSubmitCheckpoint?: (text: string) => Promise<any>;
   onBackToChallenges: () => void;
   onToggleStatus: (id: string) => void;
 }
@@ -45,6 +47,8 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   logs,
   findings,
   workflowNodes,
+  checkpoint,
+  onSubmitCheckpoint,
   onBackToChallenges,
   onToggleStatus
 }) => {
@@ -89,6 +93,44 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   const [selectedWorkflowNode, setSelectedWorkflowNode] = useState<WorkflowNode | null>(activeWorkflowNodes[0]);
   const [copiedReadme, setCopiedReadme] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // ── HITL checkpoint (hard pause & wait) local UI state ──────────────────────
+  const [checkpointPaste, setCheckpointPaste] = useState('');
+  const [checkpointBusy, setCheckpointBusy] = useState(false);
+  const [checkpointResult, setCheckpointResult] = useState<string | null>(null);
+  const [checkpointCopied, setCheckpointCopied] = useState(false);
+
+  const handleCopyCheckpoint = () => {
+    if (!checkpoint) return;
+    try {
+      navigator.clipboard.writeText(checkpoint.report);
+      setCheckpointCopied(true);
+      setTimeout(() => setCheckpointCopied(false), 1500);
+    } catch (e) { /* clipboard blocked — user can select manually */ }
+  };
+
+  const handleSubmitCheckpoint = async () => {
+    if (!onSubmitCheckpoint || !checkpointPaste.trim()) return;
+    setCheckpointBusy(true);
+    setCheckpointResult(null);
+    try {
+      const res = await onSubmitCheckpoint(checkpointPaste);
+      if (res && res.accepted === false) {
+        setCheckpointResult(`Not accepted: ${res.reason || 'no active checkpoint'}`);
+      } else if (res && res.parsed) {
+        setCheckpointResult(`Routed directives to: ${(res.routed || []).join(', ') || '(none)'}${res.unknown_labels && res.unknown_labels.length ? ` | unknown labels: ${res.unknown_labels.join(', ')}` : ''}. Resuming.`);
+        setCheckpointPaste('');
+      } else {
+        setCheckpointResult('No suggestion delimiters found — applied the paste as general guidance to all agents. Resuming.');
+        setCheckpointPaste('');
+      }
+      try { soundEngine.playSuccess(); } catch (e) {}
+    } catch (e: any) {
+      setCheckpointResult(`Failed to submit: ${e?.message || e}`);
+    } finally {
+      setCheckpointBusy(false);
+    }
+  };
 
   const buildDynamicWriteup = () => {
     const evidenceText = evidenceList.map(e => `### [${e.source}] ${e.description}\n\`\`\`text\n${e.content}\n\`\`\``).join('\n\n') || '*No evidence collected yet.*';
@@ -167,6 +209,58 @@ ${evidenceText}
 
   return (
     <div className="space-y-5 font-mono text-slate-100 pb-10">
+      {/* HITL Checkpoint — hard pause & wait (manual copy-paste to a stronger model) */}
+      {checkpoint && (
+        <div className="glass-panel border-2 border-cyber-amber/60 rounded-xl p-5 space-y-3 shadow-[0_0_30px_rgba(245,158,11,0.18)] cyber-corner">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-display font-bold tracking-wider text-cyber-amber uppercase flex items-center space-x-2">
+              <AlertTriangle className="w-4 h-4" />
+              <span>Operator Checkpoint — Cycle {checkpoint.cycle} (run paused)</span>
+            </h3>
+            <button
+              onClick={handleCopyCheckpoint}
+              className="px-3 py-1.5 rounded-lg bg-obsidian-900 border border-cyber-amber/50 text-cyber-amber text-xs font-bold flex items-center space-x-1.5 hover:bg-amber-950/50 transition-all"
+            >
+              {checkpointCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+              <span>{checkpointCopied ? 'COPIED' : 'COPY REPORT'}</span>
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-400 leading-relaxed">
+            All agents are halted. Copy this consolidated report into a stronger external model, then paste its
+            response below. Route directives with <span className="text-cyber-cyan font-bold">--- suggestion: {'{agent_id}'} ---</span> markers.
+          </p>
+          <textarea
+            readOnly
+            value={checkpoint.report}
+            rows={12}
+            className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-3 text-[11px] text-slate-200 font-mono leading-relaxed custom-scrollbar select-all"
+          />
+          <div className="space-y-2">
+            <label className="block text-[11px] text-slate-400 uppercase font-bold">Paste external model response</label>
+            <textarea
+              value={checkpointPaste}
+              onChange={(e) => setCheckpointPaste(e.target.value)}
+              rows={6}
+              placeholder={"--- suggestion: agent_1 ---\n<directive text>\n\n--- suggestion: agent_2 ---\n<directive text>"}
+              className="w-full bg-obsidian-950 border border-cyber-cyan/40 rounded-lg p-3 text-[11px] text-slate-100 font-mono leading-relaxed focus:outline-none focus:border-cyber-cyan custom-scrollbar"
+            />
+          </div>
+          {checkpointResult && (
+            <div className="text-[11px] text-cyber-emerald bg-emerald-950/40 border border-emerald-800/60 rounded-lg p-2.5">{checkpointResult}</div>
+          )}
+          <div className="flex justify-end">
+            <button
+              onClick={handleSubmitCheckpoint}
+              disabled={checkpointBusy || !checkpointPaste.trim()}
+              className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 disabled:opacity-40 disabled:cursor-not-allowed text-obsidian-950 font-display font-bold text-xs uppercase tracking-wider flex items-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all"
+            >
+              <span>{checkpointBusy ? 'APPLYING…' : 'APPLY & RESUME'}</span>
+              <ArrowRight className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Workspace Top Header Bar */}
       <div className="glass-panel border-2 border-cyber-cyan/40 rounded-xl p-5 space-y-4 shadow-[0_0_30px_rgba(0,240,255,0.15)] cyber-corner">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-4">

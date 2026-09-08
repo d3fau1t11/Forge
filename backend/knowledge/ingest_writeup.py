@@ -2,7 +2,7 @@
 Writeup Ingestion Engine for FORGE Playbook Vault
 ==================================================
 Converts raw CTF writeups (markdown / text files) into structured FORGE Playbooks (.yaml).
-Indexes them immediately into the Playbook Vault FTS search index.
+Indexes them immediately into the Playbook Vault FTS search index with sanitization.
 
 Usage:
   py -m backend.knowledge.ingest_writeup path/to/writeup.md --category web --title "SSTI via Jinja"
@@ -11,6 +11,8 @@ Usage:
 import sys
 import os
 import re
+import time
+import hashlib
 import yaml
 import argparse
 import logging
@@ -25,6 +27,52 @@ logger = logging.getLogger("forge.ingest_writeup")
 logging.basicConfig(level=logging.INFO, format="[IngestWriteup] %(message)s")
 
 
+PROMPT_INJECTION_PATTERNS = [
+    r"(?i)ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions",
+    r"(?i)system\s*directive",
+    r"(?i)you\s+are\s+now\s+(?:in|operating|a)",
+    r"(?i)<\|im_start\|>",
+    r"(?i)<SYS>",
+    r"(?i)override\s+safety\s+guidelines",
+    r"(?i)do\s+not\s+follow\s+(?:any\s+)?rules"
+]
+
+
+def sanitize_playbook_content(text: str) -> str:
+    """Strips meta-instructions and adversarial prompt injection vectors from writeup content."""
+    if not text:
+        return ""
+    sanitized = text
+    for pattern in PROMPT_INJECTION_PATTERNS:
+        sanitized = re.sub(pattern, "[FILTERED_DIRECTIVE]", sanitized)
+    return sanitized
+
+
+def infer_expected_outcome_signatures(content: str, category: str) -> List[str]:
+    """Extract intermediate outcome signatures indicating step success from writeup patterns."""
+    outcomes = []
+    content_lower = content.lower()
+
+    if "sqli" in content_lower or "sql injection" in content_lower:
+        outcomes.append(r"(?:SQL syntax|mysql_fetch|sqlite3\.OperationalError|PG::SyntaxError)")
+    if "ssti" in content_lower or "template" in content_lower:
+        outcomes.append(r"(?:uid=\d+|root:x:0:0|\{\{.*\}\})")
+    if "jwt" in content_lower or "bearer" in content_lower:
+        outcomes.append(r"(?:HTTP/1\.[01] 200|Welcome, admin|flag|authenticated)")
+    if "lfi" in content_lower or "file inclusion" in content_lower:
+        outcomes.append(r"root:x:0:0")
+    if "pwn" in content_lower or "bof" in content_lower or "buffer overflow" in content_lower:
+        outcomes.append(r"(?:\[\+\] Opening connection|\[\*\] Switching to interactive mode|Segmentation fault|Core dumped)")
+
+    # Look for explicit success strings in markdown quotes or output blocks
+    for match in re.findall(r"(?:Output|Response|Result):\s*`([^`]+)`", content):
+        clean_m = match.strip()
+        if 3 < len(clean_m) < 40 and not clean_m.startswith("http"):
+            outcomes.append(re.escape(clean_m))
+
+    return list(dict.fromkeys(outcomes))[:4]
+
+
 def parse_writeup_content(content: str, category: str = "web", title: Optional[str] = None, source_type: str = "human", source_url: Optional[str] = None) -> PlaybookSchema:
     # Extract title if not provided
     if not title:
@@ -36,8 +84,6 @@ def parse_writeup_content(content: str, category: str = "web", title: Optional[s
 
     # Generate clean ID
     clean_title = re.sub(r'[^a-zA-Z0-9]+', '-', title.lower()).strip('-')
-    # Append content hash to prevent ID collisions from truncated titles
-    import hashlib
     content_hash = hashlib.md5(content[:500].encode("utf-8", errors="ignore")).hexdigest()[:6]
     clean_id = f"{category.lower()}-{clean_title[:40]}-{content_hash}"
 
@@ -45,12 +91,14 @@ def parse_writeup_content(content: str, category: str = "web", title: Optional[s
     code_blocks = re.findall(r"```(?:python|bash|sh|c|cpp|sql|html)?\n(.*?)```", content, re.DOTALL)
     exploit_template = ""
     if code_blocks:
-        # Pick the largest code block as the exploit template
         exploit_template = max(code_blocks, key=len).strip()
 
-    # Parameterize target URLs and ports if present
+    # Parameterize target URLs and flags
     exploit_template = re.sub(r"https?://[a-zA-Z0-9\.\-]+(?::\d+)?", "{TARGET_URL}", exploit_template)
     exploit_template = re.sub(r"(?:picoCTF|FLAG|CTF|HTB|THM)\{[^\}\s]+\}", "{FLAG}", exploit_template, flags=re.IGNORECASE)
+
+    # Sanitize prompt injection directives from template and notes
+    sanitized_template = sanitize_playbook_content(exploit_template or content[:1000])
 
     # Extract trigger signatures and keywords
     signatures = []
@@ -86,37 +134,41 @@ def parse_writeup_content(content: str, category: str = "web", title: Optional[s
         if phrase in content_lower:
             tags.append(tag)
 
-    # Dedup tags
     tags = list(dict.fromkeys(tags))
 
-    # Extract headers as notes/signatures
+    # Extract headers as signatures
     headers = re.findall(r"^#{1,3}\s+(.+)$", content, re.MULTILINE)
     signatures.extend(headers[:3])
 
     notes = content[:600].strip()
     if source_url:
         notes = f"Source URL: {source_url}\n\n" + notes
+    sanitized_notes = sanitize_playbook_content(notes)
+
+    expected_outcomes = infer_expected_outcome_signatures(content, category)
 
     playbook = PlaybookSchema(
         id=clean_id,
         category=category.lower() if category.lower() in CATEGORIES else "web",
         tags=tags,
         trigger_signatures=signatures,
-        notes=notes,
-        exploit_template=exploit_template or content[:1000],
+        notes=sanitized_notes,
+        exploit_template=sanitized_template,
+        expected_outcome_signatures=expected_outcomes,
         source=source_type,
         confidence_score=1.0,
         times_used=1,
         success_rate=1.0,
-        is_promoted=True
+        is_promoted=True,
+        is_sanitized=True
     )
 
     return playbook
 
 
-import time
 import httpx
 from bs4 import BeautifulSoup
+
 
 def ingest_url(url: str, category: str = "web", title: Optional[str] = None) -> PlaybookSchema:
     """Fetch CTF writeup from web URL (Medium, blog, HackMD), extract text/code/images, and ingest as playbook."""
@@ -131,7 +183,6 @@ def ingest_url(url: str, category: str = "web", title: Optional[str] = None) -> 
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Extract title from HTML tag if not provided
     if not title:
         page_title = soup.find("title")
         if page_title and page_title.string:
@@ -140,10 +191,8 @@ def ingest_url(url: str, category: str = "web", title: Optional[str] = None) -> 
             h1 = soup.find("h1")
             title = h1.text.strip() if h1 else "URL Writeup"
 
-    # Find main article content container
     article = soup.find("article") or soup.find("main") or soup.body
 
-    # Extract images with alt text
     image_refs = []
     if article:
         for img in article.find_all("img"):
@@ -152,7 +201,6 @@ def ingest_url(url: str, category: str = "web", title: Optional[str] = None) -> 
             if src and not src.startswith("data:"):
                 image_refs.append(f"![{alt}]({src})")
 
-    # Extract code blocks from pre/code
     code_snippets = []
     if article:
         for pre in article.find_all(["pre", "code"]):
@@ -160,15 +208,12 @@ def ingest_url(url: str, category: str = "web", title: Optional[str] = None) -> 
             if len(snippet) > 15 and "\n" in snippet:
                 code_snippets.append(f"```\n{snippet}\n```")
 
-    # Convert prose text to plain text
     text_content = ""
     if article:
-        # Remove nav, header, footer
         for elem in article.find_all(["nav", "header", "footer", "script", "style"]):
             elem.decompose()
         text_content = article.get_text(separator="\n", strip=True)
 
-    # Reconstruct combined markdown
     combined_parts = [f"# {title}"]
     if image_refs:
         combined_parts.append("\n### Attached Images / Figures\n" + "\n".join(image_refs[:5]))
@@ -224,7 +269,7 @@ def parse_writeup(file_path: str, category: str = "web", title: Optional[str] = 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest raw CTF writeups into FORGE Playbook Vault")
     parser.add_argument("file", help="Path to raw markdown/text writeup file or URL")
-    parser.add_argument("--category", "-c", default="web", choices=list(CATEGORIES.keys()), help="Challenge category")
+    parser.add_argument("--category", "-c", default="web", choices=CATEGORIES, help="Challenge category")
     parser.add_argument("--title", "-t", default=None, help="Custom title for the playbook")
     parser.add_argument("--url", action="store_true", help="Treat input as URL")
 

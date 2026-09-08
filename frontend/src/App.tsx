@@ -101,6 +101,8 @@ export default function App() {
 
   // Application Data States
   const [challenges, setChallenges] = useState<Challenge[]>(INITIAL_CHALLENGES);
+  // Active HITL checkpoint reports keyed by challenge id (set on CHECKPOINT_REACHED).
+  const [checkpointReports, setCheckpointReports] = useState<Record<string, { cycle: number; report: string }>>({});
   const [targets, setTargets] = useState<Target[]>(INITIAL_TARGETS);
   const [agents, setAgents] = useState<AgentInfo[]>(INITIAL_AGENTS);
   const [tools, setTools] = useState<ToolItem[]>(INITIAL_TOOLS);
@@ -334,6 +336,31 @@ export default function App() {
             setActiveChallenge((prev) =>
               prev && prev.id === data.challenge_id ? { ...prev, status: 'PAUSED' } : prev
             );
+          } else if (data.event === 'CHECKPOINT_REACHED') {
+            // Hard-pause HITL checkpoint: store the consolidated report + flip status.
+            setCheckpointReports((prev) => ({
+              ...prev,
+              [data.challenge_id]: { cycle: data.cycle, report: data.report || '' }
+            }));
+            setChallenges((prev) =>
+              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'WAITING_FOR_USER' } : c))
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id ? { ...prev, status: 'WAITING_FOR_USER' } : prev
+            );
+            try { soundEngine.playWarning(); } catch (e) {}
+          } else if (data.event === 'CHECKPOINT_RESUMED' || data.event === 'CHECKPOINT_PARSE_ERROR') {
+            setCheckpointReports((prev) => {
+              const next = { ...prev };
+              delete next[data.challenge_id];
+              return next;
+            });
+            setChallenges((prev) =>
+              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
+            );
+            setActiveChallenge((prev) =>
+              prev && prev.id === data.challenge_id ? { ...prev, status: 'RUNNING' } : prev
+            );
           } else if (data.event === 'KILL_SWITCH_ACTIVATED') {
             setKillSwitchActive(true);
             setShowModalKillSwitch(true);
@@ -502,6 +529,11 @@ export default function App() {
     workingDirectory?: string;
     platformName?: string;
     requiresRoot?: boolean;
+    flagPattern?: string;
+    maxIterations?: number;
+    maxMinutes?: number;
+    instanceExpiryMinutes?: number;
+    attachedFilePaths?: string[];
   }) => {
     const createdLocally: Challenge = {
       id: `ch-${Date.now()}`,
@@ -544,7 +576,12 @@ export default function App() {
         target_address: newCh.target,
         working_directory: newCh.workingDirectory,
         platform_name: newCh.platformName,
-        requires_root: newCh.requiresRoot
+        requires_root: newCh.requiresRoot,
+        flag_pattern: newCh.flagPattern,
+        max_iterations: newCh.maxIterations,
+        max_minutes: newCh.maxMinutes,
+        instance_expiry_minutes: newCh.instanceExpiryMinutes,
+        attached_file_paths: newCh.attachedFilePaths
       });
       if (resp && resp.id) {
         setChallenges((prev) =>
@@ -764,6 +801,8 @@ export default function App() {
               logs={terminalLogs.filter((l) => !l.challengeId || l.challengeId === activeChallenge.id)}
               findings={findings.filter((f) => !f.challengeId || f.challengeId === activeChallenge.id)}
               workflowNodes={workflowNodes}
+              checkpoint={checkpointReports[activeChallenge.id]}
+              onSubmitCheckpoint={(text: string) => apiService.respondToCheckpoint(activeChallenge.id, text)}
               onBackToChallenges={handleClearActiveChallenge}
               onToggleStatus={handleToggleChallengeStatus}
             />

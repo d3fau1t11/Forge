@@ -15,11 +15,12 @@ import {
 import { Challenge } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
 import { DirectoryBrowserModal } from './DirectoryBrowserModal';
+import { apiService } from '../../services/api';
 
 interface ChallengesProps {
   challenges: Challenge[];
   onSelectChallenge: (challenge: Challenge) => void;
-  onCreateChallenge: (newCh: { name: string; category: any; difficulty: any; target: string; description: string; workingDirectory?: string; platformName?: string; requiresRoot?: boolean }) => void;
+  onCreateChallenge: (newCh: { name: string; category: any; difficulty: any; target: string; description: string; workingDirectory?: string; platformName?: string; requiresRoot?: boolean; flagPattern?: string; maxIterations?: number; maxMinutes?: number; instanceExpiryMinutes?: number; attachedFilePaths?: string[] }) => void;
   onToggleStatus: (id: string) => void;
   onDeleteChallenge?: (id: string) => void;
   onDeleteAllChallenges?: () => void;
@@ -48,6 +49,29 @@ export const Challenges: React.FC<ChallengesProps> = ({
   const [showTargetOverride, setShowTargetOverride] = useState(false);
   const [workingDirectory, setWorkingDirectory] = useState('');
   const [requiresRoot, setRequiresRoot] = useState(false);
+  // Flexible-agent engine config + artifact upload.
+  const [flagPattern, setFlagPattern] = useState('');
+  const [maxIterations, setMaxIterations] = useState<number>(40);
+  const [maxMinutes, setMaxMinutes] = useState<number>(30);
+  const [instanceExpiryMinutes, setInstanceExpiryMinutes] = useState<number>(0);
+  const [uploadedFiles, setUploadedFiles] = useState<{ name: string; path: string; size: number }[]>([]);
+  const [uploading, setUploading] = useState(false);
+
+  const handleFileUpload = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setUploading(true);
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const uploaded = await apiService.uploadArtifact(files[i]);
+        setUploadedFiles((prev) => [...prev, { name: uploaded.filename, path: uploaded.path, size: uploaded.size }]);
+      }
+      soundEngine.playSuccess();
+    } catch (e) {
+      console.warn('Artifact upload failed:', e);
+    } finally {
+      setUploading(false);
+    }
+  };
 
   const extractFolderName = (pathStr: string): string => {
     if (!pathStr) return '';
@@ -100,7 +124,12 @@ export const Challenges: React.FC<ChallengesProps> = ({
       description,
       workingDirectory,
       platformName: platformName.trim() || 'PicoCTF',
-      requiresRoot
+      requiresRoot,
+      flagPattern: flagPattern.trim(),
+      maxIterations,
+      maxMinutes,
+      instanceExpiryMinutes,
+      attachedFilePaths: uploadedFiles.map((f) => f.path)
     });
     setName('');
     setPlatformName('PicoCTF');
@@ -109,6 +138,11 @@ export const Challenges: React.FC<ChallengesProps> = ({
     setShowTargetOverride(false);
     setWorkingDirectory('');
     setRequiresRoot(false);
+    setFlagPattern('');
+    setMaxIterations(40);
+    setMaxMinutes(30);
+    setInstanceExpiryMinutes(0);
+    setUploadedFiles([]);
     setShowModal(false);
   };
 
@@ -503,6 +537,62 @@ export const Challenges: React.FC<ChallengesProps> = ({
                       />
                     </div>
                   )}
+
+                  {/* Agent Budget + Flag Validation (flexible-agent engine) */}
+                  <div className="mt-3 p-3 rounded-lg bg-obsidian-900 border border-slate-800 space-y-3">
+                    <div className="text-[11px] font-bold text-cyber-cyan uppercase">Agent Budget & Flag Validation</div>
+                    <div>
+                      <label className="block text-slate-400 text-[10px] uppercase font-bold mb-1">Expected Flag Format (validation filter only — never a construction target)</label>
+                      <input
+                        type="text"
+                        value={flagPattern}
+                        onChange={(e) => setFlagPattern(e.target.value)}
+                        placeholder="picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}"
+                        className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan"
+                      />
+                    </div>
+                    <div className="grid grid-cols-3 gap-3">
+                      <div>
+                        <label className="block text-slate-400 text-[10px] uppercase font-bold mb-1">Max Iterations</label>
+                        <input type="number" min={1} value={maxIterations} onChange={(e) => setMaxIterations(parseInt(e.target.value) || 0)}
+                          className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan" />
+                      </div>
+                      <div>
+                        <label className="block text-slate-400 text-[10px] uppercase font-bold mb-1">Max Minutes</label>
+                        <input type="number" min={1} value={maxMinutes} onChange={(e) => setMaxMinutes(parseInt(e.target.value) || 0)}
+                          className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan" />
+                      </div>
+                      <div>
+                        <label className="block text-slate-400 text-[10px] uppercase font-bold mb-1">Instance Expiry (min)</label>
+                        <input type="number" min={0} value={instanceExpiryMinutes} onChange={(e) => setInstanceExpiryMinutes(parseInt(e.target.value) || 0)}
+                          className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan" />
+                      </div>
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-normal">Budget bounds each agent (N iterations OR M minutes, whichever first) to protect shared free-tier rate limits. Instance expiry 0 = none.</p>
+                  </div>
+
+                  {/* Downloadable Artifact Upload (byte-safe) */}
+                  <div className="mt-3 p-3 rounded-lg bg-obsidian-900 border border-slate-800 space-y-2">
+                    <label className="block text-[11px] font-bold text-cyber-cyan uppercase">Attach Challenge Files (optional)</label>
+                    <input
+                      type="file"
+                      multiple
+                      onChange={(e) => handleFileUpload(e.target.files)}
+                      className="block w-full text-[11px] text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:text-xs file:font-bold file:bg-cyber-cyan file:text-obsidian-950 hover:file:bg-cyan-300 cursor-pointer"
+                    />
+                    {uploading && <p className="text-[10px] text-cyber-amber">Uploading…</p>}
+                    {uploadedFiles.length > 0 && (
+                      <ul className="text-[10px] text-slate-400 space-y-0.5">
+                        {uploadedFiles.map((f, i) => (
+                          <li key={i} className="flex items-center justify-between">
+                            <span className="truncate max-w-[300px] text-cyber-emerald">{f.name}</span>
+                            <span className="text-slate-500">{f.size} B</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    <p className="text-[10px] text-slate-500">Binary artifacts are handled byte-safely and routed to the binary-analysis workflow automatically.</p>
+                  </div>
 
                   {/* Root / Elevated Privileges Toggle */}
                   <div className="mt-3 p-3 rounded-lg bg-obsidian-900 border border-slate-800 hover:border-cyber-cyan/40 transition-colors flex items-center justify-between">

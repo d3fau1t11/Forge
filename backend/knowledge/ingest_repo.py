@@ -54,6 +54,17 @@ def infer_category_and_tags(relative_path: str, content: str) -> Tuple[str, List
         if clean_part and len(clean_part) > 2 and clean_part not in ["readme", "md", "docs"]:
             tags.append(clean_part)
 
+    # Common security keyword tags
+    common_vuln_keywords = [
+        "ssti", "sqli", "sql", "xss", "rce", "lfi", "rfi", "ssrf", "csrf", "jwt",
+        "idor", "cors", "nosql", "xxe", "deserialization", "prototype-pollution",
+        "jinja2", "flask", "django", "express", "bof", "rop", "heap", "format-string",
+        "rsa", "aes", "ecc", "stego", "ghidra", "pcap", "wireshark"
+    ]
+    for kw in common_vuln_keywords:
+        if kw in path_lower or kw in content_lower:
+            tags.append(kw)
+
     return category, list(dict.fromkeys(tags))
 
 

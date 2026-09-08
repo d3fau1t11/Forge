@@ -2,8 +2,21 @@ import httpx
 import logging
 from typing import Optional, Dict, Any
 from backend.providers.base import BaseProvider, ProviderResponse
+from backend.providers.rate_limits import parse_ratelimit_headers
+from backend.providers.quota_manager import quota_manager
+from backend.config import settings
 
 logger = logging.getLogger("forge.providers")
+
+
+def _max_tokens_floor(model: str) -> int:
+    """Per-model minimum for max_tokens. GLM (z-ai) is a reasoning model: too low a ceiling
+    is spent entirely on hidden reasoning tokens, returning HTTP 200 with empty content.
+    Enforce a floor so a low caller value can't starve visible output."""
+    m = (model or "").lower()
+    if "glm" in m:
+        return int(getattr(settings, "GLM_MIN_MAX_TOKENS", 2048))
+    return 0
 
 class HTTPBaseProvider(BaseProvider):
     def __init__(self, name: str, is_paid: bool, api_key: str, default_model: str, base_url: str, speed_tier: str = "fast"):
@@ -15,7 +28,9 @@ class HTTPBaseProvider(BaseProvider):
     async def is_available(self) -> bool:
         return bool(self.api_key)
 
-    async def _post_json(self, url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+    async def _post_json(self, url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: float = 30.0):
+        """POST and return (json_body, response_headers). Headers are returned so callers
+        can passively read rate-limit metadata; raises on non-200 as before."""
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             res = await client.post(url, headers=headers, json=payload)
             if res.status_code in (401, 403):
@@ -28,7 +43,7 @@ class HTTPBaseProvider(BaseProvider):
                 raise RuntimeError(f"HTTP {res.status_code} Server Error for {self.name}: {res.text[:200]}")
             elif res.status_code != 200:
                 raise RuntimeError(f"HTTP {res.status_code} for {self.name} at {url}: {res.text[:200]}")
-            return res.json()
+            return res.json(), res.headers
 
 class GeminiProvider(HTTPBaseProvider):
     SAFETY_SETTINGS = [
@@ -93,7 +108,7 @@ class GeminiProvider(HTTPBaseProvider):
             url = f"{self.base_url}/{model_to_use}:generateContent?key={active_key}"
 
             try:
-                data = await self._post_json(url, {"Content-Type": "application/json"}, payload)
+                data, _hdrs = await self._post_json(url, {"Content-Type": "application/json"}, payload)
                 candidates = data.get("candidates", [])
                 if not candidates:
                     return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="No candidates returned")
@@ -168,10 +183,13 @@ class OpenAISpecProvider(HTTPBaseProvider):
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": prompt if (prompt and prompt.strip()) else "Hello"})
+        # Enforce a per-model floor so a low caller value can't starve a reasoning model's
+        # visible output (GLM 200-empty). max() keeps any higher caller request intact.
+        requested_max = kwargs.get("max_tokens", 4096)
         payload = {
             "model": model_to_use,
             "messages": messages,
-            "max_tokens": kwargs.get("max_tokens", 4096)
+            "max_tokens": max(int(requested_max), _max_tokens_floor(model_to_use))
         }
 
         max_attempts = max(1, len(self.api_keys))
@@ -187,12 +205,31 @@ class OpenAISpecProvider(HTTPBaseProvider):
                 headers["Authorization"] = f"Bearer {active_key}"
 
             try:
-                data = await self._post_json(url, headers, payload)
+                data, resp_headers = await self._post_json(url, headers, payload)
+                # Passively record rate-limit headroom from this real response (no probes).
+                try:
+                    quota_manager.record_ratelimit_snapshot(
+                        self.name, parse_ratelimit_headers(self.name, resp_headers))
+                except Exception:
+                    pass
                 choices = data.get("choices", [])
                 if not choices:
                     return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="Empty choices")
 
                 text_content = choices[0].get("message", {}).get("content", "")
+                # HTTP 200 with empty content is an execution-level failure disguised as a
+                # valid response (e.g. a reasoning route whose token budget was spent before
+                # any visible output). Treat it as a refusal so the router fails over instead
+                # of returning empty analysis that wastes an agent iteration.
+                if text_content is None or not str(text_content).strip():
+                    finish = (choices[0].get("finish_reason") or "").lower()
+                    logger.warning(f"[{self.name}] Empty completion for model '{model_to_use}' "
+                                   f"(finish_reason={finish or 'unknown'}). Treating as failover.")
+                    return ProviderResponse(
+                        provider_name=self.name, model_name=model_to_use, content="", is_refusal=True,
+                        refusal_reason=f"empty_completion (finish_reason={finish or 'unknown'}; "
+                                       f"possible reasoning-token starvation)",
+                    )
                 usage = data.get("usage", {})
                 return ProviderResponse(
                     provider_name=self.name,
@@ -244,7 +281,7 @@ class AnthropicSpecProvider(HTTPBaseProvider):
             payload["system"] = system_instruction
 
         try:
-            data = await self._post_json(url, headers, payload)
+            data, _hdrs = await self._post_json(url, headers, payload)
             content_blocks = data.get("content", [])
             text_content = ""
             for block in content_blocks:
@@ -285,7 +322,7 @@ class HuggingFaceProvider(HTTPBaseProvider):
         payload = {"inputs": f"{system_instruction or ''}\n\nUser: {prompt}\nAssistant:"}
 
         try:
-            data = await self._post_json(url, headers, payload)
+            data, _hdrs = await self._post_json(url, headers, payload)
             if isinstance(data, list) and len(data) > 0:
                 text_content = data[0].get("generated_text", "")
             elif isinstance(data, dict):
@@ -335,7 +372,7 @@ class CloudflareProvider(HTTPBaseProvider):
         payload = {"messages": messages}
 
         try:
-            data = await self._post_json(url, headers, payload)
+            data, _hdrs = await self._post_json(url, headers, payload)
             result = data.get("result", {})
             text_content = result.get("response", "")
             return ProviderResponse(
