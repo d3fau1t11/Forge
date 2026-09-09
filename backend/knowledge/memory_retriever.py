@@ -62,12 +62,19 @@ class MemoryRetriever:
         query: str = "",
         top_k: int = 6,
         include_failures: bool = True,
+        capabilities: Any = None,
     ) -> List[RetrievedMemory]:
         """Return up to *top_k* ranked memories relevant to the current evidence.
 
         FORGE experience is favoured over external playbooks (roughly 60/40) but the
         split back-fills from whichever source has material, so a strong playbook is
         never starved when there is no experience yet, and vice-versa.
+
+        When a :class:`~backend.agent_runtime.execution_backend.CapabilityReport` is
+        supplied, each memory's score is multiplied by how well its declared execution
+        requirements fit the environment that will actually run commands (§8, §12): an
+        experience needing a Linux-only tool absent here is de-prioritised, never
+        silently dropped, so the operator/agent can still choose to install it.
         """
         top_k = max(1, min(int(top_k or 6), 12))
         cat = self._norm_category(category)
@@ -79,6 +86,14 @@ class MemoryRetriever:
 
         experiences = self._retrieve_experiences(search_query, cat, evidence, tech, exp_budget + pb_budget, include_failures)
         playbooks = self._retrieve_playbooks(search_query, cat, evidence, tech, pb_budget + exp_budget)
+
+        # Environment-fit re-weighting (§8, §12) — applied before source budgeting so
+        # a runnable-here experience can outrank one that needs an unavailable tool.
+        if capabilities is not None:
+            for m in experiences:
+                m.environment_fit = self._env_fit(capabilities, m)
+                m.score = round(m.score * m.environment_fit, 4)
+            experiences.sort(key=lambda m: m.score, reverse=True)
 
         chosen: List[RetrievedMemory] = []
         chosen.extend(experiences[:exp_budget])
@@ -93,6 +108,17 @@ class MemoryRetriever:
 
         chosen.sort(key=lambda m: m.score, reverse=True)
         return chosen[:top_k]
+
+    @staticmethod
+    def _env_fit(capabilities: Any, memory: RetrievedMemory) -> float:
+        """0..1 fit of a memory's declared environment requirements to *capabilities*."""
+        try:
+            env = memory.provenance.get("environment") if memory.provenance else None
+            if not env:
+                return 1.0
+            return capabilities.fit_score(env)
+        except Exception:
+            return 1.0
 
     def _retrieve_experiences(self, query, category, evidence, tech, k, include_failures) -> List[RetrievedMemory]:
         try:
@@ -157,6 +183,11 @@ class MemoryRetriever:
                 "source_challenge_id": r.get("source_challenge_id"),
                 "challenge_name": r.get("challenge_name"),
                 "times_successful": n_succ,
+                "environment": {
+                    "required_os": r.get("required_os", "any"),
+                    "tools": r.get("required_tools", []) or [],
+                    "python_libs": r.get("required_python_libs", []) or [],
+                },
             },
             score=round(base, 4),
         )
@@ -191,7 +222,7 @@ class MemoryRetriever:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def format_for_prompt(memories: List[RetrievedMemory]) -> str:
+    def format_for_prompt(memories: List[RetrievedMemory], capabilities: Any = None) -> str:
         if not memories:
             return ""
         lines = [
@@ -221,6 +252,24 @@ class MemoryRetriever:
                 lines.append(f"  Success indicators: {', '.join(m.success_indicators)}")
             if m.failed_approaches:
                 lines.append(f"  Previously FAILED here (do not blindly repeat): {'; '.join(m.failed_approaches)}")
+            # Environment-awareness note (§12): tell the agent whether this technique's
+            # tooling is actually runnable in the current execution environment.
+            env = (m.provenance or {}).get("environment") or {}
+            req_os = (env.get("required_os") or "any")
+            req_tools = env.get("tools") or []
+            if req_os != "any" or req_tools:
+                note = f"  Environment: requires OS={req_os}"
+                if req_tools:
+                    note += f", tools=[{', '.join(req_tools)}]"
+                if capabilities is not None:
+                    missing = capabilities.missing_tools(req_tools)
+                    if not capabilities.satisfies_os(req_os):
+                        note += f" — NOTE: execution env is {capabilities.os}; may need a {req_os} backend"
+                    elif missing:
+                        note += f" — NOTE: missing here: {', '.join(missing)} (install or adapt)"
+                    else:
+                        note += " — runnable in the current environment"
+                lines.append(note)
             lines.append("")
         return "\n".join(lines).strip()
 
@@ -232,11 +281,13 @@ class MemoryRetriever:
         query: str = "",
         top_k: int = 6,
         include_failures: bool = True,
+        capabilities: Any = None,
     ) -> Tuple[str, List[RetrievedMemory]]:
         """Convenience: retrieve + render. Returns (prompt_section, memories)."""
         memories = self.retrieve(evidence=evidence, category=category, technologies=technologies,
-                                 query=query, top_k=top_k, include_failures=include_failures)
-        return self.format_for_prompt(memories), memories
+                                 query=query, top_k=top_k, include_failures=include_failures,
+                                 capabilities=capabilities)
+        return self.format_for_prompt(memories, capabilities=capabilities), memories
 
 
 memory_retriever = MemoryRetriever()
