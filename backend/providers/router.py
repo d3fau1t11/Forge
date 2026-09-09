@@ -42,7 +42,11 @@ class ModelRouter:
         "reverse_engineering": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "mistral"],
         "fast_reasoning": ["groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "rapidapi_gpt54_mini", "nvidia", "mistral"],
         "general_reasoning": ["groq", "xkiro", "xkiro_planner", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
-        "verification": ["groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "mistral"]
+        "verification": ["groq", "xkiro", "xkiro_mistral", "openrouter", "gemini", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "mistral"],
+        # Writeup / report authoring — Gemini is deliberately FIRST for this task
+        # (strong long-form technical prose); the rest of the free chain is the
+        # fallback if Gemini is unavailable / quota-exhausted.
+        "report_generation": ["gemini", "groq", "xkiro", "xkiro_planner", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"]
     }
 
     # Model to Provider/Transport Mapping

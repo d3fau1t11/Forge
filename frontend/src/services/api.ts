@@ -659,6 +659,33 @@ export class ApiService {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
+
+  // ----------------------------------------------------
+  // WRITEUP / REPORT (AI-authored from real run telemetry)
+  // ----------------------------------------------------
+
+  // Preview: AI-crafted (Gemini-first) technical writeup. NOT saved to disk.
+  // May take several seconds while the provider chain authors it.
+  public async getWriteup(challengeId: string): Promise<{ content: string; generated_by: string }> {
+    try {
+      const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/writeup`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return { content: '', generated_by: '' };
+    }
+  }
+
+  // Persist the operator-confirmed writeup into the challenge working folder.
+  public async saveWriteup(challengeId: string, content: string): Promise<{ status: string; file_path: string }> {
+    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/writeup/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
 }
 
 export const apiService = new ApiService();

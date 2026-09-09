@@ -17,11 +17,13 @@ import {
   Folder,
   ListTodo,
   Clock,
-  Zap
+  Zap,
+  Save
 } from 'lucide-react';
 import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode, AgentInfo } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
 import { computeElapsedSeconds, formatDuration } from '../../utils/timeUtils';
+import { apiService } from '../../services/api';
 
 interface ChallengeWorkspaceProps {
   challenge: Challenge;
@@ -142,37 +144,13 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
     }
   };
 
-  const buildDynamicWriteup = () => {
-    const evidenceText = evidenceList.map(e => `### [${e.source}] ${e.description}\n\`\`\`text\n${e.content}\n\`\`\``).join('\n\n') || '*No evidence collected yet.*';
-    const findingsText = findings.map(f => `- **${f.severity}**: ${f.title} — ${f.description}`).join('\n') || '*No findings logged yet.*';
-    return `# CTF WRITEUP: ${challenge.name} (${challenge.category})
-
-## Challenge Information
-- **Platform / Competition**: ${challenge.platformName || 'FORGE CTF Framework'}
-- **Category**: ${challenge.category}
-- **Target Address**: ${target.currentIp} (${target.hostname})
-- **Working Directory**: \`${challenge.workingDirectory || './workspaces/' + challenge.name.toLowerCase().replace(/\s+/g, '_')}\`
-- **Difficulty**: ${challenge.difficulty}
-- **Status**: ${challenge.status}
-- **Flag**: ${challenge.flag || (challenge.flagStatus === 'CAPTURED' ? 'FORGE{flag_captured}' : 'Pending / Unfound')}
-
-## 1. Reconnaissance & Investigation Strategy
-The FORGE Autonomous Framework conducted targeted analysis on \`${target.currentIp}\`.
-
-## 2. Key Findings & Vulnerability Assessment
-${findingsText}
-
-## 3. Collected Telemetry & Evidence Artifacts
-${evidenceText}
-
-## 4. Flag Extraction & Verification
-- Status: **${challenge.flagStatus}**
-- Flag: \`${challenge.flag || 'In Progress'}\`
-`;
-  };
-
-  // Writeup content state
-  const [writeupText, setWriteupText] = useState<string>(buildDynamicWriteup());
+  // Writeup content state — the writeup is authored on the BACKEND (AI, Gemini-first)
+  // from the real run telemetry; the frontend only previews and (on Save) persists it
+  // into the challenge working folder.
+  const [writeupText, setWriteupText] = useState<string>('');
+  const [writeupBusy, setWriteupBusy] = useState<boolean>(false);
+  const [writeupBy, setWriteupBy] = useState<string>('');
+  const [writeupSaveMsg, setWriteupSaveMsg] = useState<string>('');
 
   const handleTabChange = (tabKey: any) => {
     soundEngine.playClick();
@@ -193,10 +171,42 @@ ${evidenceText}
     setTimeout(() => setCopiedId(null), 2000);
   };
 
-  const handleGenerateWriteup = () => {
-    soundEngine.playSuccess();
-    setWriteupText(buildDynamicWriteup());
+  const handleGenerateWriteup = async () => {
+    soundEngine.playClick();
+    setWriteupBusy(true);
+    setWriteupSaveMsg('');
+    try {
+      const data = await apiService.getWriteup(challenge.id);
+      setWriteupText(data.content || '# No run telemetry yet\n\nRun this challenge first, then generate the writeup.');
+      setWriteupBy(data.generated_by || '');
+      soundEngine.playSuccess();
+    } catch (e) {
+      // keep any existing text on error
+    } finally {
+      setWriteupBusy(false);
+    }
   };
+
+  const handleSaveWriteup = async () => {
+    soundEngine.playClick();
+    try {
+      const res = await apiService.saveWriteup(challenge.id, writeupText);
+      setWriteupSaveMsg(`SAVED → ${res.file_path}`);
+      soundEngine.playSuccess();
+      setTimeout(() => setWriteupSaveMsg(''), 8000);
+    } catch (e: any) {
+      setWriteupSaveMsg(`Save failed: ${e?.message || e}`);
+      setTimeout(() => setWriteupSaveMsg(''), 8000);
+    }
+  };
+
+  // Lazily author the writeup the first time the WRITEUP MD tab is opened.
+  useEffect(() => {
+    if (activeTab === 'readme' && !writeupText && !writeupBusy) {
+      handleGenerateWriteup();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
 
   const currentPlan = challenge.missionPlan || challenge.mission_plan;
 
@@ -895,10 +905,20 @@ ${evidenceText}
             <div className="flex items-center space-x-2">
               <button
                 onClick={handleGenerateWriteup}
-                className="px-3.5 py-2 rounded-lg bg-cyber-cyan/15 hover:bg-cyber-cyan/30 border border-cyber-cyan/60 text-cyber-cyan font-bold flex items-center space-x-1.5 transition-colors"
+                disabled={writeupBusy}
+                className="px-3.5 py-2 rounded-lg bg-cyber-cyan/15 hover:bg-cyber-cyan/30 border border-cyber-cyan/60 text-cyber-cyan font-bold flex items-center space-x-1.5 transition-colors disabled:opacity-50"
               >
-                <Sparkles className="w-4 h-4 text-cyber-cyan" />
-                <span>AUTO WRITEUP</span>
+                <Sparkles className={`w-4 h-4 text-cyber-cyan ${writeupBusy ? 'animate-pulse' : ''}`} />
+                <span>{writeupBusy ? 'CRAFTING…' : 'AUTO WRITEUP'}</span>
+              </button>
+              <button
+                onClick={handleSaveWriteup}
+                disabled={writeupBusy || !writeupText}
+                className="px-3.5 py-2 rounded-lg bg-cyber-emerald/15 hover:bg-cyber-emerald/30 border border-cyber-emerald/60 text-cyber-emerald font-bold flex items-center space-x-1.5 transition-colors disabled:opacity-50"
+                title="Save the writeup markdown into the challenge working folder"
+              >
+                <Save className="w-4 h-4" />
+                <span>SAVE MD</span>
               </button>
               <button
                 onClick={handleCopyWriteup}
@@ -910,9 +930,17 @@ ${evidenceText}
             </div>
           </div>
 
+          {(writeupBy || writeupSaveMsg) && (
+            <div className="flex items-center justify-between text-[11px] font-mono">
+              <span className="text-slate-500">{writeupBy ? `generated by ${writeupBy}` : ''}</span>
+              <span className="text-cyber-emerald">{writeupSaveMsg}</span>
+            </div>
+          )}
+
           <textarea
             rows={16}
             value={writeupText}
+            placeholder={writeupBusy ? 'Crafting writeup with AI…' : 'Click AUTO WRITEUP to generate a technical writeup from the run telemetry.'}
             onChange={(e) => setWriteupText(e.target.value)}
             className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-4 text-slate-200 font-mono text-xs focus:outline-none focus:border-cyber-cyan leading-relaxed shadow-inner"
           ></textarea>

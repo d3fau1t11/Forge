@@ -123,6 +123,11 @@ class TerminalExecuteRequest(BaseModel):
     challenge_id: Optional[str] = None
     working_directory: Optional[str] = None
 
+class SaveWriteupRequest(BaseModel):
+    # The operator-confirmed markdown to persist. When omitted, the backend
+    # regenerates a deterministic writeup from the challenge's real telemetry.
+    content: Optional[str] = None
+
 class EvidenceCreateRequest(BaseModel):
     challenge_id: str
     agent: str
@@ -533,20 +538,44 @@ async def resume_challenge(challenge_id: str, db: Session = Depends(get_db)):
     return {"status": "RUNNING", "id": challenge_id}
 
 @router.post("/challenges/{challenge_id}/report")
-def generate_report(challenge_id: str, db: Session = Depends(get_db)):
-    report_path = report_generator.generate_readme(db, challenge_id)
-    if not report_path:
+async def generate_report(challenge_id: str, db: Session = Depends(get_db)):
+    """Author a detailed technical writeup (Gemini-first AI chain, deterministic
+    fallback) from the real run telemetry and persist it under reports/."""
+    content, generated_by = await report_generator.craft_writeup(db, challenge_id)
+    if not content:
         raise HTTPException(status_code=404, detail="Could not generate report for challenge")
-    
-    report_entry = ReportModel(
-        challenge_id=challenge_id,
-        title=f"README_{challenge_id}.md",
-        file_path=report_path
-    )
-    db.add(report_entry)
-    db.commit()
-    
-    return {"status": "GENERATED", "file_path": report_path}
+    report_path = report_generator.save_writeup(db, challenge_id, content, output_dir="reports")
+    return {"status": "GENERATED", "file_path": report_path,
+            "content": content, "generated_by": generated_by}
+
+
+@router.get("/challenges/{challenge_id}/writeup")
+async def get_writeup(challenge_id: str, db: Session = Depends(get_db)):
+    """AI-crafted technical writeup PREVIEW (not persisted). Gemini is tried first
+    for the report_generation capability; on failure the provider chain falls back
+    to the other agents, then to a deterministic writeup built from the same real
+    telemetry — so this never returns fabricated or empty filler."""
+    content, generated_by = await report_generator.craft_writeup(db, challenge_id)
+    if not content:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    return {"content": content, "generated_by": generated_by}
+
+
+@router.post("/challenges/{challenge_id}/writeup/save")
+def save_writeup_endpoint(challenge_id: str, req: SaveWriteupRequest,
+                          db: Session = Depends(get_db)):
+    """Persist the operator-confirmed writeup markdown into the challenge working
+    folder (path-safety enforced by backend.utils.workspace)."""
+    content = req.content
+    if content is None:
+        ctx = report_generator.gather_context(db, challenge_id)
+        if ctx is None:
+            raise HTTPException(status_code=404, detail="Challenge not found")
+        content = report_generator.render_deterministic(ctx)
+    report_path = report_generator.save_writeup(db, challenge_id, content)
+    if not report_path:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    return {"status": "SAVED", "file_path": report_path}
 
 # ----------------------------------------------------
 # TARGET IDENTITY MANAGEMENT (TARGET IP ≠ IDENTITY)
