@@ -99,6 +99,36 @@ def init_db():
                 conn.commit()
             except Exception:
                 pass
+            # Phase 2: environment-aware skill columns on experiences.
+            for _ddl in (
+                "ALTER TABLE experiences ADD COLUMN required_os VARCHAR DEFAULT 'any'",
+                "ALTER TABLE experiences ADD COLUMN required_tools JSON",
+                "ALTER TABLE experiences ADD COLUMN required_python_libs JSON",
+            ):
+                try:
+                    conn.execute(text(_ddl))
+                    conn.commit()
+                except Exception:
+                    pass
+
+    # Phase 2: warm the in-memory FTS indexes AFTER create_all + migration. The
+    # experience/trajectory singletons build their indexes at import time, which in
+    # the app happens BEFORE this function runs (routes are imported before startup
+    # calls init_db). On a pre-existing DB whose `experiences` table predates the
+    # environment-aware columns, that first import-time index build fails on the
+    # missing column and leaves an EMPTY index for the process lifetime. Reloading
+    # here — once the schema is correct — repairs it. Lazy-imported + non-fatal so
+    # this never affects fresh installs or non-app entrypoints.
+    try:
+        from backend.knowledge.experience_memory import experience_memory as _em
+        _em.reload_index()
+    except Exception:
+        pass
+    try:
+        from backend.agent_runtime.trajectory import trajectory_search as _ts
+        _ts.reload_index()
+    except Exception:
+        pass
 
 def get_db():
     db = SessionLocal()

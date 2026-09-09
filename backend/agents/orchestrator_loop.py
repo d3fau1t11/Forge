@@ -50,6 +50,79 @@ class AutonomousOrchestrator:
         # Tracks pending root/privilege requests: request_id -> asyncio.Event
         self._root_events: dict[str, asyncio.Event] = {}
         self._root_results: dict[str, dict] = {}
+        # ── Agent-runtime facade (Step 5) ──────────────────────────────────────
+        # The new HERMES-inspired runtime owns canonical session/trajectory state.
+        # These are lazily bound so importing the orchestrator never forces the
+        # runtime stack to load; the legacy run_autonomous_loop below is preserved
+        # verbatim for backward compatibility, and delegates only via run_with_runtime.
+        self._runtime = None
+        self._session_manager = None
+
+    # ------------------------------------------------------------------ #
+    # Agent-runtime facade (Step 5). The orchestrator is becoming a thin
+    # compatibility surface over backend.agent_runtime. This entrypoint runs a
+    # mission through the canonical runtime (session + trajectory owned by FORGE,
+    # provider-agnostic) while the legacy run_autonomous_loop remains available.
+    # ------------------------------------------------------------------ #
+
+    def _ensure_runtime(self):
+        if self._runtime is None:
+            from backend.agent_runtime import AgentRuntime, RealToolExecutor, session_manager
+            self._session_manager = session_manager
+            self._runtime = AgentRuntime(tool_executor=RealToolExecutor())
+        return self._runtime
+
+    async def run_with_runtime(
+        self,
+        run_id: str,
+        challenge_id: str,
+        target: str,
+        *,
+        resume_session_id: Optional[str] = None,
+        max_turns: int = 40,
+        max_minutes: int = 0,
+    ):
+        """Run a mission via the new AgentRuntime, returning its RunResult.
+
+        FORGE owns the session/trajectory; a crash is resumable via resume_session_id.
+        Challenge metadata is read from the DB so the runtime prompt matches the swarm's.
+        Non-fatal to the legacy path — callers may still use run_autonomous_loop.
+        """
+        runtime = self._ensure_runtime()
+        sm = self._session_manager
+
+        db = SessionLocal()
+        try:
+            ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+            meta = {
+                "challenge_name": getattr(ch, "name", "") or challenge_id,
+                "category": getattr(ch, "category", "") or "",
+                "difficulty": getattr(ch, "difficulty", "") or "",
+                "platform": getattr(ch, "platform_name", "") or "",
+                "description": getattr(ch, "description", "") or "",
+                "working_directory": getattr(ch, "working_directory", "") or "",
+            }
+        finally:
+            db.close()
+
+        if resume_session_id:
+            session = sm.restore(resume_session_id) or sm.create(
+                challenge_id=challenge_id, run_id=run_id, target_scope=target,
+                agent_id="orchestrator", engine="orchestrator", **{
+                    k: v for k, v in meta.items() if k != "working_directory"})
+        else:
+            session = sm.create(
+                challenge_id=challenge_id, run_id=run_id, target_scope=target,
+                agent_id="orchestrator", engine="orchestrator", **{
+                    k: v for k, v in meta.items() if k != "working_directory"})
+
+        return await runtime.run(
+            session,
+            max_turns=max_turns,
+            max_seconds=(max_minutes * 60) if max_minutes else None,
+            cwd=meta.get("working_directory") or None,
+            cancel_check=lambda: workflow_runner.is_kill_switch_active(run_id),
+        )
 
     def resolve_install_request(self, request_id: str, success: bool):
         """Called by the API route after user approves and pip install completes."""

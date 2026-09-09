@@ -310,6 +310,60 @@ def derive_detection_indicators(tags: List[str]) -> Dict[str, List[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Environment-requirement inference for environment-aware skills (Phase 2, §12)
+# ---------------------------------------------------------------------------
+
+# Tools that only exist / are meaningfully used on Linux CTF hosts. If an
+# experience's commands invoke one of these, the technique implicitly requires a
+# Linux execution environment (FORGE itself may be driving from Windows).
+_LINUX_ONLY_TOOLS = {
+    "nmap", "ffuf", "gobuster", "feroxbuster", "dirsearch", "hydra", "john",
+    "hashcat", "binwalk", "steghide", "exiftool", "tshark", "objdump", "readelf",
+    "gdb", "radare2", "ghidra", "sqlmap", "nikto", "wpscan", "msfvenom", "searchsploit",
+}
+# Tools that are portable (present or trivially installable on Windows too).
+_PORTABLE_TOOLS = {
+    "curl", "wget", "python", "python3", "pip", "pip3", "openssl", "base64",
+    "git", "nc", "ncat", "7z", "unzip", "tar", "ssh",
+}
+# Python solver libs worth recording as a prerequisite when a script imports them.
+_KNOWN_PY_LIBS = {"pwn", "pwntools", "requests", "bs4", "cryptography", "flask_unsign", "scapy", "z3"}
+
+_TOOL_TOKEN_RE = re.compile(r"\b([a-z][a-z0-9_\-]{1,20})\b")
+_PY_IMPORT_RE = re.compile(r"(?:^|\n)\s*(?:import|from)\s+([a-zA-Z0-9_]+)")
+
+
+def infer_environment_requirements(commands: List[str], category: str = "") -> Dict[str, Any]:
+    """Deterministically infer a skill's execution-environment requirements (§12).
+
+    Returns ``{"required_os", "tools", "python_libs"}``. The rule is conservative:
+    an ``"any"`` OS is only downgraded to ``"linux"`` when the commands clearly rely
+    on a Linux-only tool, so a portable technique (curl/python) stays OS-independent
+    and remains runnable from the Windows host itself. This never executes anything.
+    """
+    tools: List[str] = []
+    libs: List[str] = []
+    blob = "\n".join(c for c in (commands or []) if c)
+    low = blob.lower()
+
+    for tok in _TOOL_TOKEN_RE.findall(low):
+        if tok in _LINUX_ONLY_TOOLS or tok in _PORTABLE_TOOLS:
+            if tok not in tools:
+                tools.append(tok)
+    for mod in _PY_IMPORT_RE.findall(blob):
+        m = mod.strip().lower()
+        if m in _KNOWN_PY_LIBS and m not in libs:
+            libs.append(m)
+
+    required_os = "linux" if any(t in _LINUX_ONLY_TOOLS for t in tools) else "any"
+    # pwn/pwntools binary exploitation is effectively Linux-bound.
+    if (category or "").lower() == "pwn" or any(l in ("pwn", "pwntools") for l in libs):
+        required_os = "linux"
+
+    return {"required_os": required_os, "tools": tools[:12], "python_libs": libs[:8]}
+
+
+# ---------------------------------------------------------------------------
 # DTOs
 # ---------------------------------------------------------------------------
 
@@ -358,6 +412,11 @@ class ExperienceRecord(BaseModel):
 
     detection_indicators: Dict[str, Any] = Field(default_factory=dict)
 
+    # Environment requirements for environment-aware skills (Phase 2, Step 12).
+    required_os: str = "any"                                   # any | linux | windows | darwin
+    required_tools: List[str] = Field(default_factory=list)
+    required_python_libs: List[str] = Field(default_factory=list)
+
     outcome: str = "success"
     confidence: float = 0.6
 
@@ -382,4 +441,5 @@ class RetrievedMemory(BaseModel):
     success_rate: float = 1.0
     source: str = "forge_run"
     provenance: Dict[str, Any] = Field(default_factory=dict)
+    environment_fit: float = 1.0   # 0..1 fit to the current execution environment (§12)
     score: float = 0.0

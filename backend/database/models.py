@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from sqlalchemy import (
-    Column, String, Text, Boolean, Float, Integer, DateTime, ForeignKey, JSON
+    Column, String, Text, Boolean, Float, Integer, DateTime, ForeignKey, JSON, Index
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -263,6 +263,14 @@ class ExperienceModel(Base):
     # ── Blue-team knowledge derived from the attack (§11) ─────────────────────
     detection_indicators = Column(JSON, default=dict)
 
+    # ── Environment requirements for environment-aware skills (Phase 2, Step 12) ──
+    # FORGE runs on Windows but executes tooling on Linux; a skill/experience declares
+    # what the EXECUTION environment must provide. "any" ⇒ OS-independent. These are
+    # advisory: the ExecutionBackend decides where a command can actually run.
+    required_os = Column(String, default="any")           # any | linux | windows | darwin
+    required_tools = Column(JSON, default=list)            # ["nmap", "ffuf", ...]
+    required_python_libs = Column(JSON, default=list)      # ["pwntools", "requests", ...]
+
     # ── Outcome + learning-flywheel statistics (§12) ──────────────────────────
     outcome = Column(String, default="success")           # success | failure
     confidence = Column(Float, default=0.6)
@@ -311,3 +319,115 @@ class MemoryUsageModel(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     experience = relationship("ExperienceModel", back_populates="usages")
+
+
+# =============================================================================
+# AGENT RUNTIME — CANONICAL SESSION & TRAJECTORY (HERMES-inspired, FORGE-native)
+# -----------------------------------------------------------------------------
+# Central principle: "THE MODEL IS NOT THE MEMORY." FORGE owns the complete
+# session/trajectory state so any external LLM provider can be swapped at any
+# time (Groq → Gemini → OpenRouter → a future local model) WITHOUT losing the
+# mission. These two tables are the durable source of truth for
+#
+#     command → stdout/stderr → observation → state change → decision → next action
+#
+# for every agent turn, so a run can be resumed after a process crash with zero
+# information loss.
+#
+# Provenance columns (run_id / challenge_id / agent_id) are PLAIN INDEXED strings,
+# NOT ForeignKeys — the same deliberate choice made for the experience layer.
+# A hard FK into `challenges` (cascade "all, delete-orphan") would wipe a
+# session's trajectory the moment an operator deletes the challenge; the runtime
+# must instead OUTLIVE the challenge/run for cross-session recall (§4 FTS5).
+# ToolExecutionModel remains valid and useful, but is no longer the ONLY
+# representation of agent history.
+# =============================================================================
+
+class AgentSessionModel(Base):
+    """One durable mission session. Survives model/provider changes and restarts."""
+    __tablename__ = "agent_sessions"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+
+    # ── Provenance (plain indexed strings, no FK cascade) ──────────────────────
+    run_id = Column(String, index=True, nullable=True)
+    challenge_id = Column(String, index=True, nullable=True)
+    agent_id = Column(String, index=True, default="orchestrator")
+
+    # ── Which engine owns/created this session (facade compatibility) ──────────
+    engine = Column(String, default="runtime")     # runtime | swarm | cli_agent | orchestrator
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+    status = Column(String, default="CREATED", index=True)  # CREATED, RUNNING, PAUSED, COMPLETED, CANCELLED, FAILED
+    phase = Column(String, default="recon")
+    objective = Column(Text, default="")
+    target_scope = Column(String, default="")
+
+    # ── Serialized structured MissionState (the resumable brain) ───────────────
+    state = Column(JSON, default=dict)
+    last_sequence = Column(Integer, default=0)      # highest trajectory sequence persisted
+
+    # ── Current provider/model (informational — a session is provider-agnostic) ─
+    provider_name = Column(String, default="")
+    model_name = Column(String, default="")
+
+    # ── Outcome ─────────────────────────────────────────────────────────────────
+    verified_flag = Column(String, nullable=True)
+    outcome = Column(String, nullable=True)         # success | failure | None (in progress)
+    total_prompt_tokens = Column(Integer, default=0)
+    total_completion_tokens = Column(Integer, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class TrajectoryEventModel(Base):
+    """A single meaningful agent event. Never depend solely on in-memory history."""
+    __tablename__ = "trajectory_events"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+
+    # ── Identity / provenance (all indexed for recall — §3) ────────────────────
+    session_id = Column(String, index=True, nullable=False)
+    run_id = Column(String, index=True, nullable=True)
+    challenge_id = Column(String, index=True, nullable=True)
+    agent_id = Column(String, index=True, default="orchestrator")
+    sequence = Column(Integer, default=0, index=True)
+
+    # ── Event classification (drives the observability stream — §13) ───────────
+    # SESSION_START, PLAN, ACTION, COMMAND, OUTPUT, OBSERVATION, DECISION,
+    # STATE_UPDATE, REPLAN, RECOVERY, FLAG_CANDIDATE, FLAG_VERIFIED, SESSION_COMPLETE
+    event_type = Column(String, default="ACTION", index=True)
+
+    # ── Action ──────────────────────────────────────────────────────────────────
+    action_type = Column(String, default="")        # command | python_script | tool_call | complete
+    command = Column(Text, default="")
+    tool_name = Column(String, default="")
+
+    # ── Complete captured result ─────────────────────────────────────────────────
+    stdout = Column(Text, default="")
+    stderr = Column(Text, default="")
+    exit_code = Column(Integer, nullable=True)
+    duration_ms = Column(Float, default=0.0)
+
+    # ── Derived reasoning artefacts ───────────────────────────────────────────────
+    observation = Column(JSON, default=dict)         # serialized Observation
+    state_delta = Column(JSON, default=dict)         # what changed in MissionState
+    decision_summary = Column(Text, default="")
+    strategy = Column(String, default="")
+    result = Column(String, default="")              # SUCCESS | FAILED | TIMEOUT | REJECTED | ...
+
+    # ── Provider/model + token usage (if available) ───────────────────────────────
+    provider = Column(String, default="")
+    model = Column(String, default="")
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    # Composite index for the hot read path: ordered replay of one session.
+    __table_args__ = (
+        Index("ix_trajectory_session_seq", "session_id", "sequence"),
+        Index("ix_trajectory_challenge_type", "challenge_id", "event_type"),
+    )

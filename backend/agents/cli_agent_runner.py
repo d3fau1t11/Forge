@@ -104,6 +104,23 @@ class CLIAgentRunner:
             challenge.status = "RUNNING"
             db.commit()
 
+            # ── Agent-runtime session (Step 6): FORGE owns the canonical trajectory ──
+            # The external CLI runs stateless (--no-session-persistence); FORGE
+            # persists every important event to its own session/trajectory DB so the
+            # mission state is never hidden inside the CLI's own conversation memory.
+            cli_session = None
+            try:
+                from backend.agent_runtime import session_manager as _sm
+                cli_session = _sm.create(
+                    challenge_id=challenge_id, run_id=run_id, target_scope=target,
+                    agent_id=agent_type, engine="cli_agent",
+                    challenge_name=challenge.name, category=challenge.category,
+                    difficulty=challenge.difficulty, platform=challenge.platform_name or "",
+                    description=challenge.description or "",
+                )
+            except Exception as _sess_err:
+                logger.debug(f"[CLIAgentRunner] runtime session create skipped: {_sess_err}")
+
             # Ensure solver scripts and notes file exist
             notes_file = os.path.join(working_dir, "MISSION.md")
             mission_prompt = (
@@ -283,6 +300,15 @@ class CLIAgentRunner:
 
             # Finalize Challenge State
             full_output = "".join(accumulated_output)
+
+            # ── Persist the CLI turn to FORGE's canonical trajectory (Step 6) ──
+            # Runs before any early return (e.g. 402 fallback) so what the CLI did
+            # is always captured, independent of the external CLI's hidden state.
+            try:
+                self._persist_runtime_trajectory(cli_session, binary_name, full_output,
+                                                 proc.returncode, captured_flag)
+            except Exception as _traj_err:
+                logger.debug(f"[CLIAgentRunner] runtime trajectory persist skipped: {_traj_err}")
             from backend.providers.quota_manager import quota_manager
             is_quota_error = quota_manager.detect_quota_error(full_output) or "402" in full_output or "budget pool" in full_output.lower()
 
@@ -395,5 +421,60 @@ class CLIAgentRunner:
             })
         finally:
             db.close()
+
+    def _persist_runtime_trajectory(self, cli_session, binary_name, full_output, returncode, captured_flag):
+        """Record the stateless CLI turn as FORGE-owned trajectory events (Step 6).
+
+        The external CLI process keeps no session state (--no-session-persistence); this
+        makes FORGE's session/trajectory DB the canonical record: command → output →
+        observation → (verified) flag, with a real FlagVerifier gate on any captured value.
+        """
+        if cli_session is None:
+            return
+        from backend.agent_runtime import (
+            trajectory_store, ObservationEngine, ExecResult, FlagVerifier, FlagSource, FlagStatus,
+            session_manager as _sm,
+        )
+        status = "SUCCESS" if returncode == 0 else "FAILED"
+
+        trajectory_store.record(
+            session_id=cli_session.id, event_type="COMMAND", run_id=cli_session.run_id,
+            challenge_id=cli_session.challenge_id, agent_id=cli_session.agent_id,
+            action_type="cli_agent", command=f"{binary_name} exec (autonomous CLI)",
+            tool_name=binary_name, stdout=full_output or "", exit_code=returncode, result=status,
+        )
+        obs = ObservationEngine().observe(ExecResult(
+            command=f"{binary_name} exec", status=status, stdout=full_output or "", exit_code=returncode))
+        trajectory_store.record(
+            session_id=cli_session.id, event_type="OBSERVATION", run_id=cli_session.run_id,
+            challenge_id=cli_session.challenge_id, agent_id=cli_session.agent_id,
+            observation=obs.to_dict(), decision_summary=obs.summary, result=status)
+        try:
+            cli_session.state.apply_observation(obs)
+        except Exception:
+            pass
+
+        if captured_flag:
+            verdict = FlagVerifier().assess(captured_flag, source=FlagSource.TOOL_OUTPUT,
+                                            action_succeeded=(returncode == 0))
+            if verdict.status == FlagStatus.VERIFIED:
+                cli_session.state.set_verified_flag(verdict.candidate)
+                trajectory_store.record(
+                    session_id=cli_session.id, event_type="FLAG_VERIFIED", run_id=cli_session.run_id,
+                    challenge_id=cli_session.challenge_id, agent_id=cli_session.agent_id,
+                    result="VERIFIED",
+                    decision_summary=f"Flag verified from {binary_name} output: {verdict.candidate}")
+                _sm.complete(cli_session, outcome="success", verified_flag=verdict.candidate)
+                return
+            trajectory_store.record(
+                session_id=cli_session.id, event_type="FLAG_CANDIDATE", run_id=cli_session.run_id,
+                challenge_id=cli_session.challenge_id, agent_id=cli_session.agent_id,
+                result="CANDIDATE", decision_summary=f"Candidate (unverified): {captured_flag}")
+
+        # No verified flag: pause (resumable) on a clean exit, fail on an error exit.
+        if returncode == 0:
+            _sm.pause(cli_session)
+        else:
+            _sm.fail(cli_session, f"{binary_name} exited {returncode} without a verified flag")
 
 cli_agent_runner = CLIAgentRunner()

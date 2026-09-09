@@ -27,6 +27,7 @@ from backend.knowledge.memory_models import (
     Generalizer,
     classify_technique,
     derive_detection_indicators,
+    infer_environment_requirements,
 )
 
 logger = logging.getLogger("forge.experience_extractor")
@@ -151,6 +152,7 @@ class ExperienceExtractor:
         generalized_strategy = self._strategy_for(technique, category)
         prerequisites = self._prereqs_for(tags, technologies)
         detection = derive_detection_indicators(tags)
+        env_reqs = infer_environment_requirements(commands_used, category)
 
         target_characteristics = {
             "category": category,
@@ -193,6 +195,9 @@ class ExperienceExtractor:
             prerequisites=prerequisites,
             generalized_strategy=generalized_strategy,
             detection_indicators=detection,
+            required_os=env_reqs["required_os"],
+            required_tools=env_reqs["tools"],
+            required_python_libs=env_reqs["python_libs"],
             outcome=outcome,
             confidence=confidence,
             attempts=attempts,

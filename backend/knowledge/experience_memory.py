@@ -122,6 +122,7 @@ class ExperienceMemory:
             exp.observed_conditions or "", exp.applicable_conditions or "",
             exp.generalized_strategy or "", " ".join(exp.vulnerabilities or []),
             " ".join(str(x) for x in (exp.success_indicators or [])),
+            " ".join(getattr(exp, "required_tools", None) or []),
         ]))
         with self.db_conn:
             self.db_conn.execute("DELETE FROM experience_fts WHERE id = ?", (exp.id,))
@@ -174,6 +175,9 @@ class ExperienceMemory:
                 prerequisites=record.prerequisites or [],
                 generalized_strategy=record.generalized_strategy or "",
                 detection_indicators=record.detection_indicators or {},
+                required_os=(getattr(record, "required_os", None) or "any"),
+                required_tools=getattr(record, "required_tools", None) or [],
+                required_python_libs=getattr(record, "required_python_libs", None) or [],
                 outcome=record.outcome or "success",
                 confidence=float(record.confidence or 0.6),
                 success_rate=1.0 if (record.outcome or "success") == "success" else 0.0,
@@ -341,6 +345,30 @@ class ExperienceMemory:
         except Exception as e:
             logger.debug(f"[ExperienceMemory] record_retrieval skip: {e}")
             db.rollback()
+        finally:
+            db.close()
+
+    def record_usage_event(self, experience_id: str, event: str, note: str = "",
+                           run_id: Optional[str] = None, challenge_id: Optional[str] = None) -> bool:
+        """Log a fine-grained memory-usage telemetry event WITHOUT changing stats (§14).
+
+        Unlike :meth:`record_feedback` (which moves confidence/success_rate), this only
+        appends a usage row so FORGE can later analyse "which memories actually help?" —
+        e.g. event='contributed' (helped reach the flag) or 'contradicted' (real output
+        disproved the memory's suggestion). Non-fatal.
+        """
+        if not experience_id or not event:
+            return False
+        db = SessionLocal()
+        try:
+            db.add(MemoryUsageModel(experience_id=experience_id, run_id=run_id,
+                                    challenge_id=challenge_id, event=event, note=note[:500]))
+            db.commit()
+            return True
+        except Exception as e:
+            logger.debug(f"[ExperienceMemory] record_usage_event skip: {e}")
+            db.rollback()
+            return False
         finally:
             db.close()
 
@@ -565,6 +593,9 @@ class ExperienceMemory:
             "prerequisites": exp.prerequisites or [],
             "generalized_strategy": exp.generalized_strategy,
             "detection_indicators": exp.detection_indicators or {},
+            "required_os": getattr(exp, "required_os", None) or "any",
+            "required_tools": getattr(exp, "required_tools", None) or [],
+            "required_python_libs": getattr(exp, "required_python_libs", None) or [],
             "outcome": exp.outcome,
             "confidence": round(exp.confidence or 0.0, 3),
             "times_retrieved": exp.times_retrieved or 0,
