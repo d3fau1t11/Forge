@@ -611,6 +611,54 @@ export class ApiService {
       return { grand_total: 0, categories: [] };
     }
   }
+
+  // ----------------------------------------------------
+  // EXPERIENCE MEMORY (FORGE-learned experience layer)
+  // ----------------------------------------------------
+
+  public async getMemory(category?: string, outcome?: string) {
+    try {
+      const params = new URLSearchParams();
+      if (category && category !== 'ALL') params.set('category', category.toLowerCase());
+      if (outcome && outcome !== 'ALL') params.set('outcome', outcome.toLowerCase());
+      const qs = params.toString();
+      const res = await fetch(`${API_BASE_URL}/memory${qs ? `?${qs}` : ''}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return { stats: null, experiences: [] };
+    }
+  }
+
+  public async getMemoryDetail(experienceId: string) {
+    const res = await fetch(`${API_BASE_URL}/memory/${experienceId}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async searchMemory(query: string, category?: string) {
+    try {
+      const res = await fetch(`${API_BASE_URL}/memory/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, category: category && category !== 'ALL' ? category.toLowerCase() : undefined, top_k: 10 })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return { query, count: 0, memories: [] };
+    }
+  }
+
+  public async sendMemoryFeedback(experienceId: string, success: boolean, note?: string) {
+    const res = await fetch(`${API_BASE_URL}/memory/${experienceId}/feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ success, note: note || '' })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
 }
 
 export const apiService = new ApiService();

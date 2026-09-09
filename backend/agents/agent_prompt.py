@@ -72,6 +72,11 @@ class AgentContext:
     # Accumulated history summary (last N turns / shared blackboard state) ──
     history_context: str = ""
 
+    # Retrieved FORGE memory (past experiences + reference playbooks). Built ONCE
+    # per mission by the memory retriever and shared across all agents (§6, §8).
+    # Reference material — never auto-executed commands.
+    memory_context: str = ""
+
 
 # ---------------------------------------------------------------------------
 # System instruction (identity + hard rules)
@@ -122,6 +127,7 @@ Tools available : {tool_inventory}
 Python libs     : {python_libs}
 Working dir     : {working_directory}
 {binary_constraints_section}
+{memory_section}
 === STEP HISTORY (last turns) ===
 {history_context}
 {injected_directive_section}
@@ -189,6 +195,9 @@ def build_user_prompt(ctx: AgentContext) -> str:
     else:
         injected_directive_section = ""
 
+    # Retrieved FORGE memory section (shared across agents; empty when nothing relevant).
+    memory_section = ctx.memory_context.strip() if ctx.memory_context else ""
+
     history = ctx.history_context.strip() if ctx.history_context else "No commands executed yet."
 
     return USER_PROMPT_TEMPLATE.format(
@@ -204,6 +213,7 @@ def build_user_prompt(ctx: AgentContext) -> str:
         python_libs=ctx.python_libs or "requests, cryptography",
         working_directory=ctx.working_directory or ".",
         binary_constraints_section=binary_constraints_section,
+        memory_section=memory_section,
         history_context=history,
         injected_directive_section=injected_directive_section,
     )
@@ -230,6 +240,7 @@ def make_context_from_env(
     artifact_classification: ClassificationResult | None = None,
     history_context: str = "",
     injected_directive: str = "",
+    memory_context: str = "",
 ) -> AgentContext:
     """Build an AgentContext from the dict returned by environment_detector.detect_environment().
 
@@ -270,4 +281,5 @@ def make_context_from_env(
         flag_pattern=flag_pattern,
         history_context=history_context,
         injected_directive=injected_directive,
+        memory_context=memory_context,
     )

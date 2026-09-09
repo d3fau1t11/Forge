@@ -207,3 +207,107 @@ class AuditLogModel(Base):
     approved = Column(Boolean, default=True)
     details = Column(JSON, default=dict)
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
+# =============================================================================
+# EXPERIENCE / MEMORY LAYER
+# -----------------------------------------------------------------------------
+# FORGE's experience-based memory. A completed run is distilled into a reusable,
+# GENERALIZED ExperienceModel (challenge-specific secrets stripped) so future
+# missions can retrieve "we have seen conditions like this before".
+#
+# Provenance note: source_run_id / source_challenge_id are PLAIN string columns
+# (NOT ForeignKeys). Memory must OUTLIVE the challenge/run it came from — a hard
+# FK with the challenges cascade ("all, delete-orphan") would wipe learned
+# experience the moment an operator deletes the original challenge. The link is
+# preserved for traceability (§13) without coupling lifecycle.
+# =============================================================================
+
+class ExperienceModel(Base):
+    __tablename__ = "experiences"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+
+    # ── Provenance (§13) — plain strings, no FK cascade, so memory survives deletion ──
+    source = Column(String, default="forge_run")          # forge_run | external
+    source_run_id = Column(String, nullable=True)
+    source_challenge_id = Column(String, nullable=True)
+    challenge_name = Column(String, default="")
+
+    # ── Classification ────────────────────────────────────────────────────────
+    category = Column(String, default="web")
+    difficulty = Column(String, default="MEDIUM")
+    technique = Column(String, nullable=False)            # generalized technique label
+    tags = Column(JSON, default=list)                     # searchable keywords
+
+    # ── Observed conditions & environment (generalized) ───────────────────────
+    target_characteristics = Column(JSON, default=dict)
+    initial_observations = Column(Text, default="")
+    observed_conditions = Column(Text, default="")        # what FORGE observed
+    applicable_conditions = Column(Text, default="")      # when to consider this
+    discovered_endpoints = Column(JSON, default=list)
+    technologies = Column(JSON, default=list)
+    vulnerabilities = Column(JSON, default=list)
+
+    # ── What worked / what did not (§5) ───────────────────────────────────────
+    successful_techniques = Column(JSON, default=list)
+    failed_techniques = Column(JSON, default=list)        # [{approach, reason}]
+    commands_used = Column(JSON, default=list)            # generalized commands
+    important_tool_outputs = Column(JSON, default=list)   # generalized snippets
+    successful_attack_chain = Column(JSON, default=list)  # ordered steps
+    verification_evidence = Column(Text, default="")
+    success_indicators = Column(JSON, default=list)
+    prerequisites = Column(JSON, default=list)
+    generalized_strategy = Column(Text, default="")
+
+    # ── Blue-team knowledge derived from the attack (§11) ─────────────────────
+    detection_indicators = Column(JSON, default=dict)
+
+    # ── Outcome + learning-flywheel statistics (§12) ──────────────────────────
+    outcome = Column(String, default="success")           # success | failure
+    confidence = Column(Float, default=0.6)
+    times_retrieved = Column(Integer, default=0)
+    times_used = Column(Integer, default=0)
+    times_successful = Column(Integer, default=0)
+    times_failed = Column(Integer, default=0)
+    success_rate = Column(Float, default=1.0)
+    last_used = Column(DateTime, nullable=True)
+
+    # ── Playbook promotion link (§10) ─────────────────────────────────────────
+    promoted_playbook_id = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    attempts = relationship("ExperienceAttemptModel", back_populates="experience", cascade="all, delete-orphan")
+    usages = relationship("MemoryUsageModel", back_populates="experience", cascade="all, delete-orphan")
+
+
+class ExperienceAttemptModel(Base):
+    __tablename__ = "experience_attempts"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    experience_id = Column(String, ForeignKey("experiences.id"), nullable=False)
+    sequence = Column(Integer, default=0)
+    approach = Column(String, default="")                 # generalized approach label
+    technique = Column(String, default="")
+    outcome = Column(String, default="failure")           # success | failure
+    reason = Column(Text, default="")                     # why it failed / how verified
+    evidence = Column(Text, default="")                   # generalized supporting output
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    experience = relationship("ExperienceModel", back_populates="attempts")
+
+
+class MemoryUsageModel(Base):
+    __tablename__ = "memory_usage"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    experience_id = Column(String, ForeignKey("experiences.id"), nullable=False)
+    run_id = Column(String, nullable=True)
+    challenge_id = Column(String, nullable=True)
+    event = Column(String, default="retrieved")           # retrieved | used | success | failure
+    note = Column(Text, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    experience = relationship("ExperienceModel", back_populates="usages")

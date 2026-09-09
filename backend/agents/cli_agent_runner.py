@@ -20,7 +20,9 @@ from backend.providers.cli.base import redact_secrets
 logger = logging.getLogger("forge.cli_agent_runner")
 
 FLAG_REGEX = re.compile(
-    r"(picoCTF\{[^\}\s]+\}|flag\{[^\}\s]+\}|CTF\{[^\}\s]+\}|HTB\{[^\}\s]+\}|FLAG\{[^\}\s]+\}|THM\{[^\}\s]+\})",
+    # Body excludes '{' and '}' so echoed template/format artifacts (e.g. picoCTF{{{flag}}})
+    # never match as a real flag.
+    r"(picoCTF\{[^{}\s]+\}|flag\{[^{}\s]+\}|CTF\{[^{}\s]+\}|HTB\{[^{}\s]+\}|FLAG\{[^{}\s]+\}|THM\{[^{}\s]+\})",
     re.IGNORECASE
 )
 

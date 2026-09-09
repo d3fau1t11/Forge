@@ -1342,6 +1342,20 @@ class SearchPlaybooksRequest(BaseModel):
     top_k: int = 5
     include_unpromoted: bool = False
 
+
+class MemorySearchRequest(BaseModel):
+    query: str = ""
+    category: Optional[str] = None
+    top_k: int = 6
+    include_failures: bool = True
+
+
+class MemoryFeedbackRequest(BaseModel):
+    success: bool
+    note: str = ""
+    run_id: Optional[str] = None
+    challenge_id: Optional[str] = None
+
 @router.post("/playbooks/ingest")
 async def ingest_writeup(req: IngestWriteupRequest):
     """Ingest a CTF writeup (from URL, raw text, or markdown file) into the Playbook Vault."""
@@ -1502,3 +1516,65 @@ def get_knowledge_coverage():
         "grand_total": grand_total,
         "categories": categories_list
     }
+
+
+# =============================================================================
+# EXPERIENCE MEMORY — FORGE-learned experience layer (§14)
+# Read/search/feedback over experiences distilled from real runs. No demo data:
+# every row originates from a verified/failed FORGE execution.
+# =============================================================================
+
+@router.get("/memory")
+def list_memory(limit: int = Query(100), category: Optional[str] = None, outcome: Optional[str] = None):
+    """Memory dashboard payload: aggregate stats + the experience list (§15)."""
+    from backend.knowledge.experience_memory import experience_memory
+    return {
+        "stats": experience_memory.get_stats(),
+        "experiences": experience_memory.list_experiences(limit=limit, category=category, outcome=outcome),
+    }
+
+
+@router.get("/memory/stats")
+def memory_stats():
+    """Aggregate memory counters + leaderboards for the Memory UI header (§15)."""
+    from backend.knowledge.experience_memory import experience_memory
+    return experience_memory.get_stats()
+
+
+@router.post("/memory/search")
+def search_memory(req: MemorySearchRequest):
+    """Unified memory search (FORGE experience + reference playbooks), ranked (§6, §7)."""
+    from backend.knowledge.memory_retriever import memory_retriever
+    memories = memory_retriever.retrieve(
+        query=req.query, category=req.category, top_k=req.top_k, include_failures=req.include_failures
+    )
+    return {"query": req.query, "count": len(memories), "memories": [m.model_dump() for m in memories]}
+
+
+@router.get("/memory/{experience_id}")
+def get_memory(experience_id: str):
+    """Full experience detail incl. attempts + usage log + provenance (§13)."""
+    from backend.knowledge.experience_memory import experience_memory
+    exp = experience_memory.get(experience_id, with_children=True)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experience not found")
+    return exp
+
+
+@router.post("/memory/{experience_id}/feedback")
+def memory_feedback(experience_id: str, req: MemoryFeedbackRequest):
+    """Record whether a retrieved memory actually helped — updates its stats (§12)."""
+    from backend.knowledge.experience_memory import experience_memory
+    ok = experience_memory.record_feedback(
+        experience_id, success=req.success, note=req.note, run_id=req.run_id, challenge_id=req.challenge_id
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Experience not found")
+    return {"status": "RECORDED", "experience_id": experience_id, "success": req.success}
+
+
+@router.get("/experiences")
+def list_experiences_alias(limit: int = Query(100), category: Optional[str] = None, outcome: Optional[str] = None):
+    """Alias returning the raw experience list (§14)."""
+    from backend.knowledge.experience_memory import experience_memory
+    return experience_memory.list_experiences(limit=limit, category=category, outcome=outcome)

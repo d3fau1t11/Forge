@@ -99,6 +99,16 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   const [checkpointBusy, setCheckpointBusy] = useState(false);
   const [checkpointResult, setCheckpointResult] = useState<string | null>(null);
   const [checkpointCopied, setCheckpointCopied] = useState(false);
+  const [flagCopied, setFlagCopied] = useState(false);
+
+  const handleCopyFlag = () => {
+    if (!challenge.flag) return;
+    try {
+      navigator.clipboard.writeText(challenge.flag);
+      setFlagCopied(true);
+      setTimeout(() => setFlagCopied(false), 1500);
+    } catch (e) { /* clipboard blocked — the field is select-all as a fallback */ }
+  };
 
   const handleCopyCheckpoint = () => {
     if (!checkpoint) return;
@@ -209,6 +219,34 @@ ${evidenceText}
 
   return (
     <div className="space-y-5 font-mono text-slate-100 pb-10">
+      {/* Captured flag — prominent, one-click copy (click the field to select-all as a fallback) */}
+      {challenge.flag && (
+        <div className="glass-panel border-2 border-cyber-emerald/60 rounded-xl p-5 space-y-3 shadow-[0_0_30px_rgba(16,185,129,0.2)] cyber-corner">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-display font-bold tracking-wider text-cyber-emerald uppercase flex items-center space-x-2">
+              <Check className="w-4 h-4" />
+              <span>Flag Captured</span>
+            </h3>
+            <button
+              onClick={() => { soundEngine.playClick(); handleCopyFlag(); }}
+              className="px-3 py-1.5 rounded-lg bg-obsidian-900 border border-cyber-emerald/50 text-cyber-emerald text-xs font-bold flex items-center space-x-1.5 hover:bg-emerald-950/50 transition-all"
+            >
+              {flagCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+              <span>{flagCopied ? 'COPIED' : 'COPY FLAG'}</span>
+            </button>
+          </div>
+          <input
+            readOnly
+            value={challenge.flag}
+            onFocus={(e) => e.currentTarget.select()}
+            onClick={(e) => e.currentTarget.select()}
+            aria-label="Captured flag"
+            className="w-full bg-obsidian-950 border border-cyber-emerald/40 rounded-lg px-3 py-3 text-sm md:text-base text-cyber-emerald font-mono tracking-wide select-all focus:outline-none focus:border-cyber-emerald"
+          />
+          <p className="text-[11px] text-slate-500">Click the field to select it all, or use COPY FLAG. Verified from real tool output.</p>
+        </div>
+      )}
+
       {/* HITL Checkpoint — hard pause & wait (manual copy-paste to a stronger model) */}
       {checkpoint && (
         <div className="glass-panel border-2 border-cyber-amber/60 rounded-xl p-5 space-y-3 shadow-[0_0_30px_rgba(245,158,11,0.18)] cyber-corner">

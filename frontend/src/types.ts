@@ -4,10 +4,11 @@ export type NavTab =
   | 'targets' 
   | 'agents' 
   | 'tools' 
-  | 'ai_intelligence' 
+  | 'ai_intelligence'
   | 'playbooks'
   | 'knowledge'
-  | 'evidence' 
+  | 'memory'
+  | 'evidence'
   | 'terminal' 
   | 'providers' 
   | 'system';

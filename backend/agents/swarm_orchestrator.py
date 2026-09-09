@@ -31,6 +31,9 @@ from backend.websocket.manager import ws_manager
 from backend.engine.keep_awake import keep_awake_manager
 from backend.reporting.generator import report_generator
 from backend.knowledge.playbook_vault import playbook_vault
+from backend.knowledge.memory_retriever import memory_retriever
+from backend.knowledge.experience_memory import experience_memory
+from backend.knowledge.experience_extractor import experience_extractor
 from backend.recon.turbo_recon import turbo_recon
 from backend.config import settings
 from backend.environment.detector import environment_detector
@@ -43,9 +46,11 @@ logger = logging.getLogger("forge.swarm")
 
 # Strict flag regex — only known CTF platform prefixes, minimum 4 chars inside braces.
 # Does NOT include a generic catch-all to avoid false positives from CSS, LaTeX, JSON, etc.
+# The body excludes BOTH braces ([^{}]) so a template/format artifact the agent merely
+# ECHOED — e.g. the SSTI payload picoCTF{{{flag}}} — can never match as a real flag.
 FLAG_REGEX = re.compile(
-    r"(?:picoCTF\{[^}]{4,}\}|FLAG\{[^}]{4,}\}|flag\{[^}]{4,}\}|HTB\{[^}]{4,}\}|CTF\{[^}]{4,}\}|"
-    r"DUCTF\{[^}]{4,}\}|corctf\{[^}]{4,}\}|TFCCTF\{[^}]{4,}\}|pwn\.college\{[^}]{4,}\})",
+    r"(?:picoCTF\{[^{}]{4,}\}|FLAG\{[^{}]{4,}\}|flag\{[^{}]{4,}\}|HTB\{[^{}]{4,}\}|CTF\{[^{}]{4,}\}|"
+    r"DUCTF\{[^{}]{4,}\}|corctf\{[^{}]{4,}\}|TFCCTF\{[^{}]{4,}\}|pwn\.college\{[^{}]{4,}\})",
     re.IGNORECASE
 )
 
@@ -244,6 +249,12 @@ class SwarmBlackboard:
         self.processed_decode_hashes: Set[str] = set()
         self.last_target_rejection: Optional[str] = None
         self._lock = asyncio.Lock()
+
+        # ── Experience memory (retrieved ONCE per mission, shared by all agents) ──
+        # memory_context is a compact, reference-only prompt block; retrieved_memory_ids
+        # feeds the post-solve feedback loop (§6, §8, §12).
+        self.memory_context: str = ""
+        self.retrieved_memory_ids: List[str] = []
 
         # ── Unified flexible-agent challenge context ────────────────────────────
         # Populated by run_swarm before agents start; baked into every agent's
@@ -901,6 +912,45 @@ class SwarmOrchestrator:
             except Exception as art_err:
                 logger.warning(f"[SwarmOrchestrator] Artifact acquisition failed (non-fatal): {art_err}")
 
+            # ── Memory retrieval phase (§6) — ONE shared retrieval before agents ──
+            # OBSERVE → RETRIEVE MEMORY: use the seeded recon + challenge context to
+            # pull a few relevant past experiences / reference playbooks into a compact,
+            # reference-only context shared by every agent. Agents still reason and
+            # decide what to run (§8, §22). Fast + non-fatal (§17).
+            try:
+                evidence_parts = [board.description or ""]
+                evidence_parts.extend(sorted(board.discovered_endpoints)[:15])
+                evidence_parts.extend(f"{k}: {v}" for k, v in list(board.extracted_headers.items())[:12])
+                if board.artifact_classification is not None:
+                    evidence_parts.append(f"binary artifact {board.artifact_classification.artifact_type}")
+                evidence_text = "\n".join(p for p in evidence_parts if p)
+                technologies = experience_extractor._detect_technologies(evidence_text)
+                mem_context, memories = memory_retriever.retrieve_and_format(
+                    evidence=evidence_text,
+                    category=board.category,
+                    technologies=technologies,
+                    query=f"{board.category} {board.challenge_name}",
+                    top_k=int(getattr(settings, "MEMORY_RETRIEVAL_TOP_K", 6) or 6),
+                )
+                board.memory_context = mem_context
+                board.retrieved_memory_ids = [m.id for m in memories if m.kind == "experience" and m.id]
+                if memories:
+                    experience_memory.record_retrieval(board.retrieved_memory_ids, run_id, challenge_id)
+                    _append_to_challenge_log(
+                        challenge_id, "orchestrator",
+                        f"[MEMORY] Retrieved {len(memories)} relevant memories "
+                        f"({len(board.retrieved_memory_ids)} FORGE experiences) for shared agent context")
+                    await ws_manager.broadcast({
+                        "event": "MEMORY_RETRIEVED", "challenge_id": challenge_id, "run_id": run_id,
+                        "count": len(memories), "experiences": len(board.retrieved_memory_ids),
+                        "techniques": [m.technique for m in memories][:8],
+                    })
+                else:
+                    _append_to_challenge_log(challenge_id, "orchestrator",
+                                             "[MEMORY] No relevant prior experience found (cold start)")
+            except Exception as mem_err:
+                logger.warning(f"[SwarmOrchestrator] Memory retrieval failed (non-fatal): {mem_err}")
+
             # ── Spawn N general-purpose agents (config-driven; not roles) ──────────
             pool_size = self._resolve_pool_size(board.env_info)
             board.agent_ids = [f"agent_{i+1}" for i in range(pool_size)]
@@ -968,6 +1018,9 @@ class SwarmOrchestrator:
                     "run_id": run_id,
                     "flag": board.flag_captured
                 })
+
+                # LEARN → STORE: distill this solve into generalized experience (§3, §19).
+                await self._learn_from_run(board, outcome="success")
             elif board.pause_requested:
                 # Operator paused — persist a resume snapshot and finalize as PAUSED
                 # (resumable), never FAILED. Progress and blackboard state are kept.
@@ -1087,6 +1140,7 @@ class SwarmOrchestrator:
             artifact_classification=board.artifact_classification,
             history_context=board.build_history_context(agent_id),
             injected_directive=board.agent_directives.get(agent_id, ""),
+            memory_context=board.memory_context,
         )
 
     async def _agent_worker(self, agent_id: str, board: "SwarmBlackboard", workdir: str, capability: str):
@@ -1469,6 +1523,21 @@ class SwarmOrchestrator:
                 "cycle": board.cycle_n, "note": parsed.note, "applied_as_general": bool(parsed.fallback_text),
             })
 
+        # Refresh each agent's budget for the new cycle. The operator just re-authorized
+        # continuation at the checkpoint, so directives get a fresh iteration/minute window
+        # instead of dying instantly on a budget that was already spent before the pause
+        # (the checkpoint-interval == budget trap). The dedup set is deliberately NOT reset,
+        # so agents still never re-run an identical command.
+        now_ts = time.time()
+        for aid in board.agent_ids:
+            board.agent_started_ts[aid] = now_ts
+            board.agent_paused_seconds[aid] = 0.0
+            board.agent_iterations[aid] = 0
+            board.agent_local_fail_streak[aid] = 0
+        _append_to_challenge_log(
+            board.challenge_id, "checkpoint",
+            f"Budget refreshed for {len(board.agent_ids)} agents on resume (fresh cycle window)")
+
         board.checkpoint_pause = False
         board.checkpoint_active = False
         board.latest_pasted_response = None
@@ -1587,6 +1656,45 @@ class SwarmOrchestrator:
         except Exception as e:
             logger.debug(f"[{worker_id}] decode-directives skip: {e}")
         return acted
+
+    async def _learn_from_run(self, board: "SwarmBlackboard", outcome: str = "success"):
+        """LEARN → STORE (§3, §5, §12, §19).
+
+        Distil the finished run into a single GENERALIZED experience, store it, and
+        run the feedback loop for any memories that were retrieved this mission. The
+        experience layer is the one learning entry point; a proven experience is
+        promoted into the Playbook Vault by ExperienceMemory itself (§10) rather than
+        writing a second, separate playbook here. Deterministic + non-fatal — a
+        learning failure can never break run completion."""
+        try:
+            flag = board.flag_captured or ""
+            record = experience_extractor.extract_from_board(board, flag=flag, outcome=outcome)
+            exp_id = experience_memory.store(record)
+            if exp_id:
+                _append_to_challenge_log(
+                    board.challenge_id, "orchestrator",
+                    f"[MEMORY] Learned experience {exp_id}: '{record.technique}' "
+                    f"({len(record.successful_attack_chain)}-step chain, "
+                    f"{len(record.failed_techniques)} failed approaches recorded)")
+                try:
+                    await ws_manager.broadcast({
+                        "event": "MEMORY_LEARNED", "challenge_id": board.challenge_id,
+                        "run_id": board.run_id, "experience_id": exp_id,
+                        "technique": record.technique, "outcome": outcome,
+                    })
+                except Exception:
+                    pass
+            # Feedback: memories retrieved during a SOLVED run get positive reinforcement (§12).
+            if outcome == "success":
+                for mid in board.retrieved_memory_ids:
+                    try:
+                        experience_memory.record_feedback(
+                            mid, success=True, note="Retrieved during a solved run",
+                            run_id=board.run_id, challenge_id=board.challenge_id)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"[SwarmOrchestrator] Experience learning failed (non-fatal): {e}")
 
 # Global Singleton
 swarm_orchestrator = SwarmOrchestrator()

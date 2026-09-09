@@ -35,6 +35,7 @@ import { Providers } from './components/Pages/Providers';
 import { SystemView } from './components/Pages/SystemView';
 import { ChallengeWorkspace } from './components/Pages/ChallengeWorkspace';
 import { KnowledgeCoverage } from './components/Pages/KnowledgeCoverage';
+import { ExperienceMemory } from './components/Pages/ExperienceMemory';
 import { apiService } from './services/api';
 import { AlertTriangle, X } from 'lucide-react';
 import { soundEngine } from './utils/soundEngine';
@@ -861,6 +862,10 @@ export default function App() {
 
               {activeTab === 'knowledge' && (
                 <KnowledgeCoverage refreshTrigger={knowledgeRefreshTrigger} />
+              )}
+
+              {activeTab === 'memory' && (
+                <ExperienceMemory />
               )}
 
               {activeTab === 'evidence' && (
