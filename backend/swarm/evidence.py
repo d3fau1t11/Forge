@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from backend.swarm import events
 from backend.swarm.dedup import normalize_command, normalize_text
+from backend.swarm.reasoning import Reliability, classify_reliability
 from backend.swarm.roles import AgentRole, ROLE_PROFILES
 
 logger = logging.getLogger("forge.swarm.evidence")
@@ -59,11 +60,26 @@ class Evidence:
     related_endpoint: str = ""
     related_technology: str = ""
     related_vulnerability: str = ""
+    # Phase 5 §6 — how trustworthy this discovery is. Auto-classified from source /
+    # type / confidence / tags when not set explicitly. Not persisted as a column
+    # (it is deterministically re-derivable), so no schema migration is required.
+    reliability: str = ""
     # provenance (set by the bus)
     run_id: Optional[str] = None
     challenge_id: Optional[str] = None
     id: str = ""
     timestamp: str = ""
+
+    def __post_init__(self):
+        if not self.reliability:
+            self.reliability = classify_reliability(
+                source=self.source, evidence_type=self.evidence_type,
+                confidence=self.confidence, tags=self.tags).value
+
+    @property
+    def is_strong(self) -> bool:
+        """True for DIRECT/DERIVED evidence — strong enough to become a fact (§5, §6)."""
+        return self.reliability in (Reliability.DIRECT.value, Reliability.DERIVED.value)
 
     def signature(self) -> str:
         """Stable dedup key: type + normalized identifying content."""

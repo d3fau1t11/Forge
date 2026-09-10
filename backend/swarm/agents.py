@@ -62,6 +62,14 @@ class AgentResult:
     failure_category: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Phase 5 §23 — structured, machine-actionable reasoning output. Harvested from the
+    # agent's final state so the supervisor can integrate it without parsing prose.
+    observations: List[str] = field(default_factory=list)
+    facts: List[str] = field(default_factory=list)
+    hypotheses: List[str] = field(default_factory=list)
+    blockers: List[str] = field(default_factory=list)
+    confidence: float = 0.5
+    tool_executions: int = 0
 
     @property
     def succeeded(self) -> bool:
@@ -150,12 +158,26 @@ class SpecialistAgent:
         evidence = self._harvest_evidence(final, task, seeded)
         failure_category = self._derive_failure_category(final) if status != "COMPLETED" else ""
 
+        # Phase 5 §23 — structured reasoning fields harvested deterministically from the
+        # agent's final state (never parsed from prose).
+        fstate = final.state
+        observations = ([fstate.last_meaningful_observation]
+                        if getattr(fstate, "last_meaningful_observation", "") else [])
+        facts = [e.title for e in evidence
+                 if e.evidence_type in ("service", "technology", "endpoint", "credential",
+                                        "vulnerability") and e.is_strong]
+        hypotheses = list(getattr(fstate, "current_hypotheses", []) or [])[:8]
+        blockers = [failure_category] if failure_category else []
+
         return AgentResult(
             task_id=task.id, role=self.role.value, status=status, session_id=sess.id,
             verified_flag=verified_flag, flag_candidates=flag_candidates, evidence=evidence,
             reason=reason, failure_category=failure_category,
             prompt_tokens=getattr(final, "total_prompt_tokens", 0),
             completion_tokens=getattr(final, "total_completion_tokens", 0),
+            observations=observations, facts=facts, hypotheses=hypotheses, blockers=blockers,
+            confidence=(0.9 if status == "COMPLETED" else 0.4),
+            tool_executions=len(getattr(fstate, "commands_attempted", []) or []),
         )
 
     # ------------------------------------------------------------------ #

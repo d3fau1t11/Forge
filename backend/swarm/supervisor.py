@@ -12,13 +12,19 @@ The supervisor does NOT perform tool actions itself — it delegates by producin
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Any, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 from backend.swarm.tasks import Task, TaskStatus
 from backend.swarm.roles import (
     AgentRole, ROLE_PROFILES, profile, roles_for_category, roles_activated_by,
 )
+from backend.swarm.reasoning import (
+    CandidateAction, FailureClass, RecoveryHint, classify_failure as _classify_failure_class,
+    recovery_hint_for,
+)
+from backend.swarm.scoring import ActionScorer, mission_uncertainty
+from backend.swarm.candidates import CandidateGenerator
 
 _VERSION_RE = re.compile(r"\d+\.\d+")
 # A "networked" target looks like a URL or host:port / IP — recon (nmap/http) helps.
@@ -34,6 +40,35 @@ class RecoveryDecision:
     reason: str
     new_role: Optional[str] = None
     objective: Optional[str] = None
+
+
+@dataclass
+class ReasoningDecision:
+    """The Supervisor's answer to "what should happen next, and why?" (§24, §37).
+
+    Fully inspectable: it carries the selected action, the ranked alternatives it beat,
+    the plain-language reason, and the uncertainty/mode that shaped the choice — so the
+    decision can be logged to the trajectory and shown in reports.
+    """
+
+    selected: Optional[CandidateAction] = None
+    ranked: List[CandidateAction] = field(default_factory=list)
+    reason: str = ""
+    uncertainty: float = 1.0
+    mode: str = "explore"           # "explore" (reduce uncertainty) | "exploit" (act on evidence)
+    considered: int = 0
+
+    @property
+    def has_action(self) -> bool:
+        return self.selected is not None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "selected": self.selected.to_dict() if self.selected else None,
+            "ranked": [c.to_dict() for c in self.ranked],
+            "reason": self.reason, "uncertainty": self.uncertainty,
+            "mode": self.mode, "considered": self.considered,
+        }
 
 
 class Supervisor:
@@ -218,6 +253,101 @@ class Supervisor:
 
     def mission_complete(self, mission_state: Any) -> bool:
         return bool(getattr(mission_state, "verified_flag", None))
+
+    # ------------------------------------------------------------------ #
+    # Phase 5 §10-13, §24 — the central "what should we try next?" decision
+    # ------------------------------------------------------------------ #
+
+    def reason(
+        self,
+        mission_state: Any,
+        *,
+        recent_evidence: Optional[List[Any]] = None,
+        scorer: Optional[ActionScorer] = None,
+        generator: Optional[CandidateGenerator] = None,
+        attempted_signatures: Optional[List[str]] = None,
+        available_capabilities: Optional[List[str]] = None,
+        blocked_capabilities: Optional[List[str]] = None,
+        budget_pressure: float = 0.0,
+        use_memory: bool = True,
+    ) -> ReasoningDecision:
+        """Decide the single best next action given everything currently known (§24).
+
+        OBSERVE (mission_state + recent_evidence) → REASON (generate candidates, score
+        them, balance exploration/exploitation) → return the top action with its full
+        ranked alternatives and a plain reason. Pure: no side effects except stashing
+        the ranked candidates on the mission_state for observability (§37).
+        """
+        scorer = scorer or ActionScorer()
+        generator = generator or CandidateGenerator()
+
+        candidates = generator.generate(mission_state, recent_evidence=recent_evidence,
+                                         use_memory=use_memory)
+        # §8/§21 — drop candidates that cannot succeed as specified:
+        #   * one needing a capability already proven unavailable (do not re-propose it —
+        #     the Binary Digits/OCR case: recognise it once, then stop repeating), and
+        #   * one whose action was already attempted/failed, UNLESS fresh evidence
+        #     justifies a retry (a capability-blocked action is never "justified").
+        attempted = set(attempted_signatures or [])
+        failed = set(getattr(mission_state, "action_signatures", []) or [])
+        blocked = {c.lower() for c in (blocked_capabilities or [])}
+        prefiltered = []
+        for c in candidates:
+            if c.capability and c.capability.lower() in blocked:
+                continue
+            already = c.signature in attempted or c.signature in failed
+            evidence_backed = c.source in ("evidence",) or c.evidence_support >= 0.7
+            if already and not evidence_backed:
+                continue
+            prefiltered.append(c)
+        candidates = prefiltered or candidates   # never end up with nothing to consider
+
+        uncertainty = mission_uncertainty(mission_state)
+        ranked = scorer.rank(
+            candidates,
+            attempted_signatures=attempted | failed,
+            available_capabilities=available_capabilities,
+            blocked_capabilities=blocked_capabilities,
+            uncertainty=uncertainty,
+        )
+
+        # §27 — under budget pressure, drop the lowest-value tail so we only spend the
+        # remaining mission on high-value actions.
+        if budget_pressure >= 0.8 and len(ranked) > 2:
+            ranked = ranked[: max(2, len(ranked) // 2)]
+
+        try:
+            if hasattr(mission_state, "set_candidate_actions"):
+                mission_state.set_candidate_actions(ranked)
+        except Exception:
+            pass
+
+        selected = ranked[0] if ranked else None
+        mode = "exploit" if uncertainty < 0.5 else "explore"
+        reason = ""
+        if selected:
+            reason = (f"Selected '{selected.action_type}' (score {selected.score:.2f}, "
+                      f"mode={mode}, uncertainty={uncertainty:.2f}): {selected.rationale}")
+        return ReasoningDecision(selected=selected, ranked=ranked, reason=reason,
+                                 uncertainty=uncertainty, mode=mode, considered=len(candidates))
+
+    def select_next_action(self, mission_state: Any, **kwargs: Any) -> Optional[CandidateAction]:
+        """Convenience: just the winning candidate (or None)."""
+        return self.reason(mission_state, **kwargs).selected
+
+    # ------------------------------------------------------------------ #
+    # Phase 5 §14 — richer failure classification (the string API above is kept)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def classify_failure_detailed(result: Any) -> FailureClass:
+        """Return the Phase 5 :class:`FailureClass` taxonomy for a result (§14)."""
+        return _classify_failure_class(result)
+
+    @staticmethod
+    def recovery_hint(result: Any) -> RecoveryHint:
+        """The advisory recovery strategy a failure suggests (§14)."""
+        return recovery_hint_for(_classify_failure_class(result))
 
     # ------------------------------------------------------------------ #
 

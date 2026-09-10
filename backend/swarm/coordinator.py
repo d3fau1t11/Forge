@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +39,15 @@ from backend.swarm.roles import AgentRole
 from backend.swarm.scheduler import TaskScheduler
 from backend.swarm.supervisor import Supervisor
 from backend.swarm.tasks import Task, TaskStatus
+
+# Phase 5 — adaptive reasoning layer (deterministic; pure data + scoring).
+from backend.swarm.candidates import CandidateGenerator
+from backend.swarm.dedup import action_signature
+from backend.swarm.progress import (
+    MissionBudget, ProgressLedger, StopCondition, evaluate_stop,
+)
+from backend.swarm.reasoning import FailureClass, classify_failure as _classify_failure_class
+from backend.swarm.scoring import ActionScorer, mission_uncertainty
 
 # Phase 4.x — capability discovery / acquisition / target modelling (cycle-free imports).
 from backend.execution.capabilities import (
@@ -97,6 +107,12 @@ class SwarmCoordinator:
         target_detector: Optional[Any] = None,
         allow_acquisition: bool = True,
         acquisition_privilege_decider: Optional[Callable[[Any], bool]] = None,
+        budget: Optional[MissionBudget] = None,
+        enable_reasoning: bool = True,
+        scorer: Optional[ActionScorer] = None,
+        candidate_generator: Optional[CandidateGenerator] = None,
+        stagnation_limit: int = 5,
+        max_replan_actions: int = 2,
     ):
         self.limits = limits or SwarmLimits()
         self.persist = persist
@@ -107,6 +123,17 @@ class SwarmCoordinator:
         self.mission_id = mission_id or str(uuid.uuid4())
         self._stopped = False
         self._stop_reason = ""
+
+        # Phase 5 — adaptive reasoning: budget, no-progress ledger, scorer, candidate
+        # generator. All deterministic; reasoning can be disabled for pure Phase-4 behaviour.
+        self.enable_reasoning = enable_reasoning
+        self.budget = budget or MissionBudget()
+        self.ledger = ProgressLedger(stagnation_limit=stagnation_limit)
+        self.scorer = scorer or ActionScorer()
+        self.generator = candidate_generator or CandidateGenerator()
+        self.max_replan_actions = max_replan_actions
+        self._dispatched_actions: Dict[str, str] = {}   # action signature → owning task id
+        self._stagnation_replans = 0
 
         # Phase 4.x — capability/target awareness (injectable for deterministic tests).
         self.capability_service = capability_service or _default_capability_service
@@ -131,6 +158,10 @@ class SwarmCoordinator:
                 self.mission.target_type = self.target_detector.detect(target).type.value
         except Exception:
             pass
+        # Phase 5 §4 — a concise objective seeds reasoning and agent context.
+        self.mission.set_objective(
+            (description or f"Capture the flag for the {category or 'CTF'} challenge "
+             f"'{challenge_name or target or 'target'}'.")[:300])
 
         # A dedicated coordination trajectory session — coordination events are
         # recorded here, kept separate from each specialist's execution trajectory
@@ -243,6 +274,18 @@ class SwarmCoordinator:
             "evidence_count": self.bus.count(),
             "quota": self.quota_snapshot(),
             "limits": vars(self.limits),
+            # Phase 5 §37 — inspectable reasoning state.
+            "reasoning": {
+                "uncertainty": mission_uncertainty(self.mission),
+                "budget": self.budget.to_dict(),
+                "progress": self.ledger.to_dict(),
+                "stop_condition": self.mission.stop_condition,
+                "facts": len(self.mission.confirmed_facts),
+                "open_hypotheses": sum(1 for h in self.mission.hypothesis_records
+                                       if h.get("status") == "open"),
+                "failed_approaches": len(self.mission.failed_approaches),
+                "candidate_actions": list(self.mission.candidate_actions),
+            },
         }
 
     @staticmethod
@@ -323,6 +366,10 @@ class SwarmCoordinator:
         agent = self.agent_factory(role)
 
         self.scheduler.mark_running(task, assigned_agent=agent_id)
+        # Phase 5 §8/§27 — remember the action being taken (so a differently-worded but
+        # equivalent action is recognised as a duplicate) and count the agent call.
+        self._dispatched_actions[self._action_sig_for(task)] = task.id
+        self.budget.record_agent_call()
         self.mission.set_agent_status(agent_id, role=role.value, status="RUNNING",
                                       current_task=(task.objective or "")[:120], task_id=task.id)
         self._record_coord("DECISION", action_type="assign", command=(task.objective or "")[:400],
@@ -431,6 +478,48 @@ class SwarmCoordinator:
                 caps.append(capname)
         return caps
 
+    # ── Phase 5 §8 — normalized action signatures + duplicate suppression ── #
+
+    def _action_sig_for(self, task: Task) -> str:
+        """Deterministic action signature for a task (capability::target::params).
+
+        Unlike the task signature (role + objective prose), this collapses differently-
+        worded objectives that exercise the same capability against the same target — the
+        §8 requirement not to rely on raw string equality. The target is extracted from
+        the objective (a quoted endpoint/artifact, a path, or a URL) so endpoint-specific
+        tasks stay distinct; otherwise it falls back to the mission target.
+        """
+        from backend.swarm.candidates import technique_to_action_type
+        cap = (task.required_capabilities[0] if task.required_capabilities
+               else technique_to_action_type(task.objective))
+        return action_signature(cap, self._extract_target(task.objective), "")
+
+    def _extract_target(self, objective: str) -> str:
+        text = objective or ""
+        m = re.search(r"'([^']+)'", text) or re.search(r'"([^"]+)"', text)
+        if m:
+            return m.group(1)
+        m = re.search(r"https?://\S+", text)
+        if m:
+            return m.group(0).rstrip(".,;)")
+        m = re.search(r"(?<!\w)(/[\w./\-]+)", text)
+        if m:
+            return m.group(1)
+        return self.mission.target or ""
+
+    def is_duplicate_action(self, task: Task) -> bool:
+        """Whether *task* repeats an action already dispatched by a DIFFERENT task this
+        mission, or one already recorded as failed (§8). Advisory — used to filter
+        reasoning-injected candidates, NOT to hard-cancel plan/retry/reassign tasks
+        (a deliberate reassignment may share a coarse signature with the action it
+        replaces). A legitimate retry (same task id) is never a duplicate.
+        """
+        sig = self._action_sig_for(task)
+        owner = self._dispatched_actions.get(sig)
+        if owner and owner != task.id:
+            return True
+        return self.mission.has_failed_action(sig) and task.retry_count == 0
+
     def _block_task(self, task: Task, *, category: str, evidence_type: str, title: str,
                     reason: str, action: str, tags: List[str], capability: str = "") -> None:
         """Terminally block a task (no retry) and record structured, learnable evidence."""
@@ -441,6 +530,12 @@ class SwarmCoordinator:
             tags=list(tags or []) + [f"action:{action}"], related_technology=capability or ""))
         self.scheduler.mark_failed(task, reason=f"{category}: {reason}")
         self.mission.record_dead_end(f"{task.role}: {category} — {(reason or '')[:80]}")
+        # §7 — a blocked action is a failed approach too, so reasoning does not re-propose
+        # it (the capability itself is separately memoised in _blocked_capabilities).
+        self.mission.record_failed_approach(
+            action=(task.objective or "")[:200], signature=self._action_sig_for(task),
+            capability=capability, target=self._extract_target(task.objective),
+            result="BLOCKED", reason=(reason or "")[:200], failure_class=category, agent=task.role)
         self._record_coord(category, command=(task.objective or "")[:400], strategy=task.role,
                            result="BLOCKED", decision_summary=(reason or "")[:300])
         events.broadcast(events.TASK_FAILED, {
@@ -482,6 +577,7 @@ class SwarmCoordinator:
             self.scheduler.mark_completed(
                 task, result={"reason": result.reason, "session_id": result.session_id},
                 evidence_ids=published)
+            self.mission.record_action_signature(self._action_sig_for(task))   # §8
             self.mission.set_agent_status(task.assigned_agent, status="IDLE", current_task=None)
             self._record_coord("TASK_COMPLETED", command=(task.objective or "")[:400],
                                strategy=task.role, result="COMPLETED")
@@ -493,17 +589,29 @@ class SwarmCoordinator:
             self._handle_failure(task, result)
 
         self._drain_followups()
+        # Phase 5 — OBSERVE → REASON → (re)ACT: update budget/progress, reason about the
+        # new evidence, and evaluate stop conditions after each completed step.
+        self._post_step(task, result)
         self._save_mission()
         self._maybe_checkpoint()
 
     def _handle_failure(self, task: Task, result: AgentResult) -> None:
+        # 0) Phase 5 §7/§14 — remember this failed approach (bounded) with its richer
+        #    failure class, so it is not blindly repeated and so replanning can react.
+        fclass = _classify_failure_class(result)
+        self.mission.record_failed_approach(
+            action=(task.objective or "")[:200], signature=self._action_sig_for(task),
+            capability=(task.required_capabilities[0] if task.required_capabilities else ""),
+            target=self._extract_target(task.objective), result=result.status,
+            reason=(result.reason or "")[:200], failure_class=fclass.value, agent=task.assigned_agent)
+
         # 1) Record structured failure evidence (§9) so it is visible + learnable.
         self.bus.publish(Evidence(
             mission_id=self.mission_id, agent_id=task.role, task_id=task.id,
             evidence_type=EvidenceType.FAILURE.value,
             title=f"{task.role} task failed: {result.status}",
             description=(result.reason or "")[:500], source="agent", confidence=0.5,
-            tags=[result.failure_category or "failure"]))
+            tags=[result.failure_category or "failure", fclass.value]))
         self.mission.set_agent_status(task.assigned_agent, status="IDLE", current_task=None)
         self._record_coord("TASK_FAILED", command=(task.objective or "")[:400],
                            strategy=task.role, result=result.status,
@@ -538,6 +646,122 @@ class SwarmCoordinator:
             self.scheduler.mark_failed(task, reason=decision.reason)
             self.mission.record_dead_end(
                 f"{task.role}: {(task.objective or '')[:60]} — {decision.reason}")
+
+    # ================================================================== #
+    # Phase 5 — OBSERVE → REASON → replan → stop (§13, §24, §25, §26, §27)
+    # ================================================================== #
+
+    def _post_step(self, task: Task, result: AgentResult) -> None:
+        """Run after every completed step: account budget, track progress, reason about
+        new evidence, and evaluate stop conditions. All deterministic (§35)."""
+        # §27 — resource accounting.
+        self.budget.record_tool_executions(getattr(result, "tool_executions", 0) or 0)
+        if (result.status or "").upper() not in ("COMPLETED", "CANCELLED"):
+            self.budget.record_failure()
+        self.mission.mission_budget = self.budget.to_dict()
+
+        if not self.enable_reasoning:
+            return
+
+        # §26 — no-progress ledger (compare knowledge snapshot to the best so far).
+        self.ledger.record(self.mission)
+
+        # §13/§16 — adaptive replanning: reason about the freshly published evidence and
+        # inject scored, evidence-backed follow-up actions the deterministic evidence
+        # rules did not already cover. Only fires when this step produced new evidence,
+        # so a step that learned nothing never floods the queue.
+        if getattr(result, "evidence", None):
+            self._reason_and_replan(list(result.evidence))
+
+        # §25 — stop conditions (budget exhausted / stagnation / all-blocked).
+        self._evaluate_stop_conditions()
+
+    def _reason_and_replan(self, recent_evidence: List[Any]) -> None:
+        """Score candidate next actions and inject the best evidence-backed ones (§13).
+
+        The Supervisor's :meth:`reason` produces the full ranked, scored candidate set
+        (stored on the mission for observability, §37). We only *inject* candidates that
+        react to concrete new evidence — memory/state-gap/playbook candidates are
+        advisory and are NOT auto-executed without evidence (§18/§19/§32); the existing
+        deterministic evidence rules + these injections cover evidence-driven work.
+        """
+        try:
+            decision = self.supervisor.reason(
+                self.mission, recent_evidence=recent_evidence, scorer=self.scorer,
+                generator=self.generator,
+                attempted_signatures=list(self._dispatched_actions.keys()),
+                blocked_capabilities=list(self._blocked_capabilities),
+                budget_pressure=self.budget.pressure(),
+            )
+        except Exception as e:  # reasoning must never crash the mission
+            logger.debug(f"[SwarmCoordinator] reasoning error: {e}")
+            return
+
+        if decision.has_action:
+            sel = decision.selected
+            self._record_coord("REASONING_DECISION", command=(sel.objective or "")[:400],
+                               strategy=sel.role, result=decision.mode,
+                               decision_summary=decision.reason[:400])
+            events.broadcast(events.REASONING_DECISION, {
+                "mission_id": self.mission_id, "challenge_id": self.mission.challenge_id,
+                "selected": sel.action_type, "role": sel.role, "score": round(sel.score, 3),
+                "mode": decision.mode, "uncertainty": decision.uncertainty,
+                "considered": decision.considered, "reason": decision.reason[:300]})
+
+        injected = 0
+        blocked = {c.lower() for c in self._blocked_capabilities}
+        for cand in decision.ranked:
+            if injected >= self.max_replan_actions:
+                break
+            if cand.source != "evidence":                     # advisory-only, not auto-run
+                continue
+            if cand.signature in self._dispatched_actions or self.mission.has_failed_action(cand.signature):
+                continue                                       # §8 duplicate / already failed
+            if cand.capability and cand.capability.lower() in blocked:
+                continue                                       # needs an unavailable capability
+            new_task = cand.to_task(mission_id=self.mission_id, run_id=self.mission.run_id,
+                                    challenge_id=self.mission.challenge_id)
+            new_task.priority = cand.priority                  # §17 score-driven priority
+            if self._add_task(new_task, origin="reasoning"):
+                injected += 1
+
+    def _evaluate_stop_conditions(self) -> None:
+        """Stop the mission on budget exhaustion / stagnation / all-capabilities-blocked
+        (§25). A verified flag is handled elsewhere and always wins; this only fires the
+        *negative* terminal conditions so an unproductive mission cannot loop forever."""
+        if self._stopped:
+            return
+        budget_done, _ = self.budget.exhausted()
+        stagnant = self.ledger.is_stagnant()
+        all_blocked = self._all_remaining_work_blocked()
+        if not (budget_done or stagnant or all_blocked):
+            return
+        cond, reason = evaluate_stop(
+            self.mission, budget=self.budget, ledger=self.ledger,
+            has_open_work=self.scheduler.has_open_work(),
+            all_capabilities_blocked=all_blocked)
+        if cond.is_terminal and cond is not StopCondition.FLAG_VERIFIED:
+            self.mission.stop_condition = cond.value
+            self._record_coord("MISSION_STOP", result=cond.value, decision_summary=reason[:300])
+            events.broadcast(events.MISSION_STOP, {
+                "mission_id": self.mission_id, "challenge_id": self.mission.challenge_id,
+                "stop_condition": cond.value, "reason": reason})
+            self._trigger_global_stop(f"{cond.value}: {reason}", final_status="FAILED")
+
+    def _all_remaining_work_blocked(self) -> bool:
+        """True if there is open work but every not-yet-terminal task needs a capability
+        already proven blocked this mission (§25 CAPABILITY_BLOCKED)."""
+        if not self._blocked_capabilities:
+            return False
+        open_tasks = [t for t in self.scheduler.all() if t.is_active]
+        if not open_tasks:
+            return False
+        blocked = {c.lower() for c in self._blocked_capabilities}
+        for t in open_tasks:
+            caps = {c.lower() for c in (t.required_capabilities or [])}
+            if not caps or not caps.issubset(blocked):
+                return False
+        return True
 
     # ================================================================== #
     # Evidence subscription (runs synchronously during publish)
@@ -657,6 +881,20 @@ class SwarmCoordinator:
             loaded.run_id = loaded.run_id or self.mission.run_id
             loaded.challenge_id = loaded.challenge_id or self.mission.challenge_id
             self.mission = loaded
+            # Phase 5 — restore the budget so accounting continues across resume; the
+            # attempted-action signatures are already carried in the persisted state.
+            try:
+                if loaded.mission_budget:
+                    restored = MissionBudget.from_dict(loaded.mission_budget)
+                    # Preserve caps from this construction; adopt the used counters.
+                    restored.max_agent_calls = self.budget.max_agent_calls or restored.max_agent_calls
+                    restored.max_tool_executions = self.budget.max_tool_executions or restored.max_tool_executions
+                    restored.max_failed_attempts = self.budget.max_failed_attempts or restored.max_failed_attempts
+                    restored.max_duplicate_attempts = self.budget.max_duplicate_attempts or restored.max_duplicate_attempts
+                    restored.max_wall_seconds = self.budget.max_wall_seconds or restored.max_wall_seconds
+                    self.budget = restored
+            except Exception:
+                pass
         self.bus.load()
         self.scheduler.load(self.mission_id)
 
@@ -671,6 +909,14 @@ class SwarmCoordinator:
         else:
             status = "FAILED"
         self.mission.status = status
+        # Phase 5 §25 — record the authoritative stop condition + final budget snapshot.
+        if status == "COMPLETED":
+            self.mission.stop_condition = StopCondition.FLAG_VERIFIED.value
+        elif not self.mission.stop_condition and status == "FAILED":
+            self.mission.stop_condition = (StopCondition.UNRECOVERABLE_ERROR.value
+                                           if getattr(self, "_pending_final_status", "") == "CANCELLED"
+                                           else StopCondition.NO_PROGRESS.value)
+        self.mission.mission_budget = self.budget.to_dict()
         self._save_mission()
 
         try:

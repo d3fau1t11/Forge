@@ -15,6 +15,19 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from backend.swarm.dedup import normalize_text
+from backend.swarm.reasoning import (
+    Fact, Hypothesis, HypothesisStatus, FailedApproach, Reliability,
+)
+
+# §4 — state must remain bounded. Caps on the Phase 5 reasoning collections so a long
+# mission cannot grow the shared state without limit. Oldest entries are trimmed.
+_MAX_FACTS = 120
+_MAX_HYPOTHESES = 60
+_MAX_FAILED_APPROACHES = 150
+_MAX_ACTION_SIGNATURES = 400
+_MAX_CANDIDATES = 40
+
 
 def _add_unique(items: List[str], value: Optional[str]) -> bool:
     v = (value or "").strip()
@@ -22,6 +35,12 @@ def _add_unique(items: List[str], value: Optional[str]) -> bool:
         items.append(v)
         return True
     return False
+
+
+def _bounded_append(items: List[Any], value: Any, cap: int) -> None:
+    items.append(value)
+    if len(items) > cap:
+        del items[: len(items) - cap]
 
 
 @dataclass
@@ -53,7 +72,29 @@ class SharedMissionState:
     headers: Dict[str, str] = field(default_factory=dict)
     vulnerabilities: List[str] = field(default_factory=list)
     artifacts: List[str] = field(default_factory=list)
-    hypotheses: List[str] = field(default_factory=list)
+    hypotheses: List[str] = field(default_factory=list)  # legacy free-text hypotheses (kept)
+
+    # ── Objective (§4) ──────────────────────────────────────────────────────
+    objective: str = ""
+
+    # ── Phase 5 §5: facts vs hypotheses (structured, distinct) ──────────────
+    # Stored as serialized dicts so to_dict/from_dict/JSON persistence need no custom
+    # codec; use the typed accessors (get_facts / get_hypotheses / ...) to work with
+    # them as dataclasses.
+    confirmed_facts: List[Dict[str, Any]] = field(default_factory=list)
+    hypothesis_records: List[Dict[str, Any]] = field(default_factory=list)
+
+    # ── Phase 5 §7: failed-approach memory (structured, bounded) ────────────
+    failed_approaches: List[Dict[str, Any]] = field(default_factory=list)
+    # §8 normalized ACTION signatures already attempted (distinct from task sigs below).
+    action_signatures: List[str] = field(default_factory=list)
+
+    # ── Phase 5 §9/§37: last computed candidate actions (observability) ─────
+    candidate_actions: List[Dict[str, Any]] = field(default_factory=list)
+
+    # ── Phase 5 §27: mission budget snapshot + §25 stop reason ──────────────
+    mission_budget: Dict[str, Any] = field(default_factory=dict)
+    stop_condition: str = ""
 
     # ── Technique bookkeeping ───────────────────────────────────────────────
     attempted_techniques: List[str] = field(default_factory=list)
@@ -110,6 +151,26 @@ class SharedMissionState:
         _add_unique(self.endpoints, getattr(ev, "related_endpoint", ""))
         _add_unique(self.technologies, getattr(ev, "related_technology", ""))
         _add_unique(self.vulnerabilities, getattr(ev, "related_vulnerability", ""))
+
+        # Phase 5 §5/§6 — split the discovery into a FACT or a HYPOTHESIS by reliability.
+        # Strong (DIRECT/DERIVED) evidence that names something concrete becomes a
+        # confirmed fact; speculative evidence becomes an OPEN hypothesis to validate.
+        # Failure/capability/mismatch evidence is bookkeeping, not a knowledge claim.
+        if label and etype not in ("failure", "capability", "target_mismatch", "note"):
+            reliability = getattr(ev, "reliability", "") or Reliability.DERIVED.value
+            strong = reliability in (Reliability.DIRECT.value, Reliability.DERIVED.value)
+            stmt = f"{etype}: {label}"
+            if strong:
+                self.add_fact(stmt, reliability=reliability,
+                              confidence=float(getattr(ev, "confidence", 0.8) or 0.8),
+                              source=getattr(ev, "source", ""), evidence_id=getattr(ev, "id", ""),
+                              agent=getattr(ev, "agent_id", ""))
+            else:
+                self.add_hypothesis(stmt, reliability=reliability,
+                                    confidence=float(getattr(ev, "confidence", 0.4) or 0.4),
+                                    rationale=(getattr(ev, "description", "") or "")[:200],
+                                    evidence_id=getattr(ev, "id", ""),
+                                    agent=getattr(ev, "agent_id", ""))
         self._touch()
 
     # ── Explicit coordination mutators ──────────────────────────────── #
@@ -121,6 +182,136 @@ class SharedMissionState:
     def record_dead_end(self, note: str) -> None:
         _add_unique(self.dead_ends, note)
         self._touch()
+
+    # ── Phase 5 §5: facts / hypotheses ──────────────────────────────── #
+
+    def add_fact(self, statement: str, *, reliability: str = Reliability.DERIVED.value,
+                 confidence: float = 0.8, source: str = "", evidence_id: str = "",
+                 agent: str = "") -> bool:
+        """Record a CONFIRMED fact (deduped by normalized statement). Returns True if new."""
+        stmt = (statement or "").strip()
+        if not stmt:
+            return False
+        key = normalize_text(stmt)
+        for f in self.confirmed_facts:
+            if normalize_text(f.get("statement", "")) == key:
+                return False
+        _bounded_append(self.confirmed_facts, Fact(
+            statement=stmt, reliability=reliability, confidence=confidence,
+            source=source, evidence_id=evidence_id, agent=agent).to_dict(), _MAX_FACTS)
+        self._touch()
+        return True
+
+    def add_hypothesis(self, statement: str, *, confidence: float = 0.4,
+                       reliability: str = Reliability.SPECULATIVE.value, rationale: str = "",
+                       evidence_id: str = "", agent: str = "") -> Optional[Dict[str, Any]]:
+        """Record an OPEN hypothesis (deduped). Never overwrites a confirmed fact."""
+        stmt = (statement or "").strip()
+        if not stmt:
+            return None
+        key = normalize_text(stmt)
+        # If this is already a confirmed fact, do not shadow it with a hypothesis.
+        if any(normalize_text(f.get("statement", "")) == key for f in self.confirmed_facts):
+            return None
+        for h in self.hypothesis_records:
+            if normalize_text(h.get("statement", "")) == key:
+                if evidence_id and evidence_id not in h.get("supporting_evidence", []):
+                    h.setdefault("supporting_evidence", []).append(evidence_id)
+                    h["updated_at"] = datetime.now(timezone.utc).isoformat()
+                return h
+        rec = Hypothesis(statement=stmt, confidence=confidence, reliability=reliability,
+                         rationale=rationale, agent=agent,
+                         supporting_evidence=[evidence_id] if evidence_id else []).to_dict()
+        _bounded_append(self.hypothesis_records, rec, _MAX_HYPOTHESES)
+        self._touch()
+        return rec
+
+    def _set_hypothesis_status(self, statement: str, status: str,
+                               *, evidence_id: str = "") -> bool:
+        key = normalize_text(statement)
+        for h in self.hypothesis_records:
+            if normalize_text(h.get("statement", "")) == key:
+                h["status"] = status
+                h["updated_at"] = datetime.now(timezone.utc).isoformat()
+                bucket = "supporting_evidence" if status == HypothesisStatus.CONFIRMED.value else "refuting_evidence"
+                if evidence_id:
+                    h.setdefault(bucket, []).append(evidence_id)
+                self._touch()
+                return True
+        return False
+
+    def confirm_hypothesis(self, statement: str, *, evidence_id: str = "",
+                           promote_to_fact: bool = True) -> bool:
+        """Validate an open hypothesis (§5). Optionally promote it to a confirmed fact."""
+        ok = self._set_hypothesis_status(statement, HypothesisStatus.CONFIRMED.value,
+                                         evidence_id=evidence_id)
+        if ok and promote_to_fact:
+            self.add_fact(statement, reliability=Reliability.DERIVED.value, confidence=0.85,
+                          source="validation", evidence_id=evidence_id)
+        return ok
+
+    def reject_hypothesis(self, statement: str, *, evidence_id: str = "") -> bool:
+        return self._set_hypothesis_status(statement, HypothesisStatus.REJECTED.value,
+                                           evidence_id=evidence_id)
+
+    def get_facts(self) -> List[Fact]:
+        return [Fact.from_dict(d) for d in self.confirmed_facts]
+
+    def get_hypotheses(self, *, open_only: bool = False) -> List[Hypothesis]:
+        out = [Hypothesis.from_dict(d) for d in self.hypothesis_records]
+        return [h for h in out if h.is_open] if open_only else out
+
+    # ── Phase 5 §7/§8: failed-approach memory + action dedup ────────── #
+
+    def record_failed_approach(self, *, action: str, signature: str = "", capability: str = "",
+                               target: str = "", params: str = "", result: str = "",
+                               reason: str = "", failure_class: str = "", agent: str = "") -> bool:
+        """Remember a failed approach for THIS mission (§7). Deduped by signature."""
+        sig = signature or ""
+        if sig and any(fa.get("signature") == sig for fa in self.failed_approaches):
+            # Already recorded — refresh the reason/result (latest wins) but do not grow.
+            for fa in self.failed_approaches:
+                if fa.get("signature") == sig:
+                    fa["result"] = result or fa.get("result", "")
+                    fa["reason"] = reason or fa.get("reason", "")
+                    fa["failure_class"] = failure_class or fa.get("failure_class", "")
+            return False
+        _bounded_append(self.failed_approaches, FailedApproach(
+            action=action, signature=sig, capability=capability, target=target, params=params,
+            result=result, reason=reason, failure_class=failure_class, agent=agent).to_dict(),
+            _MAX_FAILED_APPROACHES)
+        if sig:
+            self.record_action_signature(sig)
+        self._touch()
+        return True
+
+    def has_failed_action(self, signature: str) -> bool:
+        return bool(signature) and any(fa.get("signature") == signature for fa in self.failed_approaches)
+
+    def get_failed_approaches(self) -> List[FailedApproach]:
+        return [FailedApproach.from_dict(d) for d in self.failed_approaches]
+
+    def record_action_signature(self, signature: str) -> None:
+        """Record that an ACTION (capability::target::params) was attempted (§8)."""
+        if signature and signature not in self.action_signatures:
+            _bounded_append(self.action_signatures, signature, _MAX_ACTION_SIGNATURES)
+            self._touch()
+
+    def has_attempted_action(self, signature: str) -> bool:
+        return bool(signature) and signature in self.action_signatures
+
+    def set_candidate_actions(self, candidates: List[Any]) -> None:
+        """Store the latest ranked candidate actions for observability (§37). Bounded."""
+        out: List[Dict[str, Any]] = []
+        for c in (candidates or [])[:_MAX_CANDIDATES]:
+            out.append(c.to_dict() if hasattr(c, "to_dict") else dict(c))
+        self.candidate_actions = out
+        self._touch()
+
+    def set_objective(self, objective: str) -> None:
+        if objective and objective != self.objective:
+            self.objective = objective
+            self._touch()
 
     def set_agent_status(self, agent_id: str, **fields: Any) -> None:
         cur = self.agent_statuses.get(agent_id, {})
@@ -167,6 +358,19 @@ class SharedMissionState:
         lines = [
             f"Target: {self.target or 'n/a'} | category={self.category or 'n/a'} | phase={self.phase}",
         ]
+        if self.objective:
+            lines.append(f"Objective: {self.objective}")
+        # Phase 5 §22 — confirmed facts and open hypotheses are the most useful bounded
+        # context for a specialist; failed approaches keep it from repeating dead ends.
+        facts = [f.get("statement", "") for f in self.confirmed_facts]
+        row = _fmt("Confirmed facts", facts)
+        if row:
+            lines.append(row)
+        open_hyps = [h.get("statement", "") for h in self.hypothesis_records
+                     if h.get("status") == "open"]
+        row = _fmt("Open hypotheses", open_hyps)
+        if row:
+            lines.append(row)
         for name, items in (
             ("Endpoints", self.endpoints), ("Technologies", self.technologies),
             ("Services", self.services), ("Vulnerabilities", self.vulnerabilities),
@@ -176,6 +380,11 @@ class SharedMissionState:
             row = _fmt(name, items)
             if row:
                 lines.append(row)
+        failed = [f"{fa.get('action', '')} → {fa.get('result') or fa.get('failure_class', '')}"
+                  for fa in self.failed_approaches]
+        row = _fmt("Failed approaches (do not repeat without new evidence)", failed)
+        if row:
+            lines.append(row)
         if self.verified_flag:
             lines.append(f"VERIFIED FLAG: {self.verified_flag}")
         return "\n".join(lines)
