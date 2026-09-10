@@ -73,6 +73,18 @@ def classify_tool_execution(tool_name: str, exit_code: Optional[int], stdout: st
       These must NOT be retried identically — the caller aborts after a couple of hits
       (see LOCAL_EXEC_CATEGORIES) instead of burning the iteration/time budget.
     """
+    # A command that exited 0 CLEANLY SUCCEEDED — a bad invocation (file-not-found,
+    # syntax error, permission denied, missing dependency) or a transport failure
+    # (DNS/refused/timeout) always exits non-zero. So any failure-looking phrase in a
+    # zero-exit command's OUTPUT is data, not a diagnostic, and must not be flagged.
+    # Observed in production: a `curl … | strings | grep` pipeline that dumped an 11MB
+    # Node heap-dump (whose body literally contains "no such file or directory") exited
+    # 0 and captured the flag, yet was tagged FILE_NOT_FOUND — which feeds the swarm's
+    # "abort after 2 local failures" guard and the coordinated recovery logic. Guarding
+    # here also avoids lower-casing a multi-megabyte stdout on every successful command.
+    if exit_code == 0:
+        return {"execution_failure": False, "failure_category": None}
+
     combined = ((stdout or "") + " " + (stderr or "")).lower()
 
     # ── LOCAL-level failures first: unambiguous text signatures win over exit-code

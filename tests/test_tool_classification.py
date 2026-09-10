@@ -65,5 +65,39 @@ class TestTargetResponsesNotFlagged(unittest.TestCase):
         self.assertFalse(r["execution_failure"])
 
 
+class TestZeroExitOutputIsNeverAFailure(unittest.TestCase):
+    """Regression: a command that exited 0 succeeded — failure phrases in its OUTPUT
+    are data, not diagnostics (observed with an 11MB heap-dump that contained the
+    string 'no such file or directory' yet exited 0 and held the flag)."""
+
+    def test_heapdump_body_with_enoent_text_not_flagged(self):
+        stdout = ('200 11252517\n/tmp/hd.bin: ASCII text\npicoCTF{Pat!3nt_15_Th3_K3y}\n'
+                  '{"err":"ENOENT: no such file or directory, open \'/app/x\'"}')
+        r = classify_tool_execution("curl", 0, stdout, "")
+        self.assertFalse(r["execution_failure"])
+        self.assertIsNone(r["failure_category"])
+
+    def test_strings_output_mentioning_permission_denied_not_flagged(self):
+        r = classify_tool_execution("strings", 0, "log: Permission denied while opening /etc/shadow", "")
+        self.assertFalse(r["execution_failure"])
+
+    def test_grep_hit_on_modulenotfound_text_not_flagged(self):
+        # grep succeeds (exit 0) and prints a line containing the phrase — not a dep failure.
+        r = classify_tool_execution("grep", 0, "README: handle ModuleNotFoundError: No module named 'x'", "")
+        self.assertFalse(r["execution_failure"])
+
+    def test_real_failure_with_nonzero_exit_still_flagged(self):
+        # The guard is exit-code scoped: a genuine bad invocation (non-zero) is unchanged.
+        r = classify_tool_execution("python", 2, "", "python: can't open file 'x.py': [Errno 2] No such file or directory")
+        self.assertTrue(r["execution_failure"])
+        self.assertEqual(r["failure_category"], "FILE_NOT_FOUND")
+
+    def test_unknown_exit_still_scanned(self):
+        # exit_code None (unknown) must still be scanned — preserves the -1/None path.
+        r = classify_tool_execution("python", None, "", "ModuleNotFoundError: No module named 'pwn'")
+        self.assertTrue(r["execution_failure"])
+        self.assertEqual(r["failure_category"], "MISSING_DEP")
+
+
 if __name__ == "__main__":
     unittest.main()
