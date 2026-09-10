@@ -29,7 +29,7 @@ Memory/playbook retrieval is bounded (§18) and goes exclusively through the EXI
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from backend.swarm.reasoning import (
     CandidateAction, Cost, InformationGain, Risk, profile_for, ACTION_PROFILES,
@@ -72,10 +72,18 @@ def technique_to_action_type(text: str) -> str:
 class CandidateGenerator:
     """Produces candidate next actions from state, evidence, memory and playbooks."""
 
-    def __init__(self, *, memory_retriever: Any = None, capabilities: Any = None):
+    def __init__(self, *, memory_retriever: Any = None, capabilities: Any = None,
+                 technique_stats: Any = None):
         # Injected for tests; defaults to the EXISTING singletons in production.
         self._memory = memory_retriever
         self._capabilities = capabilities
+        # Phase 6 §9 — optional contextual success statistics. Left None by default so
+        # candidate generation is byte-for-byte the Phase-5 behaviour unless a caller
+        # (the coordinator in production, or a test) explicitly wires it in; when wired,
+        # a technique's historical/contextual success rate refines — never dictates —
+        # the candidate's success_probability, and is recorded as observability
+        # provenance (§13).
+        self._stats = technique_stats
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -257,12 +265,15 @@ class CandidateGenerator:
                 from backend.knowledge.memory_retriever import memory_retriever as retriever  # type: ignore
             except Exception:
                 return []
+        category = getattr(ms, "category", "") or None
+        target_type = getattr(ms, "target_type", "") or None
+        technologies = list(getattr(ms, "technologies", []) or [])
         try:
             evidence_str = ms.summary() if hasattr(ms, "summary") else ""
             memories = retriever.retrieve(
                 evidence=evidence_str,
-                category=getattr(ms, "category", "") or None,
-                technologies=list(getattr(ms, "technologies", []) or []),
+                category=category,
+                technologies=technologies,
                 top_k=max_memory,
                 include_failures=False,
                 capabilities=self._capabilities,
@@ -282,8 +293,47 @@ class CandidateGenerator:
             # memory alone never dominates a strongly evidence-backed action.
             hist_conf = float(getattr(m, "confidence", 0.6) or 0.6)
             succ_rate = float(getattr(m, "success_rate", 1.0) or 1.0)
-            success_prob = _clamp(0.35 + 0.4 * hist_conf * succ_rate)
+            # Existing (Phase-5) formula — also the fallback when there is no contextual
+            # statistical evidence for this technique yet.
+            base_prob = _clamp(0.35 + 0.4 * hist_conf * succ_rate)
+            success_prob = base_prob
             source = "playbook" if kind == "playbook" else "memory"
+
+            # Phase 6 §9/§13 — observability provenance for THIS candidate. Always carries
+            # the memory's own signal; enriched with contextual statistics when wired.
+            hist_support: Dict[str, Any] = {
+                "source": source,
+                "memory_ids": [x for x in [getattr(m, "id", "")] if x],
+                "memory_confidence": round(hist_conf, 3),
+                "memory_success_rate": round(succ_rate, 3),
+                "memory_outcome": getattr(m, "outcome", ""),
+            }
+            # §9 contextual success statistics refine — never dictate — the probability.
+            if self._stats is not None:
+                try:
+                    ctx_rate, stats = self._stats.contextual_success_rate(
+                        technique, category=category, target_type=target_type,
+                        technologies=technologies)
+                    glob = (stats or {}).get("global", {})
+                    ctx = (stats or {}).get("contextual", {})
+                    hist_support.update({
+                        "similar_challenges": int(glob.get("sample_size", 0) or 0),
+                        "historical_success_rate": glob.get("success_rate"),
+                        "contextual_similar_challenges": int(ctx.get("sample_size", 0) or 0),
+                        "contextual_success_rate": ctx.get("success_rate")
+                        if int(ctx.get("sample_size", 0) or 0) else None,
+                        "context": (stats or {}).get("context"),
+                    })
+                    if ctx_rate is not None:
+                        # History is ONE input (Part 7): blend 50/50 with the memory-derived
+                        # base so a strong track record lifts the candidate and a poor one
+                        # tempers it, but neither ever fully controls the score.
+                        success_prob = _clamp(0.5 * base_prob + 0.5 * float(ctx_rate))
+                        hist_support["applied_rate"] = round(float(ctx_rate), 3)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug(f"[CandidateGenerator] technique stats skipped: {e}")
+            hist_support["applied_success_probability"] = round(success_prob, 3)
+
             # §21 playbook adaptation: only propose it if the environment can run its
             # capability; otherwise record the capability so the pre-dispatch gate (Phase
             # 4.x) can decide, rather than silently executing or silently dropping.
@@ -300,6 +350,7 @@ class CandidateGenerator:
             )
             # A memory-sourced candidate is slightly less novel than a fresh idea.
             cand.novelty = 0.85
+            cand.historical_support = hist_support
             cands.append(cand)
         return cands
 

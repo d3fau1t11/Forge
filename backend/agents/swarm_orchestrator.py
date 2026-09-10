@@ -1058,6 +1058,11 @@ class SwarmOrchestrator:
                     "candidates": [c["flag"] for c in board.flag_candidates]
                 })
 
+                # LEARN → STORE: a failed/stalled run is still experience (Part 8). Record
+                # what was attempted and why it stalled so future missions avoid the same
+                # dead ends, and down-weight any retrieved memory that did not help.
+                await self._learn_from_run(board, outcome="failed")
+
             # Generate structured report
             try:
                 report_generator.generate_final_report(challenge_id=challenge_id, run_id=run_id, db=db)
@@ -1658,22 +1663,29 @@ class SwarmOrchestrator:
         return acted
 
     async def _learn_from_run(self, board: "SwarmBlackboard", outcome: str = "success"):
-        """LEARN → STORE (§3, §5, §12, §19).
+        """LEARN → STORE (§3, §5, §12, §19; Phase 6 Part 8).
 
         Distil the finished run into a single GENERALIZED experience, store it, and
-        run the feedback loop for any memories that were retrieved this mission. The
-        experience layer is the one learning entry point; a proven experience is
-        promoted into the Playbook Vault by ExperienceMemory itself (§10) rather than
-        writing a second, separate playbook here. Deterministic + non-fatal — a
-        learning failure can never break run completion."""
+        run the feedback loop for any memories that were retrieved this mission. This
+        fires on BOTH a solve and a genuine failure/stall: a failed run is still
+        experience (what was tried, why it stalled) that future missions use to avoid
+        dead ends. The experience layer is the one learning entry point; a *proven*
+        experience is promoted into the Playbook Vault by ExperienceMemory itself (§10)
+        — a failed one never is (it cannot meet the promotion bar). Deterministic +
+        non-fatal — a learning failure can never break run completion.
+        """
         try:
             flag = board.flag_captured or ""
+            # A failed run only teaches something if it actually attempted work; storing
+            # an empty no-op failure would be noise (and violates the no-demo-data rule).
+            if outcome != "success" and not (getattr(board, "execution_history", None) or []):
+                return
             record = experience_extractor.extract_from_board(board, flag=flag, outcome=outcome)
             exp_id = experience_memory.store(record)
             if exp_id:
                 _append_to_challenge_log(
                     board.challenge_id, "orchestrator",
-                    f"[MEMORY] Learned experience {exp_id}: '{record.technique}' "
+                    f"[MEMORY] Learned {outcome} experience {exp_id}: '{record.technique}' "
                     f"({len(record.successful_attack_chain)}-step chain, "
                     f"{len(record.failed_techniques)} failed approaches recorded)")
                 try:
@@ -1684,15 +1696,21 @@ class SwarmOrchestrator:
                     })
                 except Exception:
                     pass
-            # Feedback: memories retrieved during a SOLVED run get positive reinforcement (§12).
-            if outcome == "success":
-                for mid in board.retrieved_memory_ids:
-                    try:
-                        experience_memory.record_feedback(
-                            mid, success=True, note="Retrieved during a solved run",
-                            run_id=board.run_id, challenge_id=board.challenge_id)
-                    except Exception:
-                        pass
+            # Feedback loop (§12): memories retrieved this mission are reinforced by the
+            # outcome — positively on a solve, negatively on a run that did not capture
+            # the flag, so a memory that led nowhere loses confidence. Failure is
+            # CONTEXTUAL, not a blacklist: success_rate/confidence decay but the memory
+            # is never deleted or blocked (Part 8).
+            solved = (outcome == "success")
+            for mid in board.retrieved_memory_ids:
+                try:
+                    experience_memory.record_feedback(
+                        mid, success=solved,
+                        note=("Retrieved during a solved run" if solved
+                              else "Retrieved during a run that did not capture the flag"),
+                        run_id=board.run_id, challenge_id=board.challenge_id)
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"[SwarmOrchestrator] Experience learning failed (non-fatal): {e}")
 

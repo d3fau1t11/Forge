@@ -1773,6 +1773,25 @@ def search_memory(req: MemorySearchRequest):
     return {"query": req.query, "count": len(memories), "memories": [m.model_dump() for m in memories]}
 
 
+@router.get("/memory/technique-stats")
+def technique_statistics(
+    technique: str = Query(..., description="Technique/strategy label to look up"),
+    category: Optional[str] = Query(None),
+    target_type: Optional[str] = Query(None),
+    technologies: Optional[str] = Query(None, description="Comma-separated technology list"),
+):
+    """Phase 6 §9/§13 — global + contextual success statistics for a learned technique.
+
+    Answers "how well has this technique worked, overall vs. against targets like the
+    current one?" — the observability behind why a memory-sourced candidate scored the
+    way it did. Deterministic aggregation over stored experiences; no demo data.
+    """
+    from backend.knowledge.technique_stats import technique_stats
+    techs = [t.strip() for t in (technologies or "").split(",") if t.strip()]
+    return technique_stats.lookup(technique, category=category, target_type=target_type,
+                                  technologies=techs)
+
+
 @router.get("/memory/{experience_id}")
 def get_memory(experience_id: str):
     """Full experience detail incl. attempts + usage log + provenance (§13)."""

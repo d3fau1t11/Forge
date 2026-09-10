@@ -130,7 +130,17 @@ class SwarmCoordinator:
         self.budget = budget or MissionBudget()
         self.ledger = ProgressLedger(stagnation_limit=stagnation_limit)
         self.scorer = scorer or ActionScorer()
-        self.generator = candidate_generator or CandidateGenerator()
+        if candidate_generator is not None:
+            self.generator = candidate_generator
+        else:
+            # Phase 6 §9 — production coord engine gets contextual success statistics so
+            # a memory candidate's success_probability reflects the technique's real
+            # track record (and carries it as observability provenance). Lazy + non-fatal.
+            try:
+                from backend.knowledge.technique_stats import technique_stats as _ts
+            except Exception:
+                _ts = None
+            self.generator = CandidateGenerator(technique_stats=_ts)
         self.max_replan_actions = max_replan_actions
         self._dispatched_actions: Dict[str, str] = {}   # action signature → owning task id
         self._stagnation_replans = 0

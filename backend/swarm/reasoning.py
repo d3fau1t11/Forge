@@ -355,6 +355,10 @@ class CandidateAction:
     # Filled by the scorer — inspectable breakdown for observability/tests (§10, §37).
     score: float = 0.0
     score_breakdown: Dict[str, float] = field(default_factory=dict)
+    # Phase 6 §13 — WHY learned knowledge influenced this candidate: source, the number
+    # of similar past challenges, historical & contextual success rates, memory ids.
+    # Advisory/observability only — the scorer never reads it.
+    historical_support: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.signature:
