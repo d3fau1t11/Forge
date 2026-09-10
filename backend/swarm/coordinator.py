@@ -48,6 +48,7 @@ from backend.swarm.progress import (
 )
 from backend.swarm.reasoning import FailureClass, classify_failure as _classify_failure_class
 from backend.swarm.scoring import ActionScorer, mission_uncertainty
+from backend.swarm.target_reconciliation import reconcile_target
 
 # Phase 4.x — capability discovery / acquisition / target modelling (cycle-free imports).
 from backend.execution.capabilities import (
@@ -153,6 +154,9 @@ class SwarmCoordinator:
         self._acq_decider = acquisition_privilege_decider
         self._blocked_capabilities: set = set()      # capabilities proven unavailable this mission
         self._acquisition_attempted: set = set()      # capabilities we already tried to acquire
+        # Phase 7 (STEP 2/5) — the most recent target reconciliation (empty until a
+        # resume reconciles the checkpoint target against the current one).
+        self._last_reconciliation: Dict[str, Any] = {}
 
         scope = [t.strip() for t in (target or "").split("+") if t.strip()]
         self.mission = SharedMissionState(
@@ -211,7 +215,11 @@ class SwarmCoordinator:
             if resume:
                 self._load_persisted()
 
-            if not self.scheduler.all():
+            # Fresh plan when the queue is empty OR — Phase 7 (STEP 2/10) — when the
+            # target changed on resume: the swarm must actively re-engage the NEW
+            # instance (e.g. re-run recon), not merely stop with a stale, completed plan.
+            target_changed = bool(self._last_reconciliation.get("changed"))
+            if not self.scheduler.all() or target_changed:
                 for t in self.supervisor.plan_initial(self.mission):
                     self._add_task(t, origin="plan")
 
@@ -275,6 +283,7 @@ class SwarmCoordinator:
             "challenge_id": self.mission.challenge_id, "status": self.mission.status,
             "progress": self.mission.progress, "verified_flag": self.mission.verified_flag,
             "target": self.mission.target, "strategy": self.mission.strategy,
+            "target_reconciliation": self._last_reconciliation,
             "shared_state": self.mission.to_dict(),
             "agents": [
                 {"agent_id": aid, **info} for aid, info in self.mission.agent_statuses.items()
@@ -885,6 +894,11 @@ class SwarmCoordinator:
             pass
 
     def _load_persisted(self) -> None:
+        # The target supplied for THIS (resumed) run — captured BEFORE we adopt the
+        # persisted mission, because the checkpoint's target may be STALE (a CTF
+        # instance respawns with a new address, or the operator edits it). Phase 7
+        # (STEP 2/5): the current target wins over whatever is frozen in the checkpoint.
+        fresh_target = self.mission.target
         loaded = SharedMissionState.load(self.mission_id)
         if loaded:
             # Keep the freshly-provided metadata but adopt aggregated knowledge/flags.
@@ -905,8 +919,60 @@ class SwarmCoordinator:
                     self.budget = restored
             except Exception:
                 pass
+            # Phase 7 (STEP 2/5) — reconcile the authoritative target: if the operator
+            # supplied a different target for this resume, it becomes authoritative and
+            # host-specific state from the old target is invalidated so nothing executes
+            # against a stale address merely because it exists in the checkpoint.
+            self._reconcile_authoritative_target(fresh_target)
         self.bus.load()
         self.scheduler.load(self.mission_id)
+
+    def _reconcile_authoritative_target(self, fresh_target: str) -> None:
+        """Compare the current run's target against the persisted one; on a change,
+        make the current target authoritative and invalidate stale host-bound state.
+
+        Deterministic and non-fatal: a reconciliation hiccup must never abort a resume.
+        """
+        try:
+            recon = reconcile_target(fresh_target, self.mission.target)
+        except Exception as e:  # reconciliation must never crash a resume
+            logger.debug(f"[SwarmCoordinator] target reconcile error: {e}")
+            return
+        self._last_reconciliation = recon.to_dict()
+        if not recon.changed:
+            return
+
+        counts = self.mission.adopt_authoritative_target(recon.authoritative, recon.stale_hosts)
+        # Re-derive the target KIND against the new target (conservative; UNKNOWN if unsure).
+        try:
+            self.mission.target_type = self.target_detector.detect(recon.authoritative).type.value
+        except Exception:
+            pass
+        total = sum(counts.values())
+        self._last_reconciliation["invalidated"] = counts
+        logger.warning(
+            f"[SwarmCoordinator] TARGET CHANGED on resume: '{recon.previous}' -> "
+            f"'{recon.authoritative}'. Invalidated {total} stale item(s): {counts}. "
+            f"The current target is now authoritative.")
+        self._record_coord("TARGET_CHANGED", result="RECONCILED", command=recon.authoritative,
+                           decision_summary=f"{recon.reason}; invalidated {total} stale item(s)"[:300])
+        try:
+            self.bus.publish(Evidence(
+                mission_id=self.mission_id, agent_id="supervisor",
+                evidence_type=EvidenceType.NOTE.value,
+                title=f"Authoritative target changed to {recon.authoritative}",
+                description=(f"Previous target '{recon.previous}' is stale; {total} host-specific "
+                             f"item(s) invalidated so execution targets only the current "
+                             f"address.")[:500],
+                source="supervisor", confidence=1.0, tags=["target_changed", "resume"]))
+        except Exception:
+            pass
+        events.broadcast(events.TARGET_CHANGED, {
+            "mission_id": self.mission_id, "run_id": self.mission.run_id,
+            "challenge_id": self.mission.challenge_id, "old_target": recon.previous,
+            "new_target": recon.authoritative, "stale_hosts": recon.stale_hosts,
+            "invalidated": counts})
+        self._save_mission()
 
     def _finalize(self) -> MissionResult:
         counts = self._task_counts()

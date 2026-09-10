@@ -478,6 +478,9 @@ class SwarmBlackboard:
             # Resume snapshot — rehydrated by run_swarm(resume=True) so a paused
             # challenge continues aware of prior work instead of repeating it.
             "blackboard_state": {
+                # Phase 7 (STEP 2/5) — the target this snapshot was taken against, so a
+                # resume can detect a changed target and drop stale host-bound endpoints.
+                "target_scope": self.target_scope,
                 "discovered_endpoints": list(self.discovered_endpoints),
                 "extracted_headers": dict(self.extracted_headers),
                 "observed_cookies": dict(self.observed_cookies),
@@ -570,6 +573,38 @@ class SwarmBlackboard:
         counts["commands"] = len(self.executed_commands_dedup)
         counts["transcript_lines"] = sum(len(v) for v in self.agent_transcripts.values())
         return counts
+
+    def reconcile_target(self, persisted_target: str) -> Dict[str, Any]:
+        """Phase 7 (STEP 2/5) — reconcile the authoritative target on resume.
+
+        The blackboard is constructed with the CURRENT target (``self.target_scope``);
+        this compares it against the target the resumed snapshot was taken against. If
+        they differ, the current target stays authoritative (new commands already use
+        it) and endpoints rehydrated from the OLD host are dropped so a stale address
+        can neither mislead the agents nor be executed against. Non-fatal and
+        deterministic. Returns a small summary for logging/broadcast.
+        """
+        try:
+            from backend.swarm.target_reconciliation import reconcile_target, references_stale_host
+            recon = reconcile_target(self.target_scope, persisted_target or "")
+        except Exception:
+            return {"changed": False, "dropped_endpoints": 0}
+        if not recon.changed:
+            return {"changed": False, "dropped_endpoints": 0}
+        before = len(self.discovered_endpoints)
+        self.discovered_endpoints = {
+            ep for ep in self.discovered_endpoints
+            if not references_stale_host(ep, recon.stale_hosts)
+        }
+        # A rejection signal captured against the old target no longer applies.
+        self.last_target_rejection = ""
+        return {
+            "changed": True,
+            "previous": recon.previous,
+            "authoritative": recon.authoritative,
+            "stale_hosts": recon.stale_hosts,
+            "dropped_endpoints": before - len(self.discovered_endpoints),
+        }
 
     def _compute_progress(self) -> int:
         """Progress: 100 on flag capture, else a soft function of agent activity
@@ -877,6 +912,22 @@ class SwarmOrchestrator:
                             .filter(RunModel.challenge_id == challenge_id).all())
                     prior_cmds = [r[0] for r in rows if r and r[0]]
                     counts = board.load_snapshot(snapshot, prior_cmds, prior_tasks)
+                    # Phase 7 (STEP 2/5) — if the target changed since the snapshot, keep
+                    # the current one authoritative and drop stale host-bound endpoints so
+                    # a respawned/edited instance address can't silently drive execution.
+                    recon = board.reconcile_target((snapshot or {}).get("target_scope", ""))
+                    if recon.get("changed"):
+                        _append_to_challenge_log(
+                            challenge_id, "orchestrator",
+                            f"[TARGET CHANGED] '{recon['previous']}' -> '{recon['authoritative']}' — "
+                            f"dropped {recon['dropped_endpoints']} stale endpoint(s); current target "
+                            f"is authoritative")
+                        await ws_manager.broadcast({
+                            "event": "TARGET_CHANGED", "challenge_id": challenge_id, "run_id": run_id,
+                            "old_target": recon["previous"], "new_target": recon["authoritative"],
+                            "dropped_endpoints": recon["dropped_endpoints"],
+                            "stale_hosts": recon.get("stale_hosts", []),
+                        })
                     _append_to_challenge_log(
                         challenge_id, "orchestrator",
                         f"Resuming from prior progress: {counts['endpoints']} endpoints, "

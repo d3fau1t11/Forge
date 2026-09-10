@@ -103,6 +103,34 @@ class AgentRouterQuotaManager:
             return "no rate-limit headers observed yet"
         return " | ".join(snap.summary() for snap in self._ratelimit_snapshots.values())
 
+    def snapshot(self) -> Dict:
+        """Compact, operator-facing provider/quota health (Phase 7 STEP 4 / STEP 13).
+
+        The mission snapshot surfaces this so an operator can tell *why* a mission is
+        starved — which providers are circuit-broken this session, which models are
+        quota-exhausted, and the passively-observed rate-limit headroom. Read-only;
+        never raises (observability must not break a run).
+        """
+        now = time.time()
+        try:
+            summary = self.get_quota_status_summary()
+        except Exception:
+            summary = {}
+        blacklisted = []
+        try:
+            for ident, val in (self._session_blacklisted or {}).items():
+                expiry, reason = (val if isinstance(val, tuple) else (0.0, str(val)))
+                remaining = max(0, int(expiry - now)) if expiry else 0
+                if remaining > 0 or not expiry:
+                    blacklisted.append({"provider": ident, "reason": (reason or "")[:160],
+                                        "expires_in_seconds": remaining})
+        except Exception:
+            pass
+        summary["session_blacklisted"] = blacklisted
+        summary["rate_limit_headroom"] = self.ratelimit_summary()
+        summary["any_provider_blacklisted"] = bool(blacklisted)
+        return summary
+
     def record_rate_limit(self, identifier: str, reason: str = "") -> bool:
         """Record a 429 rate-limit hit for a provider/model.
 

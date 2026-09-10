@@ -32,6 +32,9 @@ FLAG_VERIFIED = "SWARM_FLAG_VERIFIED"
 REASONING_DECISION = "SWARM_REASONING_DECISION"
 REPLAN = "SWARM_REPLAN"
 MISSION_STOP = "SWARM_MISSION_STOP"
+# Phase 7 (STEP 2/5) — the authoritative target changed on resume; stale target-
+# derived state was invalidated so nothing executes against the old target.
+TARGET_CHANGED = "SWARM_TARGET_CHANGED"
 
 
 def broadcast(event: str, payload: Optional[Dict[str, Any]] = None) -> None:

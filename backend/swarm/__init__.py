@@ -37,6 +37,9 @@ from backend.swarm.supervisor import Supervisor, RecoveryDecision, ReasoningDeci
 from backend.swarm.agents import SpecialistAgent, AgentResult
 from backend.swarm.limits import SwarmLimits
 from backend.swarm.coordinator import SwarmCoordinator, MissionResult, active_missions
+from backend.swarm.target_reconciliation import (
+    TargetReconciliation, reconcile_target, references_stale_host, hosts_of,
+)
 from backend.swarm import events, dedup
 
 __all__ = [
@@ -58,5 +61,6 @@ __all__ = [
     "SpecialistAgent", "AgentResult",
     "SwarmLimits",
     "SwarmCoordinator", "MissionResult", "active_missions",
+    "TargetReconciliation", "reconcile_target", "references_stale_host", "hosts_of",
     "events", "dedup",
 ]

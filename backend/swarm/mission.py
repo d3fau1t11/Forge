@@ -183,6 +183,69 @@ class SharedMissionState:
         _add_unique(self.dead_ends, note)
         self._touch()
 
+    # ── Phase 7: authoritative target reconciliation on resume (STEP 2/5) ── #
+
+    def adopt_authoritative_target(self, new_target: str, stale_hosts: List[str]) -> Dict[str, int]:
+        """Make *new_target* authoritative and invalidate state tied to the OLD target.
+
+        On resume with a changed target, host-specific knowledge and attempt history
+        from the previous target must not silently drive execution against it. Only
+        state that references a stale host is dropped — relative paths, techniques, and
+        non-host facts stay useful and are kept. Attempt/failure signatures tied to a
+        stale host are cleared too, so the swarm may legitimately RE-TRY equivalent
+        actions against the new target instead of being suppressed by duplicate/
+        failed-action memory. Flag candidates and the audit dead-end trail are never
+        dropped. Returns per-field invalidation counts.
+        """
+        from backend.swarm.target_reconciliation import references_stale_host
+        old = self.target
+        self.target = new_target
+        # target_type is re-derived by the coordinator against the new target.
+        self.target_type = ""
+
+        def _refs(obj: Any) -> bool:
+            if isinstance(obj, dict):
+                blob = " ".join(str(obj.get(k, "")) for k in
+                                ("statement", "action", "target", "signature", "name",
+                                 "value", "rationale", "endpoint", "title"))
+            else:
+                blob = str(obj)
+            return references_stale_host(blob, stale_hosts)
+
+        def _prune(items: List[Any]) -> tuple:
+            kept, dropped = [], 0
+            for it in items:
+                if _refs(it):
+                    dropped += 1
+                else:
+                    kept.append(it)
+            return kept, dropped
+
+        counts: Dict[str, int] = {}
+        self.endpoints, counts["endpoints"] = _prune(self.endpoints)
+        self.services, counts["services"] = _prune(self.services)
+        self.artifacts, counts["artifacts"] = _prune(self.artifacts)
+        self.confirmed_facts, counts["facts"] = _prune(self.confirmed_facts)
+        self.hypothesis_records, counts["hypotheses"] = _prune(self.hypothesis_records)
+        self.failed_approaches, counts["failed_approaches"] = _prune(self.failed_approaches)
+        self.action_signatures, sig_a = _prune(self.action_signatures)
+        self.attempted_signatures, sig_b = _prune(self.attempted_signatures)
+        counts["signatures"] = sig_a + sig_b
+
+        # Record the change as a DIRECT (operator-supplied) fact + an audit note so the
+        # trajectory/report shows exactly when and why stale state was invalidated.
+        if old and old != new_target:
+            try:
+                self.add_fact(
+                    f"Authoritative target changed to '{new_target}' (was '{old}')",
+                    reliability=Reliability.DIRECT.value, confidence=1.0, source="operator")
+            except Exception:
+                pass
+            _add_unique(self.dead_ends,
+                        f"TARGET CHANGED: '{old}' -> '{new_target}' — stale host state invalidated")
+        self._touch()
+        return counts
+
     # ── Phase 5 §5: facts / hypotheses ──────────────────────────────── #
 
     def add_fact(self, statement: str, *, reliability: str = Reliability.DERIVED.value,
