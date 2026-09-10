@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional
 from pydantic import BaseModel
 from backend.tools.registry import tool_registry, ToolMetadata
 from backend.environment.detector import environment_detector
+from backend.execution.service import execution_service
 
 logger = logging.getLogger("forge.tools")
 
@@ -173,16 +174,9 @@ class ToolManager:
             extra_port = f" -p {target_port}" if target_port else ""
             raw_args = selected_tool.args_template.format(target=target_for_cmd) + extra_port
         elif selected_tool.tool_name == "ffuf":
+            from backend.execution.wordlist import wordlist_resolver  # lazy — avoids circular import
             clean_url = base_url.rstrip("/")
-            wl_path = "/usr/share/seclists/Discovery/Web-Content/common.txt"
-            if not os.path.exists(wl_path):
-                wl_path = "/usr/share/wordlists/dirb/common.txt"
-            if not os.path.exists(wl_path):
-                wl_path = os.path.abspath(os.path.join("workspaces", "common.txt"))
-                if not os.path.exists(wl_path):
-                    os.makedirs(os.path.dirname(wl_path), exist_ok=True)
-                    with open(wl_path, "w") as f:
-                        f.write("admin\nlogin\napi\nsessions\nflag\ndashboard\nindex.php\nrobots.txt\n.git\nconfig\n")
+            wl_path = wordlist_resolver.resolve("web_common")
             raw_args = f"-u {clean_url}/FUZZ -w {wl_path} -mc 200,301,302,401,403 -s"
         else:
             raw_args = selected_tool.args_template.format(target=parsed_target)
@@ -194,37 +188,19 @@ class ToolManager:
         full_command = sanitize_and_correct_command_target(full_command, target)
         logger.info(f"Executing tool '{selected_tool.tool_name}' (cwd={cwd}): {full_command}")
 
-        # 4. Controlled subprocess execution
-        try:
-            exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
-            process = await asyncio.create_subprocess_shell(
-                full_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=exec_cwd
-            )
-
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=selected_tool.timeout_seconds
-                )
-                stdout = stdout_bytes.decode(errors="replace")
-                stderr = stderr_bytes.decode(errors="replace")
-                exit_code = process.returncode
-                status = "SUCCESS" if exit_code == 0 else "FAILED"
-            except asyncio.TimeoutError:
-                process.kill()
-                stdout = ""
-                stderr = f"Tool execution timed out after {selected_tool.timeout_seconds} seconds."
-                exit_code = -1
-                status = "TIMEOUT"
-
-        except Exception as e:
-            stdout = ""
-            stderr = f"Subprocess creation error: {str(e)}"
-            exit_code = -1
-            status = "FAILED"
+        # 4. Delegate subprocess execution to ExecutionService (Phase 3)
+        exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
+        _exec = await execution_service.run_command(
+            full_command,
+            cwd=exec_cwd,
+            timeout_seconds=selected_tool.timeout_seconds,
+            capability=capability,
+            tool_name=selected_tool.tool_name,
+        )
+        stdout = _exec.stdout
+        stderr = _exec.stderr
+        exit_code = _exec.exit_code
+        status = _exec.status
 
         elapsed_ms = (time.time() - start_time) * 1000
         classification = classify_tool_execution(selected_tool.tool_name, exit_code, stdout, stderr)
@@ -253,36 +229,19 @@ class ToolManager:
         raw_cmd = sanitize_and_correct_command_target(command.strip(), canonical_target)
         logger.info(f"Executing raw CLI command (cwd={cwd}): {raw_cmd}")
 
-        try:
-            exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
-            process = await asyncio.create_subprocess_shell(
-                raw_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=exec_cwd
-            )
-
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=timeout_seconds
-                )
-                stdout = stdout_bytes.decode(errors="replace")
-                stderr = stderr_bytes.decode(errors="replace")
-                exit_code = process.returncode
-                status = "SUCCESS" if exit_code == 0 else "FAILED"
-            except asyncio.TimeoutError:
-                process.kill()
-                stdout = ""
-                stderr = f"Command execution timed out after {timeout_seconds} seconds."
-                exit_code = -1
-                status = "TIMEOUT"
-
-        except Exception as e:
-            stdout = ""
-            stderr = f"Raw subprocess error: {str(e)}"
-            exit_code = -1
-            status = "FAILED"
+        # Delegate subprocess execution to ExecutionService (Phase 3)
+        exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
+        _exec = await execution_service.run_command(
+            raw_cmd,
+            cwd=exec_cwd,
+            timeout_seconds=timeout_seconds,
+            capability="custom_command",
+            tool_name=os.path.basename(raw_cmd.split()[0]) if raw_cmd.strip() else "raw_cmd",
+        )
+        stdout = _exec.stdout
+        stderr = _exec.stderr
+        exit_code = _exec.exit_code
+        status = _exec.status
 
         elapsed_ms = (time.time() - start_time) * 1000
         first_word = raw_cmd.split()[0] if raw_cmd else "raw_cmd"

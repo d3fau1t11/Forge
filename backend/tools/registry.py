@@ -45,7 +45,7 @@ class ToolRegistry:
             privilege_requirement="SAFE",
             risk_level="LOW",
             timeout_seconds=90,
-            args_template="-u {target}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/common.txt"
+            args_template="-u {target}/FUZZ -w {wordlist}"  # wordlist resolved at runtime by WordlistResolver
         ))
 
         self.register_tool(ToolMetadata(
