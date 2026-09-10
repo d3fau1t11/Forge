@@ -431,3 +431,125 @@ class TrajectoryEventModel(Base):
         Index("ix_trajectory_session_seq", "session_id", "sequence"),
         Index("ix_trajectory_challenge_type", "challenge_id", "event_type"),
     )
+
+
+# ============================================================================ #
+# Phase 4 — Multi-agent swarm coordination (durable, resumable)
+#
+# These three tables persist the coordination layer that sits ABOVE the Phase-1
+# AgentRuntime (agent_sessions / trajectory_events). Following the same durable
+# pattern as that layer, provenance columns (mission_id / run_id / challenge_id)
+# are PLAIN indexed strings with NO ForeignKey cascade, so coordination state
+# OUTLIVES challenge deletion and survives restarts (crash-resumable missions).
+# Created by Base.metadata.create_all in init_db(); no manual migration needed.
+# ============================================================================ #
+
+class SwarmMissionModel(Base):
+    """One coordinated multi-agent mission — the supervisor's resumable brain."""
+    __tablename__ = "swarm_missions"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+
+    # ── Provenance (plain indexed strings, no FK cascade) ──────────────────────
+    run_id = Column(String, index=True, nullable=True)
+    challenge_id = Column(String, index=True, nullable=True)
+    # The supervisor's own trajectory session (coordination events live there,
+    # kept separate from each specialist agent's execution trajectory).
+    coord_session_id = Column(String, index=True, nullable=True)
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+    # PLANNING, RUNNING, PAUSED, COMPLETED, FAILED, CANCELLED
+    status = Column(String, default="PLANNING", index=True)
+    strategy = Column(Text, default="")
+    progress = Column(Integer, default=0)
+
+    # ── Serialized SharedMissionState (aggregated cross-agent knowledge) ───────
+    shared_state = Column(JSON, default=dict)
+
+    # ── Outcome ─────────────────────────────────────────────────────────────────
+    verified_flag = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class SwarmTaskModel(Base):
+    """A structured unit of coordinated work assigned to a specialist agent."""
+    __tablename__ = "swarm_tasks"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+
+    # ── Provenance / ownership ─────────────────────────────────────────────────
+    mission_id = Column(String, index=True, nullable=False)
+    run_id = Column(String, index=True, nullable=True)
+    challenge_id = Column(String, index=True, nullable=True)
+    parent_task_id = Column(String, index=True, nullable=True)
+
+    # ── Assignment ─────────────────────────────────────────────────────────────
+    role = Column(String, default="recon", index=True)   # recon|web|forensics|crypto|pwn|rev
+    assigned_agent = Column(String, default="", index=True)  # concrete agent id (role#n)
+    objective = Column(Text, default="")
+    priority = Column(Integer, default=50)                # higher = more urgent
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+    # PENDING, READY, RUNNING, BLOCKED, COMPLETED, FAILED, CANCELLED, REASSIGNED
+    status = Column(String, default="PENDING", index=True)
+    dependencies = Column(JSON, default=list)            # [task_id, ...] must COMPLETE first
+    evidence_ids = Column(JSON, default=list)            # evidence produced by this task
+
+    # ── Bounds / bookkeeping ───────────────────────────────────────────────────
+    retry_count = Column(Integer, default=0)
+    timeout_seconds = Column(Integer, default=0)
+    signature = Column(String, index=True, default="")   # normalized dedup signature
+
+    # ── Result ─────────────────────────────────────────────────────────────────
+    result = Column(JSON, default=dict)
+    failure_reason = Column(Text, default="")
+    agent_session_id = Column(String, index=True, nullable=True)  # the AgentSession that ran it
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_swarm_task_mission_status", "mission_id", "status"),
+    )
+
+
+class SwarmEvidenceModel(Base):
+    """Structured evidence published on the Evidence Bus (agent → agent comms)."""
+    __tablename__ = "swarm_evidence"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+
+    # ── Provenance ─────────────────────────────────────────────────────────────
+    mission_id = Column(String, index=True, nullable=False)
+    run_id = Column(String, index=True, nullable=True)
+    challenge_id = Column(String, index=True, nullable=True)
+    agent_id = Column(String, index=True, default="")
+    task_id = Column(String, index=True, nullable=True)
+
+    # ── Content ────────────────────────────────────────────────────────────────
+    # service|endpoint|technology|credential|vulnerability|artifact|flag|note|failure
+    evidence_type = Column(String, default="note", index=True)
+    title = Column(String, default="")
+    description = Column(Text, default="")
+    source = Column(String, default="")            # command | observation | agent | supervisor
+    command = Column(Text, default="")
+    output = Column(Text, default="")              # truncated raw output / reference
+    artifact_id = Column(String, nullable=True)
+    confidence = Column(Float, default=0.7)
+    tags = Column(JSON, default=list)
+
+    # ── Cross-references (let another specialist consume this lead) ────────────
+    related_endpoint = Column(String, default="")
+    related_technology = Column(String, default="")
+    related_vulnerability = Column(String, default="")
+
+    signature = Column(String, index=True, default="")  # dedup signature
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_swarm_evidence_mission_type", "mission_id", "evidence_type"),
+    )

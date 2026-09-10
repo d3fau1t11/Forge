@@ -41,16 +41,16 @@ class WorkflowRunner:
         }
         self.kill_switches[run_id] = False
 
-        # Full replacement: every run dispatches the unified flexible-agent engine.
-        # The legacy ReAct loop (orchestrator_loop.run_autonomous_loop) is retired as
-        # a dispatched engine; its install/root-approval helpers remain in use by the
-        # API and the new engine.
-        selected_engine = "swarm"
+        # Engine selection. The legacy blackboard swarm remains the DEFAULT so all
+        # existing behavior/tests are unchanged. Phase 4 adds the coordinated engine
+        # (supervisor + specialist AgentRuntime agents + evidence bus), selectable via
+        # engine_type in {coord, team, supervisor, coordinated, swarm_coord}.
+        engine = (engine_type or "swarm").strip().lower()
+        coordinated = engine in ("coord", "team", "supervisor", "coordinated", "swarm_coord")
 
         try:
             loop = asyncio.get_running_loop()
 
-            from backend.agents.swarm_orchestrator import swarm_orchestrator
             from backend.database.session import SessionLocal
             from backend.database.models import ChallengeModel
             from backend.utils.workspace import resolve_safe_working_dir
@@ -76,25 +76,49 @@ class WorkflowRunner:
             os.makedirs(workdir, exist_ok=True)
             db.close()
 
-            task = loop.create_task(
-                swarm_orchestrator.run_swarm(
-                    run_id=run_id,
-                    challenge_id=challenge_id,
-                    target_scope=target,
-                    working_directory=workdir,
-                    category=category,
-                    difficulty=difficulty,
-                    resume=resume,
-                    challenge_name=challenge_name,
-                    platform=platform,
-                    description=description,
-                    flag_pattern=run_config.get("flag_pattern", ""),
-                    max_iterations=int(run_config.get("max_iterations", 0) or 0),
-                    max_minutes=int(run_config.get("max_minutes", 0) or 0),
-                    attached_file_paths=run_config.get("attached_file_paths", []),
-                    instance_expiry_ts=run_config.get("instance_expiry_ts"),
+            if coordinated:
+                # Phase 4 coordinated swarm — builds ABOVE AgentRuntime/ExecutionService.
+                from backend.swarm import SwarmCoordinator, SwarmLimits
+
+                limits = SwarmLimits(
+                    task_timeout_seconds=int(run_config.get("task_timeout", 0) or 0),
+                    max_turns_per_task=int(run_config.get("max_turns_per_task", 12) or 12),
+                    max_concurrent_agents=int(run_config.get("max_concurrent_agents", 3) or 3),
                 )
-            )
+                coordinator = SwarmCoordinator(
+                    run_id=run_id, challenge_id=challenge_id, target=target,
+                    category=category, difficulty=difficulty, challenge_name=challenge_name,
+                    platform=platform, description=description,
+                    flag_format=run_config.get("flag_pattern", ""),
+                    workspace_root=workdir, limits=limits, enable_report=True,
+                    kill_switch=lambda: self.is_kill_switch_active(run_id),
+                )
+                task = loop.create_task(coordinator.run(resume=resume))
+                selected_engine = "swarm_coord"
+            else:
+                # Full replacement: every legacy run dispatches the flexible-agent swarm.
+                from backend.agents.swarm_orchestrator import swarm_orchestrator
+
+                task = loop.create_task(
+                    swarm_orchestrator.run_swarm(
+                        run_id=run_id,
+                        challenge_id=challenge_id,
+                        target_scope=target,
+                        working_directory=workdir,
+                        category=category,
+                        difficulty=difficulty,
+                        resume=resume,
+                        challenge_name=challenge_name,
+                        platform=platform,
+                        description=description,
+                        flag_pattern=run_config.get("flag_pattern", ""),
+                        max_iterations=int(run_config.get("max_iterations", 0) or 0),
+                        max_minutes=int(run_config.get("max_minutes", 0) or 0),
+                        attached_file_paths=run_config.get("attached_file_paths", []),
+                        instance_expiry_ts=run_config.get("instance_expiry_ts"),
+                    )
+                )
+                selected_engine = "swarm"
 
             # Attach error callback so unhandled exceptions surface in logs
             def _on_task_done(t: asyncio.Task):

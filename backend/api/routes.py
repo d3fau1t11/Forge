@@ -14,7 +14,8 @@ from backend.database.models import (
     ChallengeModel, TargetProfileModel, RunModel, AgentStateModel,
     CheckpointModel, ToolExecutionModel, FindingModel, EvidenceModel,
     ReportModel, KnowledgeEntryModel, ProviderUsageModel, AuditLogModel,
-    ProviderConfigModel
+    ProviderConfigModel,
+    SwarmMissionModel, SwarmTaskModel, SwarmEvidenceModel,
 )
 from backend.environment.detector import environment_detector
 from backend.providers.router import model_router
@@ -649,7 +650,7 @@ def list_runs(db: Session = Depends(get_db)):
     return db.query(RunModel).all()
 
 @router.post("/runs/{challenge_id}/start")
-async def start_run(challenge_id: str, db: Session = Depends(get_db)):
+async def start_run(challenge_id: str, engine: Optional[str] = Query(default=None), db: Session = Depends(get_db)):
     challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
@@ -673,20 +674,21 @@ async def start_run(challenge_id: str, db: Session = Depends(get_db)):
         challenge_id=challenge_id,
         status="RUNNING",
         current_phase="recon",
-        current_agent="orchestrator"
+        current_agent=(engine or "orchestrator")
     )
     db.add(run)
     challenge.status = "RUNNING"
     db.commit()
     db.refresh(run)
 
-    workflow_runner.start_run(run.id, challenge_id, target_addr, resume=resume)
+    workflow_runner.start_run(run.id, challenge_id, target_addr, engine_type=engine, resume=resume)
 
     await ws_manager.broadcast({
         "event": "RUN_STARTED",
         "run_id": run.id,
         "challenge_id": challenge_id,
         "target": target_addr,
+        "engine": engine or "swarm",
         "resume": resume
     })
 
@@ -764,6 +766,118 @@ def get_agents():
     for _run_id, board in swarm_orchestrator.active_swarms.items():
         agents.extend(board._build_agent_states())
     return agents
+
+
+# ============================================================================ #
+# Phase 4 — coordinated swarm observability (§13). Read-only views of the
+# supervisor + specialist agents, task queue, evidence bus, and mission state.
+# Serves the LIVE coordinator when a mission is running, else the durable rows.
+# ============================================================================ #
+
+def _swarm_task_dict(t) -> dict:
+    return {
+        "id": t.id, "mission_id": t.mission_id, "role": t.role, "assigned_agent": t.assigned_agent,
+        "objective": t.objective, "priority": t.priority, "status": t.status,
+        "dependencies": t.dependencies or [], "evidence_ids": t.evidence_ids or [],
+        "retry_count": t.retry_count, "parent_task_id": t.parent_task_id,
+        "failure_reason": t.failure_reason, "agent_session_id": t.agent_session_id,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+    }
+
+
+def _swarm_evidence_dict(e) -> dict:
+    return {
+        "id": e.id, "mission_id": e.mission_id, "agent_id": e.agent_id, "task_id": e.task_id,
+        "type": e.evidence_type, "title": e.title, "description": e.description,
+        "source": e.source, "confidence": e.confidence, "tags": e.tags or [],
+        "related_endpoint": e.related_endpoint, "related_technology": e.related_technology,
+        "related_vulnerability": e.related_vulnerability,
+        "created_at": e.created_at.isoformat() if e.created_at else None,
+    }
+
+
+def _assemble_swarm_snapshot(mission_row, db) -> dict:
+    tasks = (db.query(SwarmTaskModel)
+             .filter(SwarmTaskModel.mission_id == mission_row.id)
+             .order_by(SwarmTaskModel.created_at.asc()).all())
+    evidence = (db.query(SwarmEvidenceModel)
+                .filter(SwarmEvidenceModel.mission_id == mission_row.id)
+                .order_by(SwarmEvidenceModel.created_at.desc()).all())
+    state = mission_row.shared_state or {}
+    counts: dict = {"total": len(tasks)}
+    for t in tasks:
+        counts[t.status] = counts.get(t.status, 0) + 1
+    return {
+        "mission_id": mission_row.id, "run_id": mission_row.run_id,
+        "challenge_id": mission_row.challenge_id, "status": mission_row.status,
+        "progress": mission_row.progress, "strategy": mission_row.strategy,
+        "verified_flag": mission_row.verified_flag, "shared_state": state,
+        "agents": [{"agent_id": aid, **(info or {})}
+                   for aid, info in (state.get("agent_statuses") or {}).items()],
+        "tasks": [_swarm_task_dict(t) for t in tasks],
+        "task_counts": counts,
+        "evidence_count": len(evidence),
+        "evidence": [_swarm_evidence_dict(e) for e in evidence[:100]],
+        "live": False,
+    }
+
+
+def _live_swarm_snapshot(coord) -> dict:
+    snap = coord.snapshot()
+    try:
+        snap["evidence"] = [e.to_dict() for e in coord.bus.all()[:100]]
+    except Exception:
+        snap["evidence"] = []
+    snap["live"] = True
+    return snap
+
+
+@router.get("/swarm/missions")
+def list_swarm_missions(db: Session = Depends(get_db)):
+    """All coordinated missions (most recent first)."""
+    rows = db.query(SwarmMissionModel).order_by(SwarmMissionModel.created_at.desc()).all()
+    return [{
+        "mission_id": r.id, "run_id": r.run_id, "challenge_id": r.challenge_id,
+        "status": r.status, "progress": r.progress, "verified_flag": r.verified_flag,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]
+
+
+@router.get("/swarm/missions/{mission_id}")
+def get_swarm_mission(mission_id: str, db: Session = Depends(get_db)):
+    """Full mission snapshot — live coordinator if running, else durable rows."""
+    try:
+        from backend.swarm.coordinator import active_missions
+        coord = active_missions.get(mission_id)
+        if coord is not None:
+            return _live_swarm_snapshot(coord)
+    except Exception:
+        pass
+    row = db.query(SwarmMissionModel).filter(SwarmMissionModel.id == mission_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    return _assemble_swarm_snapshot(row, db)
+
+
+@router.get("/swarm/challenges/{challenge_id}")
+def get_swarm_for_challenge(challenge_id: str, db: Session = Depends(get_db)):
+    """Latest coordinated mission for a challenge (live if running)."""
+    try:
+        from backend.swarm.coordinator import active_missions
+        coord = active_missions.get(challenge_id)
+        if coord is not None:
+            return _live_swarm_snapshot(coord)
+    except Exception:
+        pass
+    row = (db.query(SwarmMissionModel)
+           .filter(SwarmMissionModel.challenge_id == challenge_id)
+           .order_by(SwarmMissionModel.created_at.desc()).first())
+    if not row:
+        return {"mission_id": None, "challenge_id": challenge_id, "status": "NONE",
+                "tasks": [], "evidence": [], "agents": [], "evidence_count": 0,
+                "task_counts": {"total": 0}, "live": False}
+    return _assemble_swarm_snapshot(row, db)
 
 @router.post("/tools/execute")
 async def execute_tool(req: ExecuteToolRequest):
