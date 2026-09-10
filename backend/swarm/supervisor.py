@@ -158,6 +158,13 @@ class Supervisor:
 
         if status == "CANCELLED":
             return "cancelled"
+        # Phase 4.x — a capability that is unavailable-and-not-acquirable, or a target of
+        # the wrong KIND, must NOT be retried: retrying cannot change the outcome and only
+        # burns the mission budget. Classify them so decide_recovery abandons immediately.
+        if cat == "BLOCKED_CAPABILITY" or "blocked_capability" in reason:
+            return "blocked_capability"
+        if cat == "TARGET_MISMATCH" or "target_mismatch" in reason:
+            return "target_mismatch"
         if status == "TIMEOUT":
             return "timeout"
         if cat in ("COMMAND_NOT_FOUND", "MISSING_TOOL", "MISSING_DEPENDENCY"):
@@ -177,6 +184,17 @@ class Supervisor:
 
         if category == "cancelled":
             return RecoveryDecision("abandon", "Task cancelled by global stop.")
+
+        # Phase 4.x — impossible-as-specified failures: retrying is futile. Abandon so the
+        # mission records a dead end and moves on instead of re-dispatching (§15, §22).
+        if category == "blocked_capability":
+            return RecoveryDecision(
+                "abandon", "A required capability is unavailable and cannot be acquired here; "
+                           "recording a dead end rather than retrying.")
+        if category == "target_mismatch":
+            return RecoveryDecision(
+                "abandon", "The provided target is the wrong kind for this task; a correct "
+                           "target is required — abandoning to avoid wasted iterations.")
 
         # Transient categories are worth a bounded retry.
         if category in ("provider", "timeout", "network") and task.retry_count < max_retries:

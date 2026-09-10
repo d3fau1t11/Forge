@@ -72,7 +72,7 @@ class RealToolExecutor:
         if action.type == ActionType.COMMAND:
             r = await self.tool_manager.execute_raw_command(
                 action.command, cwd=cwd, timeout_seconds=timeout_seconds,
-                canonical_target=canonical_target)
+                canonical_target=canonical_target, stdin=(action.stdin or None))
             return ExecResult.from_tool_result(r)
 
         if action.type == ActionType.PYTHON_SCRIPT:
@@ -87,7 +87,7 @@ class RealToolExecutor:
             py_bin = _resolve_python() or "python3"
             r = await self.tool_manager.execute_raw_command(
                 f"{py_bin} {script_path}", cwd=cwd, timeout_seconds=timeout_seconds,
-                canonical_target=canonical_target)
+                canonical_target=canonical_target, stdin=(action.stdin or None))
             return ExecResult.from_tool_result(r)
 
         if action.type == ActionType.TOOL_CALL:

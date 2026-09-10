@@ -108,6 +108,7 @@ class LocalBackend:
             session_id=req.session_id,
             agent_id=req.agent_id,
             backend=self.kind,
+            input_data=req.stdin,
         )
 
         timed_out = (

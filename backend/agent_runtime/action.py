@@ -36,6 +36,7 @@ class Action:
     type: ActionType
     command: str = ""                          # for COMMAND
     script: str = ""                           # for PYTHON_SCRIPT
+    stdin: str = ""                            # Phase 4.x: predetermined stdin for COMMAND/PYTHON_SCRIPT
     tool_name: str = ""                        # for TOOL_CALL
     capability: str = ""                       # for TOOL_CALL
     tool_args: Dict[str, Any] = field(default_factory=dict)

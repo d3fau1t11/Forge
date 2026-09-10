@@ -931,6 +931,7 @@ def get_execution_status():
     from backend.execution.process_manager import process_manager
     from backend.execution.artifact_store import artifact_store
     from backend.agent_runtime.execution_backend import execution_backend
+    from backend.execution.interactive import interactive_manager
 
     caps = execution_backend.capabilities()
     return {
@@ -940,10 +941,58 @@ def get_execution_status():
             "active_count": process_manager.active_count(),
             "active_pids": process_manager.active_pids(),
         },
+        "interactive": {
+            "active_sessions": interactive_manager.active_count(),
+            "tracked_sessions": interactive_manager.count(),
+        },
         "artifacts": {
             "total": len(artifact_store.all_records()),
         },
     }
+
+
+@router.get("/capabilities")
+def list_capabilities():
+    """Phase 4.x — discovered capabilities in this environment (read-only).
+
+    Each entry reports availability, the chosen/alternative providers, and the
+    recommended action (execute / request_acquisition / replan). Nothing is spawned
+    or installed; discovery only inspects PATH and importable libraries.
+    """
+    from backend.execution.capabilities import capability_service
+    return {"capabilities": capability_service.summary()}
+
+
+@router.get("/capabilities/{name}")
+def get_capability(name: str):
+    """Discover a single capability by name (read-only)."""
+    from backend.execution.capabilities import capability_service
+    cap = capability_service.discover(name)
+    return cap.to_dict()
+
+
+@router.get("/execution/targets")
+def detect_target_types(spec: str = Query(..., description="Target spec (multi-target joined with '+')")):
+    """Phase 4.x — classify a target spec into structured target types (read-only).
+
+    Conservative: unresolvable parts are reported as UNKNOWN rather than guessed.
+    Multiple targets are split on the FORGE '+' delimiter.
+    """
+    from backend.execution.targets import target_detector
+    targets = target_detector.detect_multi(spec)
+    return {"spec": spec, "targets": [t.to_dict() for t in targets]}
+
+
+@router.get("/execution/interactive")
+def list_interactive_sessions():
+    """Phase 4.x — active interactive sessions as checkpoint-safe specs (no live handles)."""
+    from backend.execution.interactive import interactive_manager
+    return {
+        "active_sessions": interactive_manager.active_count(),
+        "tracked_sessions": interactive_manager.count(),
+        "sessions": interactive_manager.snapshot_specs(),
+    }
+
 
 # ----------------------------------------------------
 # PRIVILEGE MANAGER

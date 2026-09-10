@@ -24,6 +24,9 @@ STATUS_TIMEOUT = "TIMEOUT"
 STATUS_MISSING_TOOL = "MISSING_TOOL"
 STATUS_KILLED = "KILLED"
 STATUS_CANCELLED = "CANCELLED"
+# Phase 4.x — capability/target-level outcomes surfaced by the execution layer.
+STATUS_BLOCKED_CAPABILITY = "BLOCKED_CAPABILITY"
+STATUS_TARGET_MISMATCH = "TARGET_MISMATCH"
 
 
 @dataclass
@@ -45,6 +48,10 @@ class ExecutionRequest:
     action_id: str = ""
     privilege_level: str = "SAFE"
     canonical_target: Optional[str] = None
+    # Tier-1 interactive execution (Phase 4.x §4): predetermined input written once to
+    # the process's stdin after spawn (e.g. ``printf 'RETURN 0\n' | python challenge.py``
+    # expressed structurally). None keeps the ordinary one-shot behaviour unchanged.
+    stdin: Optional[str] = None
 
 
 @dataclass

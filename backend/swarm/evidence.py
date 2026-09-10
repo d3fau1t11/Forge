@@ -36,6 +36,8 @@ class EvidenceType(str, Enum):
     FLAG = "flag"
     NOTE = "note"
     FAILURE = "failure"
+    CAPABILITY = "capability"        # a capability is blocked/acquirable (Phase 4.x §15, §22)
+    TARGET_MISMATCH = "target_mismatch"  # the provided target is the wrong kind (Phase 4.x §11)
 
 
 @dataclass

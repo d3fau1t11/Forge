@@ -39,7 +39,21 @@ from backend.swarm.scheduler import TaskScheduler
 from backend.swarm.supervisor import Supervisor
 from backend.swarm.tasks import Task, TaskStatus
 
+# Phase 4.x — capability discovery / acquisition / target modelling (cycle-free imports).
+from backend.execution.capabilities import (
+    capability_service as _default_capability_service, ACQUIRABLE,
+)
+from backend.execution.acquisition import acquisition_planner as _default_acquisition_planner
+from backend.execution.targets import target_detector as _default_target_detector, TargetType
+
 logger = logging.getLogger("forge.swarm.coordinator")
+
+# Objective keywords that imply a capability requirement (kept tight so existing
+# role objectives are unaffected — only an explicit OCR/text-from-image need triggers).
+_CAP_KEYWORDS = {
+    "ocr": ("ocr", "extract text from the image", "extract text from image",
+            "read the text in the image", "text from the decoded image"),
+}
 
 # Registry of live coordinators so the API/WebSocket layer can observe the swarm.
 active_missions: Dict[str, "SwarmCoordinator"] = {}
@@ -78,6 +92,11 @@ class SwarmCoordinator:
         persist: bool = True,
         enable_report: bool = False,
         kill_switch: Optional[Callable[[], bool]] = None,
+        capability_service: Optional[Any] = None,
+        acquisition_planner: Optional[Any] = None,
+        target_detector: Optional[Any] = None,
+        allow_acquisition: bool = True,
+        acquisition_privilege_decider: Optional[Callable[[Any], bool]] = None,
     ):
         self.limits = limits or SwarmLimits()
         self.persist = persist
@@ -89,6 +108,15 @@ class SwarmCoordinator:
         self._stopped = False
         self._stop_reason = ""
 
+        # Phase 4.x — capability/target awareness (injectable for deterministic tests).
+        self.capability_service = capability_service or _default_capability_service
+        self.acquisition_planner = acquisition_planner or _default_acquisition_planner
+        self.target_detector = target_detector or _default_target_detector
+        self.allow_acquisition = allow_acquisition
+        self._acq_decider = acquisition_privilege_decider
+        self._blocked_capabilities: set = set()      # capabilities proven unavailable this mission
+        self._acquisition_attempted: set = set()      # capabilities we already tried to acquire
+
         scope = [t.strip() for t in (target or "").split("+") if t.strip()]
         self.mission = SharedMissionState(
             mission_id=self.mission_id, run_id=run_id, challenge_id=challenge_id,
@@ -96,6 +124,13 @@ class SwarmCoordinator:
             challenge_name=challenge_name, platform=platform, description=description,
             flag_format=flag_format, status="PLANNING",
         )
+        # Detect the KIND of target up front (conservative; UNKNOWN when unsure) so the
+        # snapshot/API and the pre-dispatch mismatch gate can reason about it (§9–§11).
+        try:
+            if target:
+                self.mission.target_type = self.target_detector.detect(target).type.value
+        except Exception:
+            pass
 
         # A dedicated coordination trajectory session — coordination events are
         # recorded here, kept separate from each specialist's execution trajectory
@@ -241,6 +276,11 @@ class SwarmCoordinator:
                 free = self.limits.max_concurrent_agents - len(running)
                 if free > 0:
                     for task in self.scheduler.ready_tasks(limit=free):
+                        # Phase 4.x pre-dispatch gate: a task that needs a missing capability
+                        # or the wrong kind of target is blocked HERE — never spawned — so an
+                        # impossible task cannot consume the iteration budget (§15, §22).
+                        if await self._precheck_blocks(task):
+                            continue
                         self._dispatch(task, running)
 
                 if not running:
@@ -302,6 +342,111 @@ class SwarmCoordinator:
         at = asyncio.ensure_future(coro)
         setattr(at, "_forge_task_id", task.id)
         running[task.id] = at
+
+    # ================================================================== #
+    # Phase 4.x pre-dispatch capability / target gate (§11, §15, §22)
+    # ================================================================== #
+
+    async def _precheck_blocks(self, task: Task) -> bool:
+        """Return True (and block the task) if it cannot succeed as specified.
+
+        This is the anti-infinite-retry guarantee: a task needing an unavailable,
+        non-acquirable capability, or pointed at the wrong KIND of target, is failed
+        here without ever spawning an agent — and the offending capability is
+        remembered so no sibling/follow-up task re-triggers the same dead end.
+        """
+        # 1) Target-type mismatch (only when the task explicitly declares one).
+        mism = self._detect_target_mismatch(task)
+        if mism is not None:
+            self._block_task(task, category="TARGET_MISMATCH",
+                             evidence_type=EvidenceType.TARGET_MISMATCH.value,
+                             title=mism.summary(), reason=mism.reason,
+                             action=mism.recommended_action, tags=["target_mismatch"])
+            return True
+
+        # 2) Required capabilities (explicit + conservatively auto-derived).
+        for capname in self._auto_capabilities(task):
+            cap, ok = await self._resolve_capability(capname)
+            if not ok:
+                self._block_task(task, category="BLOCKED_CAPABILITY",
+                                 evidence_type=EvidenceType.CAPABILITY.value,
+                                 title=f"capability '{capname}' unavailable",
+                                 reason=cap.reason, action=cap.recommended_action,
+                                 tags=["blocked", f"capability:{capname}"], capability=capname)
+                return True
+        return False
+
+    async def _resolve_capability(self, capname: str):
+        """Discover a capability; attempt controlled acquisition once if acquirable.
+
+        Returns (Capability, ok). ok is True only if a provider is actually usable.
+        A capability that stays unavailable is memoised in ``_blocked_capabilities``
+        so it is never re-discovered/re-acquired for another task this mission.
+        """
+        cap = self.capability_service.discover(capname)
+        if cap.available:
+            return cap, True
+        if capname in self._blocked_capabilities:
+            return cap, False
+        if (self.allow_acquisition and cap.status == ACQUIRABLE
+                and capname not in self._acquisition_attempted):
+            self._acquisition_attempted.add(capname)
+            try:
+                res = await self.acquisition_planner.acquire(
+                    capname, agent="supervisor", privilege_decider=self._acq_decider)
+                self._record_coord("ACQUISITION", strategy=capname,
+                                   result=("SUCCESS" if res.success else "PENDING"),
+                                   decision_summary=(res.reason or "")[:300])
+                if res.success:
+                    self.capability_service.refresh(capname)
+                    cap2 = self.capability_service.discover(capname)
+                    if cap2.available:
+                        return cap2, True
+            except Exception as e:  # acquisition must never crash the mission
+                logger.debug(f"[SwarmCoordinator] acquisition error for {capname}: {e}")
+        self._blocked_capabilities.add(capname)
+        return cap, False
+
+    def _detect_target_mismatch(self, task: Task):
+        if not task.target_type:
+            return None
+        try:
+            required = TargetType(task.target_type)
+        except Exception:
+            return None
+        tgt = self.mission.target or ""
+        if not tgt:
+            return None
+        try:
+            provided = self.target_detector.detect(tgt)
+            return self.target_detector.classify_mismatch(required, provided)
+        except Exception:
+            return None
+
+    def _auto_capabilities(self, task: Task) -> List[str]:
+        caps = list(task.required_capabilities or [])
+        text = (task.objective or "").lower()
+        for capname, kws in _CAP_KEYWORDS.items():
+            if capname not in caps and any(kw in text for kw in kws):
+                caps.append(capname)
+        return caps
+
+    def _block_task(self, task: Task, *, category: str, evidence_type: str, title: str,
+                    reason: str, action: str, tags: List[str], capability: str = "") -> None:
+        """Terminally block a task (no retry) and record structured, learnable evidence."""
+        self.bus.publish(Evidence(
+            mission_id=self.mission_id, agent_id=task.role, task_id=task.id,
+            evidence_type=evidence_type, title=(title or "")[:400], description=(reason or "")[:500],
+            source="supervisor", confidence=0.6,
+            tags=list(tags or []) + [f"action:{action}"], related_technology=capability or ""))
+        self.scheduler.mark_failed(task, reason=f"{category}: {reason}")
+        self.mission.record_dead_end(f"{task.role}: {category} — {(reason or '')[:80]}")
+        self._record_coord(category, command=(task.objective or "")[:400], strategy=task.role,
+                           result="BLOCKED", decision_summary=(reason or "")[:300])
+        events.broadcast(events.TASK_FAILED, {
+            **self._task_event(task, task.assigned_agent or ""),
+            "reason": reason, "category": category})
+        self._save_mission()
 
     # ================================================================== #
     # Result handling

@@ -104,8 +104,14 @@ class ExecutionService:
         session_id: str = "",
         agent_id: str = "",
         canonical_target: Optional[str] = None,
+        stdin: Optional[str] = None,
     ) -> ExecutionResult:
-        """Run an arbitrary shell command and return an ExecutionResult."""
+        """Run an arbitrary shell command and return an ExecutionResult.
+
+        Passing *stdin* feeds predetermined input to the process once (Tier-1
+        scripted interactive execution, Phase 4.x §4); it defaults to None, so
+        existing one-shot callers are unaffected.
+        """
         request = ExecutionRequest(
             command=command,
             cwd=cwd,
@@ -115,8 +121,25 @@ class ExecutionService:
             session_id=session_id,
             agent_id=agent_id,
             canonical_target=canonical_target,
+            stdin=stdin,
         )
         return await self.execute(request)
+
+    # ------------------------------------------------------------------ #
+    # Persistent interactive execution (Phase 4.x §5).  A persistent process
+    # is NOT an ordinary one-shot command, so it is served by a dedicated
+    # manager rather than the backend.execute() path.  Kept here as a thin
+    # delegate so callers have one execution entry point.
+    # ------------------------------------------------------------------ #
+
+    async def open_interactive(self, command: str, **kwargs):
+        """Start a persistent interactive process. Returns an InteractiveSession.
+
+        See :class:`backend.execution.interactive.InteractiveSession`. Imported
+        lazily so the base execution layer has no hard dependency on it.
+        """
+        from backend.execution.interactive import interactive_manager
+        return await interactive_manager.open(command, **kwargs)
 
 
 # Module-level singleton.

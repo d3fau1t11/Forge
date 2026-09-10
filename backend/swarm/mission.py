@@ -40,6 +40,7 @@ class SharedMissionState:
     description: str = ""
     flag_format: str = ""
     target: str = ""
+    target_type: str = ""          # Phase 4.x: detected TargetType of `target` (observability/§11)
     scope: List[str] = field(default_factory=list)
 
     # ── Aggregated knowledge (promoted from agents via evidence) ────────────

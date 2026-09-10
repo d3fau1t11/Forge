@@ -234,13 +234,15 @@ class ToolManager:
         command: str,
         cwd: Optional[str] = None,
         timeout_seconds: int = 120,
-        canonical_target: Optional[str] = None
+        canonical_target: Optional[str] = None,
+        stdin: Optional[str] = None
     ) -> ToolExecutionResult:
         start_time = time.time()
         raw_cmd = sanitize_and_correct_command_target(command.strip(), canonical_target)
         logger.info(f"Executing raw CLI command (cwd={cwd}): {raw_cmd}")
 
-        # Delegate subprocess execution to ExecutionService (Phase 3)
+        # Delegate subprocess execution to ExecutionService (Phase 3). When *stdin* is
+        # supplied it is fed to the process once (Tier-1 scripted interactive, Phase 4.x §4).
         exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
         _exec = await execution_service.run_command(
             raw_cmd,
@@ -248,6 +250,7 @@ class ToolManager:
             timeout_seconds=timeout_seconds,
             capability="custom_command",
             tool_name=os.path.basename(raw_cmd.split()[0]) if raw_cmd.strip() else "raw_cmd",
+            stdin=stdin,
         )
         stdout = _exec.stdout
         stderr = _exec.stderr

@@ -55,12 +55,16 @@ class ProcessManager:
         session_id: str = "",
         agent_id: str = "",
         backend: str = "local",
+        input_data: Optional[str] = None,
     ) -> tuple[str, str, int]:
         """
         Run *command* in a subprocess and return (stdout, stderr, exit_code).
 
-        On timeout the process tree is killed and exit_code -1 is returned with
-        a descriptive stderr message.  The caller decides what status to assign.
+        When *input_data* is supplied it is written once to the process's stdin
+        (Tier-1 scripted interactive execution, Phase 4.x §4): the structured
+        equivalent of ``printf '...' | command``.  On timeout the process tree is
+        killed and exit_code -1 is returned with a descriptive stderr message.
+        The caller decides what status to assign.
         """
         merged_env = None
         if env:
@@ -71,6 +75,8 @@ class ProcessManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            if input_data is not None:
+                kwargs["stdin"] = asyncio.subprocess.PIPE
             if cwd and os.path.isdir(cwd):
                 kwargs["cwd"] = cwd
             if merged_env:
@@ -95,9 +101,10 @@ class ProcessManager:
         )
         self._active[process.pid] = managed
 
+        stdin_bytes = input_data.encode(errors="replace") if input_data is not None else None
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
-                process.communicate(), timeout=float(timeout_seconds)
+                process.communicate(input=stdin_bytes), timeout=float(timeout_seconds)
             )
             managed.state = "done"
             return (
@@ -144,6 +151,25 @@ class ProcessManager:
             process.kill()
         except ProcessLookupError:
             pass
+
+    async def kill(self, process: asyncio.subprocess.Process) -> None:
+        """Public entry point to kill a process tree (used by interactive sessions)."""
+        await self._kill_tree(process)
+
+    # ------------------------------------------------------------------ #
+    # External process registration — lets long-lived interactive sessions
+    # (which own their own asyncio.subprocess.Process) still appear in the one
+    # place all active PIDs are visible, for diagnostics and the compliance audit.
+    # ------------------------------------------------------------------ #
+
+    def register(self, managed: ManagedProcess) -> None:
+        self._active[managed.pid] = managed
+
+    def unregister(self, pid: int) -> None:
+        self._active.pop(pid, None)
+
+    def get(self, pid: int) -> Optional[ManagedProcess]:
+        return self._active.get(pid)
 
     # ------------------------------------------------------------------ #
 

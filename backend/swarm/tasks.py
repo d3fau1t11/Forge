@@ -51,6 +51,10 @@ class Task:
     retry_count: int = 0
     timeout_seconds: int = 0
     signature: str = ""
+    # Phase 4.x coordination hints (in-memory only — NOT persisted to swarm_tasks, so
+    # no schema migration is required; they are re-derived live on each dispatch/resume).
+    required_capabilities: List[str] = field(default_factory=list)
+    target_type: str = ""
     result: Dict[str, Any] = field(default_factory=dict)
     failure_reason: str = ""
     agent_session_id: Optional[str] = None
@@ -82,6 +86,8 @@ class Task:
             "priority": self.priority, "status": self.status, "dependencies": list(self.dependencies),
             "evidence_ids": list(self.evidence_ids), "retry_count": self.retry_count,
             "timeout_seconds": self.timeout_seconds, "signature": self.signature,
+            "required_capabilities": list(self.required_capabilities or []),
+            "target_type": self.target_type or "",
             "result": dict(self.result or {}), "failure_reason": self.failure_reason,
             "agent_session_id": self.agent_session_id, "created_at": self.created_at,
             "started_at": self.started_at, "completed_at": self.completed_at,
