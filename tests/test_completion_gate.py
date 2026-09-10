@@ -11,7 +11,8 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 from backend.database.session import SessionLocal
 from backend.database.models import (
     ChallengeModel, RunModel, TargetProfileModel, AgentStateModel,
-    CheckpointModel, ToolExecutionModel, FindingModel, EvidenceModel
+    CheckpointModel, ToolExecutionModel, FindingModel, EvidenceModel,
+    ReportModel
 )
 
 
@@ -25,13 +26,13 @@ class TestDualGatedCompletion(unittest.TestCase):
         # FK-safe cleanup: SQLite runs with PRAGMA foreign_keys=ON, and a bulk
         # query().delete() does NOT honor ORM cascades — so children must be
         # deleted before their parents. Earlier suites (e.g. the competition
-        # harness) leave checkpoint / tool-execution rows referencing runs, which
-        # made the old runs-then-challenges delete raise a FK IntegrityError and
-        # error every test in this class.
+        # harness) leave checkpoint / tool-execution rows referencing runs AND
+        # report rows referencing challenges, which made the old delete raise a FK
+        # IntegrityError (DELETE FROM challenges) and error every test in this class.
         try:
             for model in (
                 CheckpointModel, ToolExecutionModel, AgentStateModel,
-                EvidenceModel, FindingModel, TargetProfileModel,
+                EvidenceModel, FindingModel, ReportModel, TargetProfileModel,
                 RunModel, ChallengeModel,
             ):
                 self.db.query(model).delete()

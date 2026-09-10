@@ -560,6 +560,80 @@ class TestCapabilityReportRegression(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 13. Execution-layer status endpoint + operator-terminal delegation (Phase 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _multipart_available() -> bool:
+    """backend.api.routes defines Form/UploadFile endpoints that need
+    python-multipart at import time; the execution layer itself does not, so the
+    handler test below is guarded on this rather than coupling the whole suite
+    to the FastAPI surface."""
+    import importlib.util
+    return importlib.util.find_spec("multipart") is not None
+
+
+class TestExecutionStatusEndpoint(unittest.TestCase):
+    """GET /execution/status (criterion #8) and the operator terminal delegating
+    to the shared ExecutionService instead of spawning its own subprocess
+    (criterion #11).
+
+    The status payload's data sources are verified directly so the execution-layer
+    suite stays decoupled from the full FastAPI surface; the HTTP handlers are
+    exercised whenever that surface is importable here.
+    """
+
+    def test_execution_status_payload_sources(self):
+        # Exactly what GET /execution/status aggregates — verified via the real
+        # Phase 3 singletons so the endpoint always has well-formed data to return.
+        from backend.execution.service import execution_service
+        from backend.execution.process_manager import process_manager
+        from backend.execution.artifact_store import artifact_store
+        from backend.agent_runtime.execution_backend import execution_backend
+
+        backends = execution_service.list_backends()
+        self.assertEqual(backends["default"], "local")
+        self.assertIn("local", backends["registered"])
+
+        env = execution_backend.capabilities().to_dict()
+        for key in ("os", "backend_kind", "available_tools", "available_python_libs"):
+            self.assertIn(key, env)
+
+        self.assertIsInstance(process_manager.active_count(), int)
+        self.assertIsInstance(process_manager.active_pids(), list)
+        self.assertIsInstance(artifact_store.all_records(), list)
+
+    @unittest.skipUnless(
+        _multipart_available(),
+        "backend.api.routes needs python-multipart (Form/UploadFile endpoints)")
+    def test_status_and_terminal_handlers(self):
+        from backend.api import routes
+        from backend.api.routes import (
+            TerminalExecuteRequest, get_execution_status, execute_terminal_command)
+        from backend.execution.base import ExecutionResult
+
+        # GET /execution/status returns environment/backend/process/artifact info.
+        status = get_execution_status()
+        for key in ("environment", "backends", "processes", "artifacts"):
+            self.assertIn(key, status)
+        self.assertIn("local", status["backends"]["registered"])
+        self.assertIn("os", status["environment"])
+
+        # POST /terminal/execute delegates to ExecutionService (no local subprocess).
+        fake = ExecutionResult(status="SUCCESS", stdout="root\n", exit_code=0, command="whoami")
+        with patch.object(routes.execution_service, "run_command",
+                          AsyncMock(return_value=fake)) as mock_run, \
+             patch.object(routes.ws_manager, "broadcast", AsyncMock()):
+            payload = _run(execute_terminal_command(
+                TerminalExecuteRequest(command="whoami")))
+
+        mock_run.assert_awaited_once()
+        self.assertEqual(mock_run.await_args.args[0], "whoami")
+        self.assertEqual(payload["event"], "LOG_OUTPUT")
+        self.assertEqual(payload["output"], "root\n")
+        self.assertEqual(payload["exit_code"], 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     unittest.main()

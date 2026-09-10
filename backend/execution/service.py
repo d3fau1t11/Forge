@@ -62,6 +62,13 @@ class ExecutionService:
             backend = self._backends["local"]
         return backend
 
+    def list_backends(self) -> dict:
+        """Return the registered backend kinds and the default (for status/diagnostics)."""
+        return {
+            "default": self._default_backend_kind,
+            "registered": list(self._backends.keys()),
+        }
+
     # ------------------------------------------------------------------ #
 
     async def execute(

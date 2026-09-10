@@ -21,6 +21,7 @@ from backend.providers.router import model_router
 from backend.providers.snippet_parser import SnippetParser
 from backend.tools.registry import tool_registry
 from backend.tools.manager import tool_manager
+from backend.execution.service import execution_service
 from backend.api.runner import workflow_runner
 from backend.websocket.manager import ws_manager
 from backend.reporting.generator import report_generator
@@ -772,20 +773,22 @@ async def execute_tool(req: ExecuteToolRequest):
 @router.post("/terminal/execute")
 async def execute_terminal_command(req: TerminalExecuteRequest):
     start_time = datetime.utcnow()
+    # Phase 3: route the operator terminal through the SAME execution layer as the
+    # agent (ExecutionService -> LocalBackend -> ProcessManager) instead of spawning a
+    # subprocess here. This gives Windows python3->python normalisation, process-tree
+    # tracking, and execution-failure classification for free, and keeps a single
+    # execution path across the whole system.
+    exec_cwd = req.working_directory if (req.working_directory and os.path.exists(req.working_directory)) else None
     try:
-        exec_cwd = req.working_directory if (req.working_directory and os.path.exists(req.working_directory)) else None
-        process = await asyncio.create_subprocess_shell(
+        exec_result = await execution_service.run_command(
             req.command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=exec_cwd
+            cwd=exec_cwd,
+            timeout_seconds=60,
+            capability="terminal_command",
+            tool_name="terminal",
         )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=60)
-        output = stdout_bytes.decode(errors="replace") or stderr_bytes.decode(errors="replace") or "Command completed with no output."
-        exit_code = process.returncode
-    except asyncio.TimeoutError:
-        output = "Command timed out after 60 seconds."
-        exit_code = -1
+        output = exec_result.stdout or exec_result.stderr or "Command completed with no output."
+        exit_code = exec_result.exit_code
     except Exception as e:
         output = f"Execution error: {str(e)}"
         exit_code = -1
@@ -800,6 +803,33 @@ async def execute_terminal_command(req: TerminalExecuteRequest):
     }
     await ws_manager.broadcast(event_payload)
     return event_payload
+
+
+@router.get("/execution/status")
+def get_execution_status():
+    """Phase 3 execution-layer status.
+
+    Read-only snapshot of WHERE/HOW commands run: the reported execution
+    environment (OS + installed tools + python libs), the registered execution
+    backends, the live process count from the ProcessManager, and the artifact
+    store. Surfaces the Phase 3 layer without spawning anything.
+    """
+    from backend.execution.process_manager import process_manager
+    from backend.execution.artifact_store import artifact_store
+    from backend.agent_runtime.execution_backend import execution_backend
+
+    caps = execution_backend.capabilities()
+    return {
+        "environment": caps.to_dict(),
+        "backends": execution_service.list_backends(),
+        "processes": {
+            "active_count": process_manager.active_count(),
+            "active_pids": process_manager.active_pids(),
+        },
+        "artifacts": {
+            "total": len(artifact_store.all_records()),
+        },
+    }
 
 # ----------------------------------------------------
 # PRIVILEGE MANAGER

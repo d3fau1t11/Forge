@@ -5,7 +5,6 @@ from urllib.parse import urlparse
 import asyncio
 import time
 import shutil
-import subprocess
 import logging
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
