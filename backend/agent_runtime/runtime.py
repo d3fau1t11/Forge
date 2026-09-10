@@ -83,8 +83,10 @@ class RealToolExecutor:
             except Exception as e:
                 return ExecResult(status="FAILED", stderr=f"Failed to write solve.py: {e}",
                                   exit_code=-1, execution_failure=True, failure_category="IO")
+            from backend.execution.backends.local import _resolve_python
+            py_bin = _resolve_python() or "python3"
             r = await self.tool_manager.execute_raw_command(
-                f"python3 {script_path}", cwd=cwd, timeout_seconds=timeout_seconds,
+                f"{py_bin} {script_path}", cwd=cwd, timeout_seconds=timeout_seconds,
                 canonical_target=canonical_target)
             return ExecResult.from_tool_result(r)
 
