@@ -51,8 +51,9 @@ class Task:
     retry_count: int = 0
     timeout_seconds: int = 0
     signature: str = ""
-    # Phase 4.x coordination hints (in-memory only — NOT persisted to swarm_tasks, so
-    # no schema migration is required; they are re-derived live on each dispatch/resume).
+    # Phase 4.x coordination hints. Persisted to swarm_tasks (Phase 4.x hardening
+    # §5/§6) so the pre-dispatch capability gate and target-mismatch gate still fire
+    # for a task reloaded after a checkpoint/resume — not silently dropped.
     required_capabilities: List[str] = field(default_factory=list)
     target_type: str = ""
     result: Dict[str, Any] = field(default_factory=dict)
@@ -122,6 +123,8 @@ class Task:
                 row.result = dict(self.result or {})
                 row.failure_reason = self.failure_reason or ""
                 row.agent_session_id = self.agent_session_id
+                row.required_capabilities = list(self.required_capabilities or [])
+                row.target_type = self.target_type or ""
                 row.started_at = _parse_dt(self.started_at)
                 row.completed_at = _parse_dt(self.completed_at)
                 db.commit()
@@ -141,6 +144,8 @@ class Task:
             evidence_ids=list(row.evidence_ids or []), retry_count=row.retry_count or 0,
             timeout_seconds=row.timeout_seconds or 0, signature=row.signature or "",
             result=dict(row.result or {}), failure_reason=row.failure_reason or "",
+            required_capabilities=list(getattr(row, "required_capabilities", None) or []),
+            target_type=(getattr(row, "target_type", "") or ""),
             agent_session_id=row.agent_session_id, id=row.id,
             created_at=(row.created_at.isoformat() if row.created_at else datetime.utcnow().isoformat()),
             started_at=(row.started_at.isoformat() if row.started_at else None),

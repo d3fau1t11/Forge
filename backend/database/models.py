@@ -508,6 +508,13 @@ class SwarmTaskModel(Base):
     failure_reason = Column(Text, default="")
     agent_session_id = Column(String, index=True, nullable=True)  # the AgentSession that ran it
 
+    # ── Phase 4.x coordination hints ───────────────────────────────────────────
+    # Persisted so the pre-dispatch capability gate and target-mismatch gate still
+    # fire for a task that is reloaded after a checkpoint/resume, instead of being
+    # silently dropped because these were in-memory only (Phase 4.x hardening §5/§6).
+    required_capabilities = Column(JSON, default=list)   # capability names the task needs
+    target_type = Column(String, default="")             # required TargetType.value (or "")
+
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)

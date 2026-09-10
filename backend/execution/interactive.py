@@ -125,6 +125,11 @@ class InteractiveSessionSpec:
     last_interaction_at: float = 0.0
     transcript_tail: str = ""
     state: str = "restartable"       # restartable | closed
+    execution_id: str = ""           # stable per-attempt id (defaults to session_key)
+
+    def __post_init__(self) -> None:
+        if not self.execution_id:
+            self.execution_id = self.session_key
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -134,13 +139,15 @@ class InteractiveSessionSpec:
             "use_pty": self.use_pty, "created_at": self.created_at,
             "last_interaction_at": self.last_interaction_at,
             "transcript_tail": self.transcript_tail, "state": self.state,
+            "execution_id": self.execution_id,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "InteractiveSessionSpec":
         data = data or {}
+        session_key = data.get("session_key") or str(uuid.uuid4())
         return cls(
-            session_key=data.get("session_key") or str(uuid.uuid4()),
+            session_key=session_key,
             command=data.get("command", ""), cwd=data.get("cwd"),
             target=data.get("target", ""), env_keys=list(data.get("env_keys", []) or []),
             owner_session_id=data.get("owner_session_id", ""),
@@ -150,6 +157,7 @@ class InteractiveSessionSpec:
             last_interaction_at=float(data.get("last_interaction_at", 0.0) or 0.0),
             transcript_tail=data.get("transcript_tail", ""),
             state=data.get("state", "restartable"),
+            execution_id=data.get("execution_id") or session_key,
         )
 
 
@@ -227,7 +235,8 @@ class InteractiveSession:
             process_manager.register(ManagedProcess(
                 pid=self._proc.pid, command=command, session_id=self.owner_session_id,
                 agent_id=self.owner_agent_id, backend="interactive",
-                timeout_seconds=int(self.max_lifetime), state="running"))
+                timeout_seconds=int(self.max_lifetime), state="running",
+                execution_id=self.session_key))
         self._emit(EVENT_START, {"command": command, "pid": self.pid, "pty": self.use_pty})
         logger.info(f"[InteractiveSession {self.session_key[:8]}] started pid={self.pid} pty={self.use_pty}")
         return self
@@ -441,6 +450,47 @@ class InteractiveSession:
             except Exception:
                 pass
 
+    def _release_pty_sync(self) -> None:
+        """Release PTY transport + master fd without awaiting (idempotent)."""
+        try:
+            if self._pty_transport is not None:
+                self._pty_transport.close()
+                self._pty_transport = None
+        except Exception:
+            pass
+        try:
+            if self._pty_master is not None:
+                os.close(self._pty_master)
+                self._pty_master = None
+        except Exception:
+            pass
+
+    def detach_sync(self, *, reason: str = "resume_stale") -> None:
+        """Synchronously terminate + release this session with no running event loop.
+
+        Used by the synchronous resume path (:meth:`InteractiveSessionManager.mark_all_stale`)
+        where we cannot ``await`` a graceful close. Terminates the FORGE-tracked OS
+        process (never a foreign one — see ``ProcessManager.terminate_pid``), releases
+        PTY handles, and marks the session closed. Idempotent and crash-free: a process
+        that already exited is handled gracefully.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        pid = self.pid
+        if pid is not None:
+            try:
+                process_manager.terminate_pid(pid, reason=reason)
+            except Exception:
+                pass
+        self._release_pty_sync()
+        self._emit(EVENT_CLOSE, {"reason": reason, "returncode": self.returncode})
+        if self._on_close is not None:
+            try:
+                self._on_close(self.session_key)
+            except Exception:
+                pass
+
     async def _enforce_lifetime(self) -> bool:
         """If the session exceeded its max lifetime, terminate + record. Returns True then."""
         if self.max_lifetime and self.created_at and (time.time() - self.created_at) > self.max_lifetime:
@@ -550,24 +600,92 @@ class InteractiveSessionManager:
         return [s.spec().to_dict() for s in self._sessions.values()]
 
     def mark_all_stale(self) -> List[InteractiveSessionSpec]:
-        """On resume, forget live handles and return restartable specs (§8).
+        """Synchronous resume cleanup — terminate every tracked session, then return
+        restartable specs (§8, Phase 4.x hardening §2/§4).
 
-        Any process that was running before the interruption is gone (its handle
-        did not survive); we return its spec marked ``restartable`` so the caller
-        can decide whether to restart it, and clear the in-memory registry.
+        The correct checkpoint semantics for an interactive process is
+        *terminate-and-recreate*: its live stdin/stdout/PTY state cannot be restored,
+        so on resume the old process must not survive. Earlier this method ONLY
+        cleared the in-memory registry — which, if any process was still alive (an
+        in-process pause/resume rather than a full restart), orphaned it, left a
+        stale ``ProcessManager`` entry hiding a running process, and risked a
+        duplicate (old + new) process after resume. It now explicitly terminates
+        each still-live, FORGE-tracked process before clearing, so the registry can
+        never diverge from the real process lifecycle.
+
+        Prefer the async :meth:`reset_for_resume` when an event loop is available (it
+        reaps children gracefully, avoiding a transient zombie). This synchronous
+        variant exists for resume paths with no running loop; it is idempotent and
+        safe on already-dead processes.
         """
         specs: List[InteractiveSessionSpec] = []
-        for s in self._sessions.values():
+        for s in list(self._sessions.values()):
             sp = s.spec()
             sp.state = "restartable"
             specs.append(sp)
+            try:
+                s.detach_sync(reason="resume_stale")
+            except Exception as exc:
+                logger.warning(f"PROCESS_CLEANUP_FAILED session={s.session_key[:8]} error={exc}")
         self._sessions.clear()
         return specs
+
+    async def reset_for_resume(self, *, reason: str = "resume_restart") -> List[InteractiveSessionSpec]:
+        """Async resume cleanup: gracefully terminate all sessions and return their
+        restartable specs (§8, Phase 4.x hardening §2/§3/§4).
+
+        Preferred resume primitive when an event loop is running: each session is
+        closed via :meth:`InteractiveSession.close`, which kills the OS process tree,
+        reaps the child (no zombie), releases PTY handles, and unregisters the PID
+        from the ProcessManager. After it returns, no old process can survive to be
+        duplicated by a recreated one. Idempotent — a second call returns ``[]``.
+        """
+        specs: List[InteractiveSessionSpec] = []
+        for s in list(self._sessions.values()):
+            sp = s.spec()
+            sp.state = "restartable"
+            specs.append(sp)
+        for s in list(self._sessions.values()):
+            try:
+                await s.close(reason=reason)
+            except Exception as exc:
+                logger.warning(f"PROCESS_CLEANUP_FAILED session={s.session_key[:8]} error={exc}")
+        self._sessions.clear()
+        return specs
+
+    async def close_for_owner(self, owner_session_id: str, *, reason: str = "owner_cleanup") -> int:
+        """Terminate only the sessions owned by a specific agent session.
+
+        Targeted cleanup (unlike :meth:`close_all`) so a resume/disconnect for one
+        logical owner cannot tear down another concurrent mission's live sessions.
+        """
+        n = 0
+        for key, s in list(self._sessions.items()):
+            if s.owner_session_id == owner_session_id:
+                if await self.close(key, reason=reason):
+                    n += 1
+        return n
 
     def _reap(self) -> None:
         dead = [k for k, s in self._sessions.items() if not s.is_alive()]
         for k in dead:
-            self._sessions.pop(k, None)
+            s = self._sessions.pop(k, None)
+            if s is None:
+                continue
+            # A self-exited interactive process must not leave a stale entry in the
+            # ProcessManager registry (that would inflate the live-process count and
+            # hide the fact that the OS process is already gone). Release both the
+            # registry entry and any lingering PTY handles.
+            try:
+                pid = s.pid
+                if pid is not None:
+                    process_manager.unregister(pid)
+            except Exception:
+                pass
+            try:
+                s._release_pty_sync()
+            except Exception:
+                pass
 
 
 # Module-level singleton — one place all interactive sessions are tracked.

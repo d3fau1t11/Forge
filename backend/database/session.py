@@ -110,6 +110,17 @@ def init_db():
                     conn.commit()
                 except Exception:
                     pass
+            # Phase 4.x hardening: persist swarm task coordination hints so the
+            # capability/target gates survive checkpoint/resume (§5/§6).
+            for _ddl in (
+                "ALTER TABLE swarm_tasks ADD COLUMN required_capabilities JSON",
+                "ALTER TABLE swarm_tasks ADD COLUMN target_type VARCHAR DEFAULT ''",
+            ):
+                try:
+                    conn.execute(text(_ddl))
+                    conn.commit()
+                except Exception:
+                    pass
 
     # Phase 2: warm the in-memory FTS indexes AFTER create_all + migration. The
     # experience/trajectory singletons build their indexes at import time, which in

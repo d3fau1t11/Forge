@@ -50,6 +50,8 @@ ECHO_CHILD = (
 )
 # A child that just sleeps (for max-lifetime enforcement).
 SLEEP_CHILD = "import time\ntime.sleep(30)\n"
+# A child that prints one line and exits immediately (already-dead cleanup tests).
+QUICK_CHILD = "print('bye', flush=True)\n"
 
 
 def _write_child(body: str, name: str = "challenge.py") -> str:
@@ -320,20 +322,29 @@ class TestInteractiveCheckpoint(unittest.TestCase):
             self.assertEqual(sess.spec().state, "closed")
         _run(scenario())
 
-    def test_mark_all_stale_returns_restartable_and_clears(self):
+    def test_mark_all_stale_terminates_and_does_not_orphan(self):
+        # Phase 4.x hardening §2/§8 (Test A): the synchronous resume cleanup must
+        # TERMINATE each still-live tracked process, not merely clear bookkeeping.
+        # Previously this orphaned live processes and left stale ProcessManager rows.
         from backend.execution.interactive import interactive_manager
+        from backend.execution.process_manager import process_manager
 
         async def scenario():
             await interactive_manager.open(f'"{PY}" "{_write_child(SLEEP_CHILD)}"', idle_timeout=0.3)
             await interactive_manager.open(f'"{PY}" "{_write_child(SLEEP_CHILD)}"', idle_timeout=0.3)
+            live = interactive_manager.all()
+            pids = [s.pid for s in live]
+            self.assertTrue(all(p in process_manager.active_pids() for p in pids))
+
             specs = interactive_manager.mark_all_stale()
             self.assertEqual(len(specs), 2)
             self.assertTrue(all(s.state == "restartable" for s in specs))
-            self.assertEqual(interactive_manager.count(), 0)  # registry cleared on resume
+            self.assertEqual(interactive_manager.count(), 0)          # registry cleared
+            # No orphans: every previously-tracked process is terminated + unregistered.
+            for s, pid in zip(live, pids):
+                self.assertFalse(s.is_alive())
+                self.assertNotIn(pid, process_manager.active_pids())
         _run(scenario())
-        # The processes were orphaned by mark_all_stale (handles forgotten) — best-effort
-        # reap so the test host stays clean.
-        _run(interactive_manager.close_all())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -793,6 +804,274 @@ class TestTrajectoryInteractiveEvents(unittest.TestCase):
         kinds = {e.event_type for e in recent}
         self.assertIn(EVENT_START, kinds)
         self.assertIn(EVENT_CLOSE, kinds)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. Phase 4.x HARDENING — interactive process lifecycle across checkpoint/resume
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInteractiveResumeLifecycle(unittest.TestCase):
+    """Checkpoint/resume must never orphan or duplicate an interactive process."""
+
+    def tearDown(self):
+        from backend.execution.interactive import interactive_manager
+        _run(interactive_manager.close_all())
+
+    def test_reset_for_resume_terminates_no_orphan(self):
+        # Test A: the async resume primitive terminates + reaps every tracked process.
+        from backend.execution.interactive import interactive_manager
+        from backend.execution.process_manager import process_manager
+
+        async def scenario():
+            await interactive_manager.open(f'"{PY}" "{_write_child(SLEEP_CHILD)}"', idle_timeout=0.3)
+            await interactive_manager.open(f'"{PY}" "{_write_child(SLEEP_CHILD)}"', idle_timeout=0.3)
+            live = interactive_manager.all()
+            pids = [s.pid for s in live]
+            specs = await interactive_manager.reset_for_resume()
+            self.assertEqual(len(specs), 2)
+            self.assertTrue(all(sp.state == "restartable" for sp in specs))
+            self.assertEqual(interactive_manager.count(), 0)
+            for s, pid in zip(live, pids):
+                self.assertFalse(s.is_alive())
+                self.assertIsNotNone(s.returncode)          # child reaped → truly dead
+                self.assertNotIn(pid, process_manager.active_pids())
+        _run(scenario())
+
+    def test_resume_does_not_duplicate_process(self):
+        # Test C: after resume-cleanup + recreate there is exactly ONE live process
+        # for the same logical session — never old + new.
+        from backend.execution.interactive import interactive_manager
+        from backend.execution.process_manager import process_manager
+
+        async def scenario():
+            cmd = f'"{PY}" "{_write_child(ECHO_CHILD)}"'
+            s1 = await interactive_manager.open(cmd, session_key="dup-key", idle_timeout=0.3)
+            pid1 = s1.pid
+            # Interruption → resume cleanup terminates the old process.
+            await interactive_manager.reset_for_resume()
+            self.assertFalse(s1.is_alive())
+            self.assertNotIn(pid1, process_manager.active_pids())
+            # Recreate the same logical session (as a resume would, from its spec).
+            s2 = await interactive_manager.open(cmd, session_key="dup-key", idle_timeout=0.3)
+            pid2 = s2.pid
+            self.assertNotEqual(pid1, pid2)                    # a genuinely new OS process
+            self.assertTrue(s2.is_alive())
+            self.assertEqual(interactive_manager.count(), 1)   # exactly one, not two
+            self.assertIn(pid2, process_manager.active_pids())
+            self.assertNotIn(pid1, process_manager.active_pids())
+            await s2.close()
+        _run(scenario())
+
+    def test_cleanup_is_idempotent(self):
+        # Test D: repeated cleanup must not crash and must leave a consistent state.
+        from backend.execution.interactive import interactive_manager
+
+        async def scenario():
+            sess = await interactive_manager.open(f'"{PY}" "{_write_child(SLEEP_CHILD)}"', idle_timeout=0.3)
+            first = await interactive_manager.reset_for_resume()
+            self.assertEqual(len(first), 1)
+            second = await interactive_manager.reset_for_resume()      # nothing left
+            self.assertEqual(second, [])
+            self.assertEqual(interactive_manager.mark_all_stale(), [])  # sync variant too
+            await sess.close()                                         # double close is safe
+            await sess.close()
+            self.assertEqual(interactive_manager.count(), 0)
+        _run(scenario())
+
+
+class TestInteractiveRegistryHygiene(unittest.TestCase):
+    """The ProcessManager registry must reflect real process state — no stale rows."""
+
+    def tearDown(self):
+        from backend.execution.interactive import interactive_manager
+        _run(interactive_manager.close_all())
+
+    def test_checkpoint_snapshot_does_not_terminate(self):
+        # Test B: taking a checkpoint spec/snapshot must NOT kill a resumable session.
+        from backend.execution.interactive import interactive_manager
+        from backend.execution.process_manager import process_manager
+
+        async def scenario():
+            sess = await interactive_manager.open(f'"{PY}" "{_write_child(SLEEP_CHILD)}"', idle_timeout=0.3)
+            pid = sess.pid
+            specs = interactive_manager.snapshot_specs()
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0]["state"], "restartable")
+            # The live process is untouched by checkpointing.
+            self.assertTrue(sess.is_alive())
+            self.assertEqual(interactive_manager.count(), 1)
+            self.assertIn(pid, process_manager.active_pids())
+            await sess.close()
+        _run(scenario())
+
+    def test_self_exited_process_is_unregistered(self):
+        # Test E: a process that exits on its own must be cleaned out of the registry,
+        # and cleanup on an already-dead process must be graceful (no crash).
+        from backend.execution.interactive import interactive_manager
+        from backend.execution.process_manager import process_manager
+
+        async def scenario():
+            sess = await interactive_manager.open(f'"{PY}" "{_write_child(QUICK_CHILD)}"',
+                                                  idle_timeout=0.5, read_timeout=2)
+            pid = sess.pid
+            r = await sess.read()                       # drains 'bye' then hits EOF
+            self.assertTrue(r.eof or "bye" in r.data)
+            for _ in range(40):                         # let the child watcher set returncode
+                if not sess.is_alive():
+                    break
+                await asyncio.sleep(0.05)
+            interactive_manager._reap()
+            self.assertNotIn(pid, process_manager.active_pids())    # no stale entry left
+            self.assertEqual(interactive_manager.count(), 0)
+            await sess.close()                          # already dead → must not raise
+        _run(scenario())
+
+    def test_terminate_pid_only_acts_on_tracked_processes(self):
+        # Security (§12): terminate_pid must NEVER signal an untracked/foreign PID.
+        from backend.execution.process_manager import process_manager
+        self.assertFalse(process_manager.terminate_pid(2_147_480_000))  # not tracked → no-op
+
+
+class TestAppShutdownInteractiveCleanup(unittest.TestCase):
+    """Test I — tracked interactive processes must not survive a controlled shutdown."""
+
+    def test_close_all_terminates_tracked_sessions(self):
+        # main.py's @app.on_event("shutdown") handler calls exactly this close_all().
+        from backend.execution.interactive import interactive_manager
+        from backend.execution.process_manager import process_manager
+
+        async def scenario():
+            await interactive_manager.open(f'"{PY}" "{_write_child(SLEEP_CHILD)}"', idle_timeout=0.3)
+            await interactive_manager.open(f'"{PY}" "{_write_child(SLEEP_CHILD)}"', idle_timeout=0.3)
+            live = interactive_manager.all()
+            pids = [s.pid for s in live]
+            closed = await interactive_manager.close_all(reason="app_shutdown")
+            self.assertGreaterEqual(closed, 2)
+            self.assertEqual(interactive_manager.count(), 0)
+            for s, pid in zip(live, pids):
+                self.assertFalse(s.is_alive())
+                self.assertIsNotNone(s.returncode)          # truly terminated
+                self.assertNotIn(pid, process_manager.active_pids())
+        _run(scenario())
+
+
+class TestTaskMetadataResume(unittest.TestCase):
+    """Phase 4.x hardening §5/§6 — coordination metadata + gates survive resume."""
+
+    @classmethod
+    def setUpClass(cls):
+        init_db()
+
+    def _cleanup(self, mission_id):
+        from backend.database.session import SessionLocal
+        from backend.database.models import SwarmTaskModel, SwarmMissionModel
+        db = SessionLocal()
+        try:
+            db.query(SwarmTaskModel).filter(SwarmTaskModel.mission_id == mission_id).delete()
+            db.query(SwarmMissionModel).filter(SwarmMissionModel.id == mission_id).delete()
+            db.commit()
+        finally:
+            db.close()
+
+    def test_task_metadata_persists_and_reloads(self):
+        # Test F: required_capabilities + target_type survive a save/reload round-trip,
+        # and a stale RUNNING task is reset for re-dispatch WITHOUT losing that metadata.
+        import uuid as _uuid
+        from backend.swarm.tasks import Task, TaskStatus
+        from backend.swarm.scheduler import TaskScheduler
+        mid = str(_uuid.uuid4())
+        try:
+            t = Task(mission_id=mid, role="pwn", objective="Exploit the service",
+                     required_capabilities=["interactive_tcp"], target_type="LIVE_TCP",
+                     status=TaskStatus.RUNNING.value)
+            t.save()
+            sched = TaskScheduler(persist=False)
+            n = sched.load(mid)
+            self.assertEqual(n, 1)
+            reloaded = sched.get(t.id)
+            self.assertIsNotNone(reloaded)
+            self.assertEqual(reloaded.required_capabilities, ["interactive_tcp"])
+            self.assertEqual(reloaded.target_type, "LIVE_TCP")
+            # stale in-flight task is re-dispatchable (never left RUNNING), metadata intact
+            self.assertIn(reloaded.status, (TaskStatus.PENDING.value, TaskStatus.READY.value))
+            self.assertNotEqual(reloaded.status, TaskStatus.RUNNING.value)
+        finally:
+            self._cleanup(mid)
+
+    def test_capability_gate_after_resume(self):
+        # Test G: a resumed task whose required capability is unavailable is still
+        # blocked at the pre-dispatch gate — no agent is spawned.
+        import uuid as _uuid
+        from backend.swarm.coordinator import SwarmCoordinator
+        from backend.swarm.limits import SwarmLimits
+        from backend.swarm.tasks import Task, TaskStatus
+        from backend.swarm.evidence import EvidenceType
+        mid = str(_uuid.uuid4())
+        fake_caps = FakeCapabilityService({
+            "ocr": FakeCapability("ocr", "BLOCKED", False, reason="no OCR provider here",
+                                  action="replan")})
+
+        def probe(role):
+            raise AssertionError("A blocked task must NOT spawn an agent after resume.")
+
+        try:
+            c1 = SwarmCoordinator(persist=True, mission_id=mid, capability_service=fake_caps,
+                                  limits=SwarmLimits(max_total_tasks=10), agent_factory=probe)
+            c1._add_task(Task(mission_id=mid, role="forensics", objective="Analyze image",
+                              required_capabilities=["ocr"]), origin="plan")
+            c1._save_mission()
+
+            # A brand-new coordinator resumes the same mission purely from persistence.
+            c2 = SwarmCoordinator(persist=True, mission_id=mid, capability_service=fake_caps,
+                                  limits=SwarmLimits(max_total_tasks=10), agent_factory=probe)
+            c2._load_persisted()
+            reloaded = c2.scheduler.all()
+            self.assertEqual(len(reloaded), 1)
+            self.assertEqual(reloaded[0].required_capabilities, ["ocr"])   # survived resume
+            c2.mission.status = "RUNNING"
+            _run(c2._loop())
+            t = c2.scheduler.all()[0]
+            self.assertEqual(t.status, TaskStatus.FAILED.value)
+            self.assertIn("ocr", c2._blocked_capabilities)
+            self.assertGreaterEqual(len(c2.bus.by_type(EvidenceType.CAPABILITY.value)), 1)
+        finally:
+            self._cleanup(mid)
+
+    def test_target_gate_after_resume(self):
+        # Test H: a resumed task requiring a live target against a static artifact is
+        # still reported as TARGET_MISMATCH — not attempted.
+        import uuid as _uuid
+        from backend.swarm.coordinator import SwarmCoordinator
+        from backend.swarm.limits import SwarmLimits
+        from backend.swarm.tasks import Task, TaskStatus
+        from backend.swarm.evidence import EvidenceType
+        mid = str(_uuid.uuid4())
+        target = "https://challenge-files.picoctf.net/static/x/source.py"
+
+        def probe(role):
+            raise AssertionError("A mismatched task must NOT spawn an agent after resume.")
+
+        try:
+            c1 = SwarmCoordinator(target=target, persist=True, mission_id=mid,
+                                  limits=SwarmLimits(max_total_tasks=10), agent_factory=probe)
+            c1._add_task(Task(mission_id=mid, role="pwn", objective="Connect and exploit",
+                              target_type="LIVE_TCP"), origin="plan")
+            c1._save_mission()
+
+            c2 = SwarmCoordinator(target=target, persist=True, mission_id=mid,
+                                  limits=SwarmLimits(max_total_tasks=10), agent_factory=probe)
+            c2._load_persisted()
+            reloaded = c2.scheduler.all()
+            self.assertEqual(reloaded[0].target_type, "LIVE_TCP")          # survived resume
+            self.assertEqual(c2.mission.target, target)
+            c2.mission.status = "RUNNING"
+            _run(c2._loop())
+            t = c2.scheduler.all()[0]
+            self.assertEqual(t.status, TaskStatus.FAILED.value)
+            self.assertIn("TARGET_MISMATCH", t.failure_reason)
+            self.assertGreaterEqual(len(c2.bus.by_type(EvidenceType.TARGET_MISMATCH.value)), 1)
+        finally:
+            self._cleanup(mid)
 
 
 if __name__ == "__main__":

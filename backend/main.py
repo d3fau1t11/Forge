@@ -70,6 +70,24 @@ def on_startup():
     _mark_stale_runs_interrupted()
     logger.info(f"{settings.PROJECT_NAME} initialized and ready.")
 
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Clean-process-lifecycle rule: release every FORGE-tracked interactive process
+    so none survives a controlled shutdown (Phase 4.x hardening §7).
+
+    Interactive sessions own long-lived OS processes; without this hook they would
+    outlive the server and hold file locks on forge.db / logs. close_all() kills each
+    tracked process tree, reaps it, and unregisters its PID — idempotent and guarded
+    so a cleanup error can never block shutdown.
+    """
+    try:
+        from backend.execution.interactive import interactive_manager
+        closed = await interactive_manager.close_all(reason="app_shutdown")
+        if closed:
+            logger.info(f"[Shutdown] Closed {closed} tracked interactive session(s).")
+    except Exception as e:
+        logger.warning(f"[Shutdown] Interactive session cleanup failed: {e}")
+
 app.include_router(api_router, prefix="/api")
 
 @app.websocket("/ws/events")
