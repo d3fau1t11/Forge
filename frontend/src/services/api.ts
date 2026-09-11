@@ -664,20 +664,23 @@ export class ApiService {
   // WRITEUP / REPORT (AI-authored from real run telemetry)
   // ----------------------------------------------------
 
-  // Preview: AI-crafted (Gemini-first) technical writeup. NOT saved to disk.
-  // May take several seconds while the provider chain authors it.
-  public async getWriteup(challengeId: string): Promise<{ content: string; generated_by: string }> {
+  // Returns the challenge writeup. By default returns the ALREADY-SAVED writeup
+  // when one exists (saved=true) instead of authoring a new draft every open;
+  // pass refresh=true to force a fresh AI-crafted draft. May take several seconds
+  // while the provider chain authors a fresh one.
+  public async getWriteup(challengeId: string, refresh: boolean = false): Promise<{ content: string; generated_by: string; saved?: boolean; file_path?: string }> {
     try {
-      const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/writeup`);
+      const qs = refresh ? '?refresh=1' : '';
+      const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/writeup${qs}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
-      return { content: '', generated_by: '' };
+      return { content: '', generated_by: '', saved: false };
     }
   }
 
   // Persist the operator-confirmed writeup into the challenge working folder.
-  public async saveWriteup(challengeId: string, content: string): Promise<{ status: string; file_path: string }> {
+  public async saveWriteup(challengeId: string, content: string): Promise<{ status: string; file_path: string; content?: string; generated_by?: string; saved?: boolean }> {
     const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/writeup/save`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

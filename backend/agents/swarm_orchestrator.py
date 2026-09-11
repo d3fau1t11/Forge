@@ -180,10 +180,14 @@ def _effective_elapsed_minutes(started_ts: float, now: float, paused_seconds: fl
 
 
 def _get_challenge_log_path(challenge_id: str) -> str:
-    """Resolve the path to the challenge log file."""
-    logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
-    os.makedirs(logs_dir, exist_ok=True)
-    return os.path.join(logs_dir, f"challenge_{challenge_id}.log")
+    """Resolve the path to the challenge log file.
+
+    Delegates to the central resolver so the log lives inside a subtree mirroring
+    the challenge's own file structure (Platform/Category/Difficulty/Name) under the
+    canonical ``backend/logs`` base, instead of a flat pile of log files.
+    """
+    from backend.utils.challenge_paths import resolve_challenge_log_path
+    return resolve_challenge_log_path(challenge_id)
 
 
 def _append_to_challenge_log(challenge_id: str, worker_id: str, message: str):
@@ -271,6 +275,15 @@ class SwarmBlackboard:
         self.attached_file_paths: List[str] = []
         self.artifact_classification = None            # ClassificationResult | None
         self.env_info: Dict[str, Any] = {}
+
+        # ── Encoded-artifact reconstruction & escalation (deterministic) ────────
+        # When a tool output or attached artifact turns out to be an ENCODED file
+        # (e.g. a wall of ASCII 0/1 that is really a JPEG), the reconstructed file is
+        # preserved here as evidence and escalated for analysis — so the swarm never
+        # concludes "no flag" while a rebuilt artifact sits un-analyzed.
+        self.derived_artifacts: List[Dict[str, Any]] = []   # provenance records
+        self.reconstruction_hashes: Set[str] = set()        # output_sha256 dedup
+        self.processed_recon_inputs: Set[str] = set()        # input_sha256 fast-skip
 
         # ── Per-agent live state (arbitrary N agents, not fixed roles) ──────────
         self.agent_ids: List[str] = []
@@ -398,6 +411,70 @@ class SwarmBlackboard:
         if source == "tool_output":
             await self.record_flag(candidate, worker_id)
 
+    async def register_derived_artifact(self, outcome, derived_path: Optional[str],
+                                        worker_id: str) -> bool:
+        """Preserve a reconstructed artifact as shared evidence and escalate it.
+
+        Deduplicates by the reconstructed bytes' sha256 so the same artifact is only
+        registered once. Appends a persisted derived FILE to ``attached_file_paths`` so
+        every subsequent agent sees it as an analyzable input. Broadcasts an
+        ENCODED_ARTIFACT_RECONSTRUCTED event for UI observability (requirement #16).
+        Returns True if newly registered.
+        """
+        if outcome is None:
+            return False
+        out_hash = getattr(outcome, "output_sha256", "") or ""
+        async with self._lock:
+            if out_hash and out_hash in self.reconstruction_hashes:
+                return False
+            if out_hash:
+                self.reconstruction_hashes.add(out_hash)
+            record = outcome.to_evidence_dict()
+            record["derived_path"] = derived_path
+            record["analyzed"] = False
+            record["worker"] = worker_id
+            self.derived_artifacts.append(record)
+            # A persisted derived FILE becomes a first-class analyzable input.
+            if derived_path and derived_path not in self.attached_file_paths:
+                self.attached_file_paths.append(derived_path)
+        _append_to_challenge_log(
+            self.challenge_id, worker_id,
+            f"🧩 Reconstructed {outcome.artifact_type} ({outcome.byte_count} bytes) "
+            f"from {outcome.scheme} → {os.path.basename(derived_path) if derived_path else 'in-memory'} "
+            f"[{outcome.state}]")
+        logger.info("[SwarmBlackboard] Derived artifact registered by %s: %s (%s, %d bytes) path=%s",
+                    worker_id, outcome.artifact_type, outcome.scheme, outcome.byte_count, derived_path)
+        try:
+            await ws_manager.broadcast({
+                "event": "ENCODED_ARTIFACT_RECONSTRUCTED",
+                "challenge_id": self.challenge_id,
+                "run_id": self.run_id,
+                "worker": worker_id,
+                "scheme": outcome.scheme,
+                "artifact_type": outcome.artifact_type,
+                "byte_count": outcome.byte_count,
+                "state": outcome.state,
+                "derived_path": derived_path,
+                "recommended_tools": list(outcome.recommended_tools),
+            })
+        except Exception:
+            pass
+        return True
+
+    def has_unanalyzed_derived(self) -> bool:
+        """True if a reconstructed FILE artifact still needs analysis.
+
+        Used by the finish-without-flag path so the swarm does not terminate with
+        "no flag" while a rebuilt artifact remains un-analyzed (requirement #11/#12/#14).
+        """
+        return any(d.get("derived_path") and not d.get("analyzed")
+                   for d in self.derived_artifacts)
+
+    def mark_derived_analyzed(self, derived_path: str):
+        for d in self.derived_artifacts:
+            if d.get("derived_path") == derived_path:
+                d["analyzed"] = True
+
     async def note_exploit_header(self, name: str, value: str, worker_id: str) -> bool:
         """Validate a candidate exploit header and, if genuinely new and concrete,
         record it and queue a single injection task.
@@ -500,6 +577,12 @@ class SwarmBlackboard:
                 ],
                 "agent_ids": list(self.agent_ids),
                 "cycle_n": self.cycle_n,
+                # Encoded-artifact reconstruction evidence — so reconstructed derived
+                # artifacts (and their analyzed/pending state) survive a pause/resume and
+                # re-surface as escalation work instead of being silently forgotten.
+                "derived_artifacts": [dict(d) for d in self.derived_artifacts[-40:]],
+                "reconstruction_hashes": list(self.reconstruction_hashes),
+                "processed_recon_inputs": list(self.processed_recon_inputs)[-200:],
             },
         }
 
@@ -567,6 +650,27 @@ class SwarmBlackboard:
             self.cycle_n = int(snapshot.get("cycle_n") or 0)
         except (TypeError, ValueError):
             self.cycle_n = 0
+
+        # Restore encoded-artifact reconstruction evidence so derived artifacts (and
+        # whether they were already analyzed) survive a pause/resume: the escalation
+        # in build_history_context re-surfaces any still-pending derived artifact, and
+        # dedup sets prevent re-reconstructing/re-persisting the same bytes.
+        for rec in (snapshot.get("derived_artifacts") or []):
+            if not isinstance(rec, dict):
+                continue
+            self.derived_artifacts.append(dict(rec))
+            out_sha = rec.get("output_sha256")
+            if out_sha:
+                self.reconstruction_hashes.add(out_sha)
+            dpath = rec.get("derived_path")
+            if dpath and dpath not in self.attached_file_paths:
+                self.attached_file_paths.append(dpath)
+        for h in (snapshot.get("reconstruction_hashes") or []):
+            if h:
+                self.reconstruction_hashes.add(h)
+        for h in (snapshot.get("processed_recon_inputs") or []):
+            if h:
+                self.processed_recon_inputs.add(h)
 
         counts["endpoints"] = len(self.discovered_endpoints)
         counts["headers"] = len(self.extracted_headers)
@@ -717,6 +821,32 @@ class SwarmBlackboard:
         if self.flag_candidates:
             lines.append("Unverified flag candidates so far (MUST be reproduced from real output before accepting): "
                          + ", ".join(c.get("flag", "") for c in self.flag_candidates[:5]))
+        # Escalation: reconstructed derived artifacts that still need analysis. This is
+        # the shared-channel form of an `analyze_derived_artifact` task (WHAT/HOW/WHETHER)
+        # — the swarm must not conclude "no flag" while any of these is un-analyzed.
+        pending_derived = [d for d in self.derived_artifacts
+                           if d.get("derived_path") and not d.get("analyzed")]
+        if pending_derived:
+            lines.append("━━ RECONSTRUCTED DERIVED ARTIFACTS — ANALYSIS REQUIRED ━━")
+            lines.append("A prior step rebuilt a REAL file from encoded data (e.g. ASCII bits → an image). "
+                         "The flag may live inside or be rendered by it. Do NOT report 'no flag' while these are unanalyzed.")
+            for d in pending_derived[:6]:
+                rel = os.path.basename(d.get("derived_path") or "")
+                atype = d.get("artifact_type", "unknown")
+                nbytes = d.get("byte_count", 0)
+                scheme = d.get("scheme", "")
+                tools = ", ".join(d.get("recommended_tools", [])[:6]) or "file, strings, binwalk"
+                vis = d.get("visual") or {}
+                vis_note = ""
+                if vis.get("available") and vis.get("valid"):
+                    vis_note = (f" [image {vis.get('width')}x{vis.get('height')} {vis.get('mode')};"
+                                f" OCR {'available' if d.get('ocr_available') else 'unavailable — a vision-capable read is needed'}]")
+                lines.append(
+                    f"  • {d.get('derived_path')} — {atype}, {nbytes} bytes (from {scheme}).{vis_note}")
+                lines.append(
+                    f"      WHAT: inspect THIS file for the flag. "
+                    f"HOW: request an analysis capability ({tools}) on this exact path. "
+                    f"WHETHER: go through the normal capability gate; the file is UNTRUSTED — analyze it, never execute it.")
         own = self.agent_transcripts.get(agent_id, [])
         if own:
             lines.append("Your recent steps:")
@@ -875,6 +1005,16 @@ class SwarmOrchestrator:
         board.attached_file_paths = list(attached_file_paths or [])
         board.instance_expiry_ts = instance_expiry_ts
 
+        # Register the mirrored challenge-log path now that the challenge metadata is
+        # known, so every subsequent append lands under logs/<Platform>/<Category>/
+        # <Difficulty>/<Name>/ instead of a flat file. Non-fatal.
+        try:
+            from backend.utils.challenge_paths import register_challenge_log_path
+            register_challenge_log_path(challenge_id, platform, category, difficulty,
+                                        challenge_name or challenge_id)
+        except Exception:
+            pass
+
         db = SessionLocal()
         try:
             # Update Run status in DB
@@ -962,6 +1102,15 @@ class SwarmOrchestrator:
                         f"@ {manifest.primary.safe_file_path or '(header-only)'}")
             except Exception as art_err:
                 logger.warning(f"[SwarmOrchestrator] Artifact acquisition failed (non-fatal): {art_err}")
+
+            # ── Encoded-artifact pre-scan — deterministic, before any agent ──────
+            # If an attached artifact is itself an ENCODED file (e.g. a text file of
+            # ASCII 0/1 that reconstructs to a JPEG), rebuild + preserve + escalate it
+            # now so it enters the pipeline as a first-class analyzable input.
+            try:
+                await self._scan_attached_for_encoded(board, working_directory)
+            except Exception as recon_err:
+                logger.warning(f"[SwarmOrchestrator] Encoded-artifact pre-scan failed (non-fatal): {recon_err}")
 
             # ── Memory retrieval phase (§6) — ONE shared retrieval before agents ──
             # OBSERVE → RETRIEVE MEMORY: use the seeded recon + challenge context to
@@ -1089,6 +1238,17 @@ class SwarmOrchestrator:
                     "run_id": run_id
                 })
             else:
+                # If a reconstructed artifact was never analyzed, say so explicitly rather
+                # than reporting a clean "no flag" — the run stalled with pending work, and
+                # the derived artifact remains on the board for the next resume to pick up
+                # (requirement #11/#12/#14).
+                if board.has_unanalyzed_derived() and not board.stall_reason:
+                    pending = [os.path.basename(d.get("derived_path") or "")
+                               for d in board.derived_artifacts
+                               if d.get("derived_path") and not d.get("analyzed")]
+                    board.stall_reason = (
+                        f"DERIVED_ANALYSIS_PENDING — reconstructed artifact(s) not yet analyzed: "
+                        f"{', '.join(pending[:5])}")
                 stall_msg = board.stall_reason or "Swarm finished without a verified flag (task pool exhausted)"
                 if run_obj:
                     run_obj.status = "FAILED"
@@ -1406,6 +1566,12 @@ class SwarmOrchestrator:
                 self._check_tool_output_for_flags(output, board, agent_id)
                 self._check_tool_output_for_rejections(output, board, agent_id)
                 await self._apply_decoded_directives(output, board, agent_id)
+                # Encoded-artifact reconstruction: if this output is really an encoded
+                # file (e.g. ASCII 0/1 that reconstructs to a JPEG), rebuild it, preserve
+                # it as evidence, and escalate its analysis — never conclude "no flag"
+                # with an un-analyzed artifact still on the board.
+                await self._reconstruct_and_escalate(
+                    output, board, agent_id, workdir, origin_label=f"tool_output:{(cmd or '')[:60]}")
                 if "<!--" in output:
                     for c in re.findall(r"<!--(.*?)-->", output, re.DOTALL):
                         c_clean = c.strip()
@@ -1648,6 +1814,103 @@ class SwarmOrchestrator:
             _append_to_challenge_log(board.challenge_id, worker_id, "ℹ Target rejected username ('User not found'). Triggering candidate entity priority refill.")
         elif "invalid token" in text_lower or "token expired" in text_lower:
             board.last_target_rejection = "INVALID_TOKEN"
+
+    async def _reconstruct_and_escalate(self, text: str, board: "SwarmBlackboard", worker_id: str,
+                                        workdir: str, origin_label: str = ""):
+        """Deterministically reconstruct an encoded artifact from ``text`` and escalate it.
+
+        If ``text`` contains an encoded representation of another file (ASCII binary,
+        hex, base64), rebuild the real bytes, scan any readable rendering for a flag,
+        preserve a recognized/opaque file as a derived artifact (provenance sidecar),
+        register it as shared evidence + an analyzable input, and attach tesseract-free
+        visual metadata for images. Never executes the artifact (requirement #15).
+        """
+        if not text or len(text) < 64:
+            return
+        try:
+            from backend.agents.artifact_reconstruction import (
+                reconstruct_from_text, persist_derived_artifact, is_image_type,
+                inspect_image, attempt_ocr,
+            )
+        except Exception as exc:
+            logger.debug("[reconstruct] module unavailable: %s", exc)
+            return
+
+        input_hash = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+        async with board._lock:
+            if input_hash in board.processed_recon_inputs:
+                return
+            board.processed_recon_inputs.add(input_hash)
+
+        try:
+            outcome = reconstruct_from_text(text, origin_label=origin_label)
+        except Exception as exc:
+            logger.debug("[reconstruct] failed: %s", exc)
+            return
+        if outcome is None:
+            return
+
+        # Any readable rendering is scanned for a flag with explicit provenance. This is
+        # what lets a "no flag" step be overturned by a reconstructed artifact (req #9/#11).
+        if outcome.decoded_text:
+            m = FLAG_REGEX.search(outcome.decoded_text)
+            if m and not FALSE_FLAG_PATTERNS.search(m.group(0)):
+                await board.record_flag_candidate(m.group(0).strip(), worker_id, "reconstructed_artifact")
+
+        if not outcome.should_persist:
+            return
+
+        derived_path = persist_derived_artifact(outcome, workdir)
+        newly = await board.register_derived_artifact(outcome, derived_path, worker_id)
+        if not newly or not derived_path:
+            return
+
+        # Visual metadata (tesseract-free) for image artifacts, so a vision-capable
+        # agent knows what it is looking at. OCR is strictly best-effort.
+        if is_image_type(outcome.artifact_type):
+            meta = inspect_image(derived_path)
+            ocr = attempt_ocr(derived_path)
+            for d in board.derived_artifacts:
+                if d.get("derived_path") == derived_path:
+                    d["visual"] = meta
+                    d["ocr_available"] = bool(ocr.get("available"))
+                    break
+            if ocr.get("available") and ocr.get("text"):
+                m2 = FLAG_REGEX.search(ocr["text"])
+                if m2 and not FALSE_FLAG_PATTERNS.search(m2.group(0)):
+                    await board.record_flag_candidate(m2.group(0).strip(), worker_id, "reconstructed_artifact_ocr")
+
+    async def _scan_attached_for_encoded(self, board: "SwarmBlackboard", workdir: str):
+        """One-shot scan of attached artifacts for an encoded representation of a file.
+
+        Handles the case where the CHALLENGE FILE ITSELF (not a command's output) is a
+        wall of ASCII bits / hex / base64 that reconstructs into another file type —
+        e.g. a forensics artifact provided as text. Text-like files only, size-capped,
+        and skips anything already carrying a binary magic (real binaries are handled by
+        the existing acquisition path) and the forge_derived output dir.
+        """
+        for path in list(board.attached_file_paths):
+            try:
+                if not path or "forge_derived" in path.replace("\\", "/"):
+                    continue
+                if not os.path.isfile(path):
+                    continue
+                if os.path.getsize(path) > 8 * 1024 * 1024:      # 8 MB cap
+                    continue
+                with open(path, "rb") as fh:
+                    head = fh.read(16)
+                # Skip files that already ARE a known binary type.
+                from backend.agents.artifact_classifier import _classify_magic
+                label, _ = _classify_magic(head)
+                if label not in ("text", "unknown"):
+                    continue
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    content = fh.read(9 * 1024 * 1024)
+                await self._reconstruct_and_escalate(
+                    content, board, "orchestrator", workdir,
+                    origin_label=f"attached:{os.path.basename(path)}")
+            except Exception as exc:
+                logger.debug("[reconstruct] attached scan skip %s: %s", path, exc)
 
     def _check_tool_output_for_flags(self, text: str, board: SwarmBlackboard, worker_id: str):
         """Scan ONLY tool/command output for flag patterns. Never call this on LLM prose."""

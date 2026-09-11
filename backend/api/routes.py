@@ -61,12 +61,39 @@ def _safe_delete_working_dir(working_dir: str):
             logger.warning(f"Error removing working directory {clean_path}: {e}")
 
 def _delete_challenge_log(challenge_id: str):
-    """Delete the dedicated challenge log file if it exists."""
+    """Delete the dedicated challenge log file(s) if they exist.
+
+    Removes both the mirrored-structure log (logs/<Platform>/<Category>/
+    <Difficulty>/<Name>/challenge_<id>.log) and any legacy flat log, then prunes
+    now-empty parent directories up to (but not including) the logs base.
+    """
     try:
-        logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
-        log_file = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
-        if os.path.exists(log_file):
-            os.remove(log_file)
+        from backend.utils.challenge_paths import (
+            iter_candidate_log_paths, forget_challenge_log_path, logs_base,
+        )
+        base = logs_base()
+        removed_dirs: set = set()
+        for log_file in iter_candidate_log_paths(challenge_id):
+            try:
+                if os.path.exists(log_file):
+                    os.remove(log_file)
+                removed_dirs.add(os.path.dirname(log_file))
+            except Exception as e:
+                logger.debug(f"Error removing log {log_file}: {e}")
+        # Prune empty mirrored parent dirs (never the base itself).
+        for start in removed_dirs:
+            d = start
+            while d and os.path.abspath(d) != os.path.abspath(base) and \
+                    os.path.abspath(d).startswith(os.path.abspath(base) + os.sep):
+                try:
+                    if os.path.isdir(d) and not os.listdir(d):
+                        os.rmdir(d)
+                        d = os.path.dirname(d)
+                    else:
+                        break
+                except Exception:
+                    break
+        forget_challenge_log_path(challenge_id)
     except Exception as e:
         logger.debug(f"Error removing log for challenge {challenge_id}: {e}")
 
@@ -398,10 +425,11 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
 
     workflow_runner.start_run(run.id, challenge.id, resolved_target)
 
-    # Initialize Challenge Dedicated Log File
-    logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
-    os.makedirs(logs_dir, exist_ok=True)
-    ch_log_path = os.path.join(logs_dir, f"challenge_{challenge.id}.log")
+    # Initialize Challenge Dedicated Log File — stored in a subtree mirroring the
+    # challenge's own structure (logs/<Platform>/<Category>/<Difficulty>/<Name>/).
+    from backend.utils.challenge_paths import register_challenge_log_path
+    ch_log_path = register_challenge_log_path(
+        challenge.id, platform, category, difficulty, challenge.name)
     with open(ch_log_path, "w", encoding="utf-8") as f:
         f.write(f"=== FORGE CTF CHALLENGE LOG STARTED ===\n")
         f.write(f"Timestamp: {datetime.utcnow().isoformat()} UTC\n")
@@ -552,15 +580,27 @@ async def generate_report(challenge_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/challenges/{challenge_id}/writeup")
-async def get_writeup(challenge_id: str, db: Session = Depends(get_db)):
-    """AI-crafted technical writeup PREVIEW (not persisted). Gemini is tried first
-    for the report_generation capability; on failure the provider chain falls back
-    to the other agents, then to a deterministic writeup built from the same real
-    telemetry — so this never returns fabricated or empty filler."""
+async def get_writeup(challenge_id: str, refresh: bool = False, db: Session = Depends(get_db)):
+    """Return the challenge writeup.
+
+    Task #2: once the operator has SAVED a writeup, this returns THAT saved artifact
+    (``saved=true``) instead of authoring a brand-new one on every open. Pass
+    ``?refresh=1`` to force a fresh AI-crafted draft (Gemini-first for the
+    report_generation capability; provider-chain fallback, then a deterministic
+    writeup from the same real telemetry — never fabricated or empty filler).
+    A saved writeup is NOT overwritten until the operator explicitly saves again.
+    """
+    if not refresh:
+        saved = report_generator.load_saved_writeup(db, challenge_id)
+        if saved is not None:
+            content, file_path = saved
+            return {"content": content, "generated_by": "saved",
+                    "saved": True, "file_path": file_path}
+
     content, generated_by = await report_generator.craft_writeup(db, challenge_id)
     if not content:
         raise HTTPException(status_code=404, detail="Challenge not found")
-    return {"content": content, "generated_by": generated_by}
+    return {"content": content, "generated_by": generated_by, "saved": False}
 
 
 @router.post("/challenges/{challenge_id}/writeup/save")
@@ -577,7 +617,8 @@ def save_writeup_endpoint(challenge_id: str, req: SaveWriteupRequest,
     report_path = report_generator.save_writeup(db, challenge_id, content)
     if not report_path:
         raise HTTPException(status_code=404, detail="Challenge not found")
-    return {"status": "SAVED", "file_path": report_path}
+    return {"status": "SAVED", "file_path": report_path,
+            "content": content, "generated_by": "saved", "saved": True}
 
 # ----------------------------------------------------
 # TARGET IDENTITY MANAGEMENT (TARGET IP ≠ IDENTITY)

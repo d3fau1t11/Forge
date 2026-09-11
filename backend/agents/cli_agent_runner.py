@@ -210,9 +210,8 @@ class CLIAgentRunner:
                 "confidence": 99
             })
 
-            logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
-            os.makedirs(logs_dir, exist_ok=True)
-            ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
+            from backend.utils.challenge_paths import resolve_challenge_log_path
+            ch_log_path = resolve_challenge_log_path(challenge_id)
 
             # Spawn subprocess in challenge working directory
             logger.info(f"Spawning `{binary_name}` process in cwd: {working_dir} with model {model_arg}")

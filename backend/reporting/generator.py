@@ -445,6 +445,65 @@ class ReportGenerator:
     # Persistence
     # ------------------------------------------------------------------ #
 
+    def load_saved_writeup(self, db: Session, challenge_id: str) -> Optional[Tuple[str, str]]:
+        """Return the ALREADY-SAVED writeup for a challenge, or None if none exists.
+
+        Once the operator saves a README/writeup we must show THAT saved artifact
+        instead of authoring a fresh one on every open (Task #2). Resolution order:
+          1. Newest ``ReportModel`` ``WRITEUP_*`` row whose file still exists non-empty.
+          2. Fallback: newest ``WRITEUP_*.md`` on disk in the challenge working folder
+             (covers a saved file whose DB row was lost / a legacy save).
+        Returns ``(content, file_path)`` — never fabricates content.
+        """
+        challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+        if not challenge:
+            return None
+
+        # 1) DB-recorded writeup rows, newest first.
+        try:
+            rows = (db.query(ReportModel)
+                    .filter(ReportModel.challenge_id == challenge_id,
+                            ReportModel.title.like("WRITEUP_%"))
+                    .order_by(ReportModel.created_at.desc())
+                    .all())
+        except Exception as e:
+            logger.debug("[ReportGenerator] saved-writeup query skip: %s", e)
+            rows = []
+        for row in rows:
+            fp = row.file_path or ""
+            try:
+                if fp and os.path.isfile(fp):
+                    with open(fp, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    if content.strip():
+                        return content, fp
+            except OSError:
+                continue
+
+        # 2) On-disk fallback — newest WRITEUP_*.md in the challenge working folder.
+        try:
+            target_dir = resolve_safe_working_dir(
+                challenge.working_directory, challenge_id, challenge.category or "", challenge.name or "")
+            if os.path.isdir(target_dir):
+                candidates = []
+                for fn in os.listdir(target_dir):
+                    if fn.startswith("WRITEUP_") and fn.endswith(".md"):
+                        full = os.path.join(target_dir, fn)
+                        if os.path.isfile(full):
+                            candidates.append(full)
+                candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                for full in candidates:
+                    try:
+                        with open(full, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        if content.strip():
+                            return content, full
+                    except OSError:
+                        continue
+        except Exception as e:
+            logger.debug("[ReportGenerator] saved-writeup disk fallback skip: %s", e)
+        return None
+
     def save_writeup(self, db: Session, challenge_id: str, content: str,
                      output_dir: Optional[str] = None) -> str:
         """Write the writeup markdown into the challenge working folder (or `output_dir`

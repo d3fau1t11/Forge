@@ -728,8 +728,8 @@ class AutonomousOrchestrator:
                         active_playbook = None
 
                 # Append Full AI Conversation, Timings & Telemetry to Dedicated Challenge Log File
-                logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
-                ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
+                from backend.utils.challenge_paths import resolve_challenge_log_path
+                ch_log_path = resolve_challenge_log_path(challenge_id)
                 now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                 try:
                     with open(ch_log_path, "a", encoding="utf-8") as f:
@@ -830,8 +830,8 @@ class AutonomousOrchestrator:
                 import traceback
                 logger.error(f"Error during turn #{turn} of run {run_id}: {str(e)}\n{traceback.format_exc()}")
                 try:
-                    logs_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
-                    ch_log_path = os.path.join(logs_dir, f"challenge_{challenge_id}.log")
+                    from backend.utils.challenge_paths import resolve_challenge_log_path
+                    ch_log_path = resolve_challenge_log_path(challenge_id)
                     with open(ch_log_path, "a", encoding="utf-8") as f:
                         f.write(f"[{datetime.utcnow().strftime('%H:%M:%S')}] TURN #{turn} ERROR: {str(e)}\n{traceback.format_exc()}\n")
                 except Exception:
