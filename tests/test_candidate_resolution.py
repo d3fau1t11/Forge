@@ -426,6 +426,99 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(board.flag_captured, "FLAG{termination_confirmed}")
         self.assertTrue(board.flag_event.is_set())
 
+    async def test_12_verifier_agent_llm_structured_evaluation(self):
+        """12. VerifierAgent with ModelRouter parses structured LLM output and validates evidence."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content='{"verdict": "RESOLVE", "confidence": 0.96, "answer_type": "flag", "is_distractor": false, "reasoning": "Output matches binary stdout exactly.", "evidence_soundness": "Valid execution output."}'
+        )
+
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "picoCTF{valid_flag_from_llm_verified}",
+            source=AnswerSource.TOOL_OUTPUT,
+            command="./vuln",
+            action_succeeded=True,
+            task_context={"description": "Exploit binary to get flag", "category": "pwn"},
+        )
+
+        mock_router.route_request.assert_awaited_once()
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertEqual(verdict.confidence, 0.96)
+        self.assertTrue(any("Output matches binary stdout" in r for r in verdict.reasons))
+
+    async def test_13_verifier_agent_trust_boundary_prose_cannot_verify(self):
+        """13. Trust Boundary: Model prose cannot be promoted to RESOLVED even if LLM verifier recommends RESOLVE."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content='{"verdict": "RESOLVE", "confidence": 0.99, "answer_type": "flag", "is_distractor": false, "reasoning": "Model sounds very confident."}'
+        )
+
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "picoCTF{hallucinated_prose_flag}",
+            source=AnswerSource.LLM_PROSE,
+            task_context={"description": "Find the flag", "category": "crypto"},
+        )
+
+        # Deterministic trust gate strictly overrides LLM recommendation
+        self.assertEqual(verdict.status, AnswerStatus.CANDIDATE)
+        self.assertLessEqual(verdict.confidence, 0.5)
+
+    async def test_14_verifier_agent_trust_boundary_cannot_fake_authoritative_verified(self):
+        """14. Trust Boundary: LLM cannot declare VERIFIED status without authoritative=True."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content='{"verdict": "RESOLVE", "confidence": 1.0, "answer_type": "flag", "is_distractor": false, "reasoning": "Confirmed 100%."}'
+        )
+
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "FLAG{evidence_based_flag}",
+            source=AnswerSource.TOOL_OUTPUT,
+            authoritative=False,
+            task_context={"description": "Find the flag", "category": "web"},
+        )
+
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertFalse(verdict.is_verified)
+
+    async def test_15_verifier_agent_llm_distractor_rejection(self):
+        """15. VerifierAgent correctly rejects candidate when LLM flags it as a distractor."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content='{"verdict": "REJECT", "confidence": 0.05, "answer_type": "flag", "is_distractor": true, "reasoning": "This is a decoy string embedded in comments."}'
+        )
+
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "FLAG{decoy_flag_in_comment}",
+            source=AnswerSource.TOOL_OUTPUT,
+            task_context={"description": "Find the real admin username", "category": "web"},
+        )
+
+        self.assertEqual(verdict.status, AnswerStatus.REJECTED)
+        self.assertLessEqual(verdict.confidence, 0.1)
+
+    async def test_16_verifier_agent_graceful_fallback_on_router_failure(self):
+        """16. Graceful fallback: If router fails/times out, VerifierAgent falls back cleanly to deterministic assessment."""
+        mock_router = AsyncMock()
+        mock_router.route_request.side_effect = TimeoutError("Router request timed out")
+
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "picoCTF{fallback_verified_flag}",
+            source=AnswerSource.TOOL_OUTPUT,
+            command="cat flag.txt",
+            action_succeeded=True,
+            task_context={"description": "Read flag.txt", "category": "misc"},
+        )
+
+        # Successfully falls back to deterministic AnswerResolver
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertGreaterEqual(verdict.confidence, 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()
+

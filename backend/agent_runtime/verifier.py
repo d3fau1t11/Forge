@@ -23,11 +23,17 @@ Detection, Resolution, and Verification are distinct concerns:
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("forge.verifier")
+
 
 # Strict flag regex — known CTF platform prefixes only, ≥4 chars, braces excluded
 # from the body. No generic catch-all → no CSS/LaTeX/JSON FPs.
@@ -505,6 +511,30 @@ class AnswerResolver:
         )
 
 
+VERIFIER_SYSTEM_PROMPT = """You are FORGE's Verifier Agent (Agent #4).
+Your duty is to independently, critically, and objectively evaluate answer candidates against challenge requirements, tool execution evidence, and semantic context.
+
+You must determine whether the candidate value accurately and completely answers the challenge question, or if it is a distractor, placeholder, format mismatch, malformed string, or hallucinated assertion.
+
+Output MUST be a valid JSON object with the following structure:
+{
+  "verdict": "RESOLVE" | "REJECT" | "NEEDS_MORE_EVIDENCE",
+  "confidence": <float between 0.0 and 1.0>,
+  "answer_type": "flag" | "hash" | "username" | "number" | "filename" | "key" | "string" | "custom",
+  "is_distractor": <boolean>,
+  "reasoning": "<concise explanation of decision based on evidence and question intent>",
+  "evidence_soundness": "<assessment of tool output, command provenance, or observation>"
+}
+
+Strict Verification Rules:
+1. If the challenge question specifically asks for a non-flag answer (e.g., username, hash, filename, number, port, key) and the candidate is a flag format (e.g., picoCTF{...}) or irrelevant artifact, mark verdict as "REJECT" and is_distractor as true.
+2. If the candidate comes from model prose without verifiable tool command observation, confidence must NOT exceed 0.5.
+3. If the candidate contains placeholders (e.g. picoCTF{...}, {flag_here}, {insert_flag_here}), mark verdict as "REJECT".
+4. Only mark "RESOLVE" if the candidate directly satisfies the challenge question and is backed by verified execution evidence.
+5. If evidence is ambiguous or incomplete, mark verdict as "NEEDS_MORE_EVIDENCE".
+"""
+
+
 class VerifierAgent:
     """Dedicated 4th Verifier Agent in FORGE's agent architecture.
 
@@ -517,13 +547,20 @@ class VerifierAgent:
     - provenance
     - confidence
     - whether the evidence actually answers what the challenge is asking for.
+
+    Trust Boundary:
+    - The LLM output is UNTRUSTED.
+    - Deterministic FORGE code validates the structured response before applying any verdict.
+    - LLM evaluation CANNOT directly declare VERIFIED (only authoritative confirmation can).
+    - Discovery agents do not control the verifier; it is invoked by the orchestration layer.
+    - Verifier does not mutate swarm state; only authoritative orchestration mutates state.
     """
 
     def __init__(self, resolver: Optional[AnswerResolver] = None, router: Optional[Any] = None):
         self.resolver = resolver or AnswerResolver()
         self.router = router
 
-    async def verify(
+    def _extract_candidate_data(
         self,
         candidate: AnswerCandidate | str,
         *,
@@ -532,18 +569,56 @@ class VerifierAgent:
         evidence: Optional[Dict[str, Any]] = None,
         command: str = "",
         action_succeeded: bool = True,
-        authoritative: bool = False,
+    ) -> Tuple[str, AnswerSource, str, bool, Dict[str, Any], Dict[str, Any], str]:
+        if isinstance(candidate, AnswerCandidate):
+            cand_obj = candidate
+            tctx = {**(cand_obj.task_context or {}), **(task_context or {})}
+            ev = {**(cand_obj.evidence or {}), **(evidence or {})}
+            val = cand_obj.value
+            src = self.resolver.normalize_source(cand_obj.source)
+            cmd = cand_obj.provenance.get("command", command)
+            succ = cand_obj.provenance.get("action_succeeded", action_succeeded)
+            worker_id = cand_obj.worker_id
+        else:
+            val = str(candidate)
+            src = self.resolver.normalize_source(source)
+            cmd = command
+            succ = action_succeeded
+            ev = evidence or {}
+            tctx = task_context or {}
+            worker_id = ""
+        return val, src, cmd, succ, ev, tctx, worker_id
+
+    def _apply_deterministic_distractor_gate(
+        self,
+        val: str,
+        tctx: Dict[str, Any],
+        verdict: AnswerVerdict,
+        evidence: Dict[str, Any],
     ) -> AnswerVerdict:
-        """Asynchronously verify a candidate answer with full evaluation."""
-        return self.verify_sync(
-            candidate,
-            task_context=task_context,
-            source=source,
-            evidence=evidence,
-            command=command,
-            action_succeeded=action_succeeded,
-            authoritative=authoritative,
-        )
+        """Apply deterministic distractor and question mismatch checks."""
+        question = (tctx.get("description", "") or tctx.get("question", "")).lower()
+
+        # Check if candidate is a flag-shaped distractor that does NOT answer the challenge question
+        if verdict.answer_type in (AnswerType.USERNAME, AnswerType.NUMBER, AnswerType.HASH, AnswerType.FILENAME, AnswerType.KEY):
+            if FLAG_REGEX.search(val):
+                return AnswerVerdict(
+                    AnswerStatus.REJECTED,
+                    0.05,
+                    val,
+                    [f"Candidate is formatted as a flag, but challenge specifically asks for a {verdict.answer_type.value}."],
+                    verdict.answer_type,
+                    evidence,
+                )
+
+        # Check for distractor flag strings when challenge question warns about fakes
+        if "not the flag" in question or "fake" in question or "distractor" in question:
+            if "fake" in val.lower() or "distractor" in val.lower() or "not_the_flag" in val.lower():
+                verdict.status = AnswerStatus.REJECTED
+                verdict.reasons.append("Identified as a challenge distractor.")
+                verdict.confidence = 0.1
+
+        return verdict
 
     def verify_sync(
         self,
@@ -557,27 +632,14 @@ class VerifierAgent:
         authoritative: bool = False,
     ) -> AnswerVerdict:
         """Synchronously verify an answer candidate against challenge semantics and evidence."""
-        if isinstance(candidate, AnswerCandidate):
-            cand_obj = candidate
-            if task_context:
-                cand_obj.task_context = {**(cand_obj.task_context or {}), **task_context}
-            if evidence:
-                cand_obj.evidence = {**(cand_obj.evidence or {}), **evidence}
-            val = cand_obj.value
-            src = cand_obj.source
-            cmd = cand_obj.provenance.get("command", command)
-            succ = cand_obj.provenance.get("action_succeeded", action_succeeded)
-            ev = cand_obj.evidence
-            tctx = cand_obj.task_context or {}
-            worker_id = cand_obj.worker_id
-        else:
-            val = str(candidate)
-            src = source
-            cmd = command
-            succ = action_succeeded
-            ev = evidence or {}
-            tctx = task_context or {}
-            worker_id = ""
+        val, src, cmd, succ, ev, tctx, worker_id = self._extract_candidate_data(
+            candidate,
+            task_context=task_context,
+            source=source,
+            evidence=evidence,
+            command=command,
+            action_succeeded=action_succeeded,
+        )
 
         # 1. Evaluate via AnswerResolver
         verdict = self.resolver.assess(
@@ -596,27 +658,217 @@ class VerifierAgent:
         )
 
         # 2. Semantic Distractor & Intent Audit
-        # Check if candidate is a flag-shaped distractor that does NOT answer the challenge question
-        question = (tctx.get("description", "") or tctx.get("question", "")).lower()
-        if verdict.answer_type in (AnswerType.USERNAME, AnswerType.NUMBER, AnswerType.HASH, AnswerType.FILENAME, AnswerType.KEY):
-            if FLAG_REGEX.search(val):
-                return AnswerVerdict(
-                    AnswerStatus.REJECTED,
-                    0.05,
-                    val,
-                    [f"Candidate is formatted as a flag, but challenge specifically asks for a {verdict.answer_type.value}."],
-                    verdict.answer_type,
-                    ev,
-                )
+        verdict = self._apply_deterministic_distractor_gate(val, tctx, verdict, ev)
+        return verdict
 
-        # Check for distractor flag strings when challenge question asks for something specific
-        if "not the flag" in question or "fake" in question or "distractor" in question:
-            if "fake" in val.lower() or "distractor" in val.lower() or "not_the_flag" in val.lower():
-                verdict.status = AnswerStatus.REJECTED
-                verdict.reasons.append("Identified as a challenge distractor.")
-                verdict.confidence = 0.1
+    async def verify(
+        self,
+        candidate: AnswerCandidate | str,
+        *,
+        task_context: Optional[Dict[str, Any]] = None,
+        source: AnswerSource | str = AnswerSource.UNKNOWN,
+        evidence: Optional[Dict[str, Any]] = None,
+        command: str = "",
+        action_succeeded: bool = True,
+        authoritative: bool = False,
+    ) -> AnswerVerdict:
+        """Asynchronously verify a candidate answer with deterministic gate and untrusted LLM reasoning."""
+        val, src, cmd, succ, ev, tctx, worker_id = self._extract_candidate_data(
+            candidate,
+            task_context=task_context,
+            source=source,
+            evidence=evidence,
+            command=command,
+            action_succeeded=action_succeeded,
+        )
+
+        # 1. Primary deterministic assessment
+        deterministic_verdict = self.resolver.assess(
+            val,
+            source=src,
+            command=cmd,
+            action_succeeded=succ,
+            target_scope=tctx.get("target_scope", ""),
+            expected_format=tctx.get("flag_pattern", ""),
+            description=tctx.get("description", "") or tctx.get("question", ""),
+            challenge_name=tctx.get("challenge_name", ""),
+            category=tctx.get("category", ""),
+            evidence=ev,
+            worker_id=worker_id,
+            authoritative=authoritative,
+        )
+
+        # Apply deterministic distractor gate
+        verdict = self._apply_deterministic_distractor_gate(val, tctx, deterministic_verdict, ev)
+
+        # If authoritative or already rejected for structural reasons, return immediately
+        if authoritative or verdict.status == AnswerStatus.REJECTED:
+            return verdict
+
+        # 2. If ModelRouter is available, execute LLM-assisted verification (Agent #4)
+        if self.router is not None:
+            try:
+                llm_verdict = await self._llm_evaluate(
+                    val=val,
+                    src=src,
+                    cmd=cmd,
+                    succ=succ,
+                    ev=ev,
+                    tctx=tctx,
+                    deterministic_verdict=verdict,
+                    authoritative=authoritative,
+                )
+                if llm_verdict is not None:
+                    return llm_verdict
+            except Exception as e:
+                logger.warning(f"[VerifierAgent] LLM verification failed ({e}); falling back to deterministic verdict.")
 
         return verdict
+
+    async def _llm_evaluate(
+        self,
+        *,
+        val: str,
+        src: AnswerSource,
+        cmd: str,
+        succ: bool,
+        ev: Dict[str, Any],
+        tctx: Dict[str, Any],
+        deterministic_verdict: AnswerVerdict,
+        authoritative: bool,
+    ) -> Optional[AnswerVerdict]:
+        """Invoke ModelRouter with capability='verification' and validate structured response."""
+        prompt = (
+            f"Challenge Information:\n"
+            f"- Name: {tctx.get('challenge_name', 'Unknown')}\n"
+            f"- Category: {tctx.get('category', 'Unknown')}\n"
+            f"- Description / Question: {tctx.get('description', '') or tctx.get('question', 'None')}\n"
+            f"- Expected Format / Pattern: {tctx.get('flag_pattern', 'None')}\n\n"
+            f"Candidate Evaluation:\n"
+            f"- Candidate Value: {val}\n"
+            f"- Candidate Source: {src.value}\n"
+            f"- Tool Command: {cmd}\n"
+            f"- Command Succeeded: {succ}\n"
+            f"- Evidence Details: {json.dumps(ev, default=str)[:500]}\n"
+            f"- Deterministic Preliminary Status: {deterministic_verdict.status.value}\n"
+            f"- Deterministic Inferred Type: {deterministic_verdict.answer_type.value}\n"
+            f"- Deterministic Confidence: {deterministic_verdict.confidence}\n"
+        )
+
+        resp = await self.router.route_request(
+            prompt=prompt,
+            capability="verification",
+            system_instruction=VERIFIER_SYSTEM_PROMPT,
+        )
+
+        content = getattr(resp, "content", "") or ""
+        return self._validate_llm_decision(
+            llm_text=content,
+            val=val,
+            src=src,
+            ev=ev,
+            tctx=tctx,
+            deterministic_verdict=deterministic_verdict,
+            authoritative=authoritative,
+        )
+
+    def _validate_llm_decision(
+        self,
+        llm_text: str,
+        val: str,
+        src: AnswerSource,
+        ev: Dict[str, Any],
+        tctx: Dict[str, Any],
+        deterministic_verdict: AnswerVerdict,
+        authoritative: bool,
+    ) -> Optional[AnswerVerdict]:
+        """Deterministically validate untrusted LLM structured output and enforce trust boundaries."""
+        if not llm_text:
+            return None
+
+        # Extract JSON from response
+        try:
+            cleaned = llm_text.strip()
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
+            elif "```" in cleaned:
+                cleaned = cleaned.split("```", 1)[1].split("```", 1)[0].strip()
+            data = json.loads(cleaned)
+        except Exception as e:
+            logger.debug(f"[VerifierAgent] Failed to parse LLM JSON: {e}")
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        verdict_str = str(data.get("verdict", "")).strip().upper()
+        try:
+            llm_conf = float(data.get("confidence", deterministic_verdict.confidence))
+            llm_conf = max(0.0, min(1.0, llm_conf))
+        except (ValueError, TypeError):
+            llm_conf = deterministic_verdict.confidence
+
+        is_distractor = bool(data.get("is_distractor", False))
+        reasoning = str(data.get("reasoning", "")).strip()
+        ans_type_str = str(data.get("answer_type", deterministic_verdict.answer_type.value)).strip().lower()
+
+        try:
+            resolved_type = AnswerType(ans_type_str)
+        except ValueError:
+            resolved_type = deterministic_verdict.answer_type
+
+        reasons = list(deterministic_verdict.reasons)
+        if reasoning:
+            reasons.append(f"Agent #4 Verifier: {reasoning}")
+
+        # Enforce Trust Boundary Invariants:
+        # 1. Distractor detection
+        if is_distractor or verdict_str == "REJECT":
+            return AnswerVerdict(
+                status=AnswerStatus.REJECTED,
+                confidence=min(llm_conf, 0.1),
+                candidate=val,
+                reasons=reasons,
+                answer_type=resolved_type,
+                evidence=ev,
+            )
+
+        # 2. LLM prose can NEVER be elevated to RESOLVED or VERIFIED
+        if src == AnswerSource.LLM_PROSE:
+            return AnswerVerdict(
+                status=AnswerStatus.CANDIDATE,
+                confidence=min(llm_conf, 0.5),
+                candidate=val,
+                reasons=reasons,
+                answer_type=resolved_type,
+                evidence=ev,
+            )
+
+        # 3. Only authoritative external checks produce VERIFIED status
+        if authoritative:
+            return AnswerVerdict(
+                status=AnswerStatus.VERIFIED,
+                confidence=1.0,
+                candidate=val,
+                reasons=reasons,
+                answer_type=resolved_type,
+                evidence=ev,
+            )
+
+        # 4. Validated RESOLVED or CANDIDATE
+        if verdict_str == "RESOLVE" and llm_conf >= 0.7:
+            final_status = AnswerStatus.RESOLVED
+        else:
+            final_status = AnswerStatus.CANDIDATE
+
+        return AnswerVerdict(
+            status=final_status,
+            confidence=llm_conf,
+            candidate=val,
+            reasons=reasons,
+            answer_type=resolved_type,
+            evidence=ev,
+        )
 
 
 # Backward compatibility class
