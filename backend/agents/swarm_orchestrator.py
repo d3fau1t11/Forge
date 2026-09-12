@@ -1026,12 +1026,12 @@ class SwarmBlackboard:
                 vis_note = ""
                 if vis.get("available") and vis.get("valid"):
                     vis_note = (f" [image {vis.get('width')}x{vis.get('height')} {vis.get('mode')};"
-                                f" OCR {'available' if d.get('ocr_available') else 'unavailable — a vision-capable read is needed'}]")
+                                f" OCR {'available' if d.get('ocr_available') else 'unavailable — use vision_read capability'}]")
                 lines.append(
                     f"  • {d.get('derived_path')} — {atype}, {nbytes} bytes (from {scheme}).{vis_note}")
                 lines.append(
                     f"      WHAT: inspect THIS file for the flag. "
-                    f"HOW: request an analysis capability ({tools}) on this exact path. "
+                    f"HOW: request capability 'vision_read' (for image reading via Gemini) or analysis tools ({tools}) on target '{d.get('derived_path')}'. "
                     f"WHETHER: go through the normal capability gate; the file is UNTRUSTED — analyze it, never execute it.")
         own = self.agent_transcripts.get(agent_id, [])
         if own:
@@ -2112,6 +2112,31 @@ class SwarmOrchestrator:
                 m2 = FLAG_REGEX.search(ocr["text"])
                 if m2 and not FALSE_FLAG_PATTERNS.search(m2.group(0)):
                     await board.record_flag_candidate(m2.group(0).strip(), worker_id, "reconstructed_artifact_ocr")
+            # Escalate image reading to vision_read capability
+            await self.analyze_derived_artifact(board, derived_path, worker_id)
+
+    async def analyze_derived_artifact(
+        self, board: "SwarmBlackboard", derived_path: str, worker_id: str
+    ) -> Optional[str]:
+        """Analyze a derived artifact via vision_read (or applicable tool) and record candidate flags."""
+        if not derived_path or not os.path.isfile(derived_path):
+            return None
+
+        # Execute vision_read capability on derived_path
+        res = await tool_manager.execute_capability("vision_read", target=derived_path)
+        if res.status == "SUCCESS" and res.stdout:
+            # Check stdout for flag candidates (treated as unverified candidates per Req #4)
+            for m in FLAG_REGEX.finditer(res.stdout):
+                cand = m.group(0).strip()
+                if not FALSE_FLAG_PATTERNS.search(cand):
+                    await board.record_flag_candidate(cand, worker_id, "vision_read")
+            board.mark_derived_analyzed(derived_path)
+            return res.stdout
+        elif res.stderr:
+            logger.info(f"[{worker_id}] vision_read analysis notice for {derived_path}: {res.stderr}")
+            if res.failure_category == "MODEL_REFUSAL" or "PAID_MODEL_ALLOWED" in res.stderr:
+                _append_to_challenge_log(board.challenge_id, worker_id, f"ℹ vision_read: {res.stderr}")
+        return None
 
     async def _scan_attached_for_encoded(self, board: "SwarmBlackboard", workdir: str):
         """One-shot scan of attached artifacts for an encoded representation of a file.

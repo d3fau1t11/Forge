@@ -138,6 +138,69 @@ class ToolManager:
         cwd: Optional[str] = None
     ) -> ToolExecutionResult:
         start_time = time.time()
+        parsed_target = target.replace("+", ",").split(",")[0].strip()
+
+        # Direct model-powered capabilities like vision_read
+        if capability == "vision_read":
+            target_path = parsed_target
+            if cwd and not os.path.isabs(target_path) and not os.path.exists(target_path):
+                alt_path = os.path.join(cwd, target_path)
+                if os.path.exists(alt_path):
+                    target_path = alt_path
+
+            if not target_path or not os.path.isfile(target_path):
+                elapsed_ms = (time.time() - start_time) * 1000
+                return ToolExecutionResult(
+                    tool_name="vision_read",
+                    capability=capability,
+                    command=f"vision_read {target}",
+                    status="FAILED",
+                    stderr=f"Target image file not found: {target_path}",
+                    exit_code=1,
+                    duration_ms=elapsed_ms,
+                    execution_failure=True,
+                    failure_category="FILE_NOT_FOUND"
+                )
+
+            from backend.providers.router import model_router
+            vision_prompt = (
+                "Extract any readable text visible in this image. Report it EXACTLY as "
+                "it appears, character for character, with no paraphrasing. If any text "
+                "resembles a CTF flag format (e.g. flag{...}, picoCTF{...}, or similar), "
+                "quote it verbatim first before anything else."
+            )
+            resp = await model_router.route_request(
+                prompt=vision_prompt,
+                capability="vision_read",
+                image_path=target_path
+            )
+            elapsed_ms = (time.time() - start_time) * 1000
+            if resp.is_refusal:
+                refusal_msg = resp.refusal_reason or resp.content or "Model refusal for vision_read"
+                return ToolExecutionResult(
+                    tool_name="vision_read",
+                    capability=capability,
+                    command=f"vision_read {target_path}",
+                    status="FAILED",
+                    stderr=refusal_msg,
+                    exit_code=1,
+                    duration_ms=elapsed_ms,
+                    execution_failure=True,
+                    failure_category="MODEL_REFUSAL"
+                )
+            else:
+                return ToolExecutionResult(
+                    tool_name="vision_read",
+                    capability=capability,
+                    command=f"vision_read {target_path}",
+                    status="SUCCESS",
+                    stdout=resp.content,
+                    stderr="",
+                    exit_code=0,
+                    duration_ms=elapsed_ms,
+                    execution_failure=False,
+                    failure_category=None
+                )
 
         # 1. Resolve candidate tools for capability
         candidate_tools = tool_registry.get_tools_for_capability(capability)
@@ -170,7 +233,6 @@ class ToolManager:
             )
 
         # 3. Construct safe execution command string & sanitize target format for specific tools
-        parsed_target = target.replace("+", ",").split(",")[0].strip()
         target_port = None
 
         if parsed_target.startswith("http://") or parsed_target.startswith("https://"):
@@ -243,6 +305,11 @@ class ToolManager:
         raw_cmd = sanitize_and_correct_command_target(command.strip(), canonical_target)
         logger.info(f"Executing raw CLI command (cwd={cwd}): {raw_cmd}")
 
+        # Model capability intercept: vision_read
+        if raw_cmd.startswith("vision_read ") or raw_cmd.startswith("vision_read\t") or raw_cmd == "vision_read":
+            target_file = raw_cmd.split(None, 1)[1].strip().strip('"').strip("'") if " " in raw_cmd or "\t" in raw_cmd else ""
+            return await self.execute_capability(capability="vision_read", target=target_file, cwd=cwd)
+
         # Delegate subprocess execution to ExecutionService (Phase 3). When *stdin* is
         # supplied it is fed to the process once (Tier-1 scripted interactive, Phase 4.x §4).
         exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
@@ -295,7 +362,7 @@ class ToolManager:
                 canonical_target=canonical_target
             )
         else:
-            target = params.get("target") or params.get("url") or params.get("ip") or canonical_target or ""
+            target = params.get("target") or params.get("url") or params.get("ip") or params.get("file_path") or params.get("image_path") or params.get("path") or canonical_target or ""
             extra_args = params.get("extra_args") or params.get("args") or ""
             return await self.execute_capability(
                 capability=tool_name,

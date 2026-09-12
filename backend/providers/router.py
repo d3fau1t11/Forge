@@ -46,7 +46,9 @@ class ModelRouter:
         # Writeup / report authoring — Gemini is deliberately FIRST for this task
         # (strong long-form technical prose); the rest of the free chain is the
         # fallback if Gemini is unavailable / quota-exhausted.
-        "report_generation": ["gemini", "groq", "xkiro", "xkiro_planner", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"]
+        "report_generation": ["gemini", "groq", "xkiro", "xkiro_planner", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
+        # Multimodal image reading — mapped explicitly to Gemini (vision-capable provider)
+        "vision_read": ["gemini"]
     }
 
     # Model to Provider/Transport Mapping
@@ -394,6 +396,9 @@ class ModelRouter:
         # (no probe calls). Stable sort preserves the curated order among un-throttled peers.
         candidates.sort(key=lambda p_name: 1 if quota_manager.is_near_ceiling(p_name) else 0)
 
+        paid_rejected = False
+        budget_rejected = False
+
         for provider_name in candidates:
             # Time-limited circuit breaker check
             if quota_manager.is_blacklisted_for_session(provider_name):
@@ -406,9 +411,11 @@ class ModelRouter:
             if provider.is_paid:
                 if not self.paid_allowed:
                     logger.warning(f"Provider {provider_name} rejected: Paid models disabled.")
+                    paid_rejected = True
                     continue
                 if self.current_spent_usd >= self.daily_budget_usd:
                     logger.warning(f"Provider {provider_name} rejected: Daily budget ${self.daily_budget_usd} exceeded.")
+                    budget_rejected = True
                     continue
 
             if await provider.is_available():
@@ -458,16 +465,24 @@ class ModelRouter:
                     continue
 
         logger.error("[ModelRouter] ALL providers exhausted. No valid response obtained.")
+        refusal_msg = "All providers exhausted — no live provider could fulfill this request."
+        if paid_rejected:
+            refusal_msg = "Capability unavailable because paid models are disabled (PAID_MODEL_ALLOWED=False)."
+            if capability == "vision_read":
+                refusal_msg = "Vision read capability (vision_read) is unavailable because paid models are disabled (PAID_MODEL_ALLOWED=False)."
+        elif budget_rejected:
+            refusal_msg = f"Capability unavailable because daily budget ${self.daily_budget_usd} exceeded."
+
         return ProviderResponse(
             provider_name="none",
             model_name="none",
-            content="[FORGE ERROR] All providers exhausted for this request. Check provider keys and quota status.",
+            content=f"[FORGE ERROR] {refusal_msg}",
             prompt_tokens=0,
             completion_tokens=0,
             estimated_cost_usd=0.0,
             latency_ms=0.0,
             is_refusal=True,
-            refusal_reason="All providers exhausted — no live provider could fulfill this request."
+            refusal_reason=refusal_msg
         )
 
 model_router = ModelRouter()

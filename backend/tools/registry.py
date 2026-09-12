@@ -88,6 +88,20 @@ class ToolRegistry:
             args_template="-e {target}"
         ))
 
+        # Vision / Multimodal Image Reading
+        self.register_tool(ToolMetadata(
+            tool_name="vision_read",
+            capabilities=["vision_read", "file_analysis", "image_analysis"],
+            binary="vision_read",
+            version_command="vision_read --version",
+            installation_recipe="built-in gemini provider",
+            os_compatibility=["linux", "windows", "darwin"],
+            privilege_requirement="SAFE",
+            risk_level="SAFE",
+            timeout_seconds=60,
+            args_template="{target}"
+        ))
+
     def register_tool(self, tool: ToolMetadata):
         self.tools[tool.tool_name] = tool
 

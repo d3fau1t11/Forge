@@ -1,3 +1,5 @@
+import base64
+import os
 import httpx
 import logging
 from typing import Optional, Dict, Any
@@ -7,6 +9,32 @@ from backend.providers.quota_manager import quota_manager
 from backend.config import settings
 
 logger = logging.getLogger("forge.providers")
+
+
+def _detect_mime_type(image_path: str, header_bytes: bytes = b"") -> str:
+    """Detect image MIME type from magic bytes or file extension."""
+    if header_bytes:
+        if header_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if header_bytes.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if header_bytes.startswith(b"GIF8"):
+            return "image/gif"
+        if header_bytes.startswith(b"RIFF") and b"WEBP" in header_bytes:
+            return "image/webp"
+        if header_bytes.startswith(b"BM"):
+            return "image/bmp"
+
+    ext = os.path.splitext(image_path or "")[1].lower()
+    ext_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+    }
+    return ext_map.get(ext, "image/png")
 
 
 def _max_tokens_floor(model: str) -> int:
@@ -86,14 +114,32 @@ class GeminiProvider(HTTPBaseProvider):
         return bool(self.api_keys or self.api_key)
 
     async def generate_response(
-        self, prompt: str, system_instruction: Optional[str] = None, capability: str = "general_reasoning", model: Optional[str] = None, **kwargs
+        self, prompt: str, system_instruction: Optional[str] = None, capability: str = "general_reasoning", model: Optional[str] = None, image_path: Optional[str] = None, **kwargs
     ) -> ProviderResponse:
         model_to_use = model or self.default_model
         if not await self.is_available():
             return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="API Key unconfigured")
 
+        img_path = image_path or kwargs.get("image_path")
+        parts: list[Dict[str, Any]] = [{"text": prompt}]
+
+        if img_path and os.path.isfile(img_path):
+            try:
+                with open(img_path, "rb") as fh:
+                    img_bytes = fh.read()
+                mime_type = _detect_mime_type(img_path, img_bytes[:32])
+                b64_data = base64.b64encode(img_bytes).decode("utf-8")
+                parts.append({
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": b64_data
+                    }
+                })
+            except Exception as read_err:
+                logger.warning(f"Could not read image file '{img_path}' for Gemini vision request: {read_err}")
+
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
+            "contents": [{"parts": parts}],
             "safetySettings": self.SAFETY_SETTINGS
         }
         if system_instruction:
