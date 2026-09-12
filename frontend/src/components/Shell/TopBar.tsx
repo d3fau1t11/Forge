@@ -147,10 +147,15 @@ export const TopBar: React.FC<TopBarProps> = ({
                 <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" />
                 <span>WS {wsStatus}</span>
               </span>
+            ) : wsStatus === 'ERROR' ? (
+              <span className="flex items-center space-x-1.5 text-rose-400 font-bold text-[11px]">
+                <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+                <span>WS ERROR</span>
+              </span>
             ) : (
               <span className="flex items-center space-x-1.5 text-rose-400 font-bold text-[11px]">
                 <WifiOff className="w-3.5 h-3.5 text-rose-400" />
-                <span>WS OFFLINE</span>
+                <span>WS {wsStatus || 'DISCONNECTED'}</span>
               </span>
             )}
           </div>

@@ -619,20 +619,24 @@ export default function App() {
     return () => {
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       if (wsRef.current) {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
         wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
         wsRef.current.close();
         wsRef.current = null;
       }
     };
   }, []);
 
-  // Periodic lightweight resync while any challenge is RUNNING / AWAITING_FLAG
+  // Periodic lightweight resync while any challenge is active OR when WS is offline
   useEffect(() => {
     const interval = setInterval(() => {
-      const isAnyRunning = challenges.some(
-        (c) => c.status === 'RUNNING' || c.status === 'AWAITING_FLAG' || c.status === 'WAITING'
+      const isAnyActive = challenges.some(
+        (c) => c.status === 'RUNNING' || c.status === 'AWAITING_FLAG' || c.status === 'WAITING' || c.status === 'WAITING_FOR_USER'
       );
-      if (isAnyRunning) {
+      const isWsOffline = wsStatus !== 'CONNECTED';
+      if (isAnyActive || isWsOffline) {
         fetchBackendData();
         if (activeChallengeRef.current?.id) {
           fetchActiveChallengeData(activeChallengeRef.current.id);
@@ -641,9 +645,12 @@ export default function App() {
     }, 10000);
 
     return () => clearInterval(interval);
-  }, [challenges]);
+  }, [challenges, wsStatus]);
 
   const fetchBackendData = async () => {
+    let anyError: string | null = null;
+
+    // Each endpoint is fetched independently so a single failure doesn't abort the rest.
     try {
       const backendChallenges = await apiService.getChallenges();
       if (Array.isArray(backendChallenges)) {
@@ -674,7 +681,11 @@ export default function App() {
         }));
         setChallenges(formatted);
       }
+    } catch (e: any) {
+      anyError = e?.message || 'Failed to fetch challenges';
+    }
 
+    try {
       const backendTargets = await apiService.getTargets();
       if (Array.isArray(backendTargets)) {
         const formattedT: Target[] = backendTargets.map((t: any) => ({
@@ -693,17 +704,29 @@ export default function App() {
         }));
         setTargets(formattedT);
       }
+    } catch (e: any) {
+      anyError = anyError || e?.message || 'Failed to fetch targets';
+    }
 
+    try {
       const backendEvidence = await apiService.getEvidence();
       if (Array.isArray(backendEvidence)) {
         setEvidenceList(backendEvidence);
       }
+    } catch (e: any) {
+      anyError = anyError || e?.message || 'Failed to fetch evidence';
+    }
 
+    try {
       const backendFindings = await apiService.getFindings();
       if (Array.isArray(backendFindings)) {
         setFindings(backendFindings);
       }
+    } catch (e: any) {
+      anyError = anyError || e?.message || 'Failed to fetch findings';
+    }
 
+    try {
       const backendTools = await apiService.getTools();
       if (Array.isArray(backendTools) && backendTools.length > 0) {
         setTools(
@@ -720,7 +743,11 @@ export default function App() {
           }))
         );
       }
+    } catch (e: any) {
+      anyError = anyError || e?.message || 'Failed to fetch tools';
+    }
 
+    try {
       const backendProviders = await apiService.getProviders();
       const provList = Array.isArray(backendProviders)
         ? backendProviders
@@ -738,21 +765,36 @@ export default function App() {
           fallbackPriority: Number(p.fallback_priority) || 0
         })));
       }
+    } catch (e: any) {
+      anyError = anyError || e?.message || 'Failed to fetch providers';
+    }
 
+    try {
       // Reload-safe terminal history (persisted tool executions from the swarm/orchestrator)
       const backendExecutions = await apiService.getToolExecutions();
       if (Array.isArray(backendExecutions) && backendExecutions.length > 0) {
         setTerminalLogs(mapToolExecutionsToLogs(backendExecutions));
       }
+    } catch (e: any) {
+      anyError = anyError || e?.message || 'Failed to fetch tool executions';
+    }
 
+    try {
       // Live swarm worker fleet (fallback: keep the idle placeholder fleet)
       const backendAgents = await apiService.getAgents();
       if (Array.isArray(backendAgents) && backendAgents.length > 0) {
         setAgents(mapSwarmAgents(backendAgents));
       }
     } catch (e: any) {
-      console.warn('Backend sync failed:', e);
-      setBackendError(e?.message || 'Backend API server unreachable');
+      anyError = anyError || e?.message || 'Failed to fetch agents';
+    }
+
+    // Surface the first error encountered, or clear previous error on full success
+    if (anyError) {
+      console.warn('Backend sync partial failure:', anyError);
+      setBackendError(anyError);
+    } else {
+      setBackendError(null);
     }
   };
 
@@ -1054,6 +1096,8 @@ export default function App() {
               onSubmitCheckpoint={(text: string) => apiService.respondToCheckpoint(activeChallenge.id, text)}
               onBackToChallenges={handleClearActiveChallenge}
               onToggleStatus={handleToggleChallengeStatus}
+              wsStatus={wsStatus}
+              backendError={backendError}
             />
           ) : (
             /* PRIMARY 10 PAGES */

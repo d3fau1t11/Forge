@@ -203,10 +203,18 @@ export class ApiService {
   public async getTargets() {
     try {
       const res = await fetch(`${API_BASE_URL}/targets`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        this.isOnline = false;
+        this.lastError = `HTTP ${res.status}`;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      this.isOnline = true;
+      this.lastError = null;
       return await res.json();
-    } catch (e) {
-      return [];
+    } catch (e: any) {
+      this.isOnline = false;
+      this.lastError = e?.message || 'Network Error';
+      throw e;
     }
   }
 
@@ -265,10 +273,18 @@ export class ApiService {
   public async getTools() {
     try {
       const res = await fetch(`${API_BASE_URL}/tools`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        this.isOnline = false;
+        this.lastError = `HTTP ${res.status}`;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      this.isOnline = true;
+      this.lastError = null;
       return await res.json();
-    } catch (e) {
-      return [];
+    } catch (e: any) {
+      this.isOnline = false;
+      this.lastError = e?.message || 'Network Error';
+      throw e;
     }
   }
 
@@ -277,20 +293,36 @@ export class ApiService {
       const params = new URLSearchParams({ limit: String(limit) });
       if (challengeId) params.set('challenge_id', challengeId);
       const res = await fetch(`${API_BASE_URL}/tools/executions?${params.toString()}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        this.isOnline = false;
+        this.lastError = `HTTP ${res.status}`;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      this.isOnline = true;
+      this.lastError = null;
       return await res.json();
-    } catch (e) {
-      return [];
+    } catch (e: any) {
+      this.isOnline = false;
+      this.lastError = e?.message || 'Network Error';
+      throw e;
     }
   }
 
   public async getAgents() {
     try {
       const res = await fetch(`${API_BASE_URL}/agents`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        this.isOnline = false;
+        this.lastError = `HTTP ${res.status}`;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      this.isOnline = true;
+      this.lastError = null;
       return await res.json();
-    } catch (e) {
-      return [];
+    } catch (e: any) {
+      this.isOnline = false;
+      this.lastError = e?.message || 'Network Error';
+      throw e;
     }
   }
 
@@ -335,30 +367,54 @@ export class ApiService {
   public async getProviders() {
     try {
       const res = await fetch(`${API_BASE_URL}/providers/health`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        this.isOnline = false;
+        this.lastError = `HTTP ${res.status}`;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      this.isOnline = true;
+      this.lastError = null;
       return await res.json();
-    } catch (e) {
-      return null;
+    } catch (e: any) {
+      this.isOnline = false;
+      this.lastError = e?.message || 'Network Error';
+      throw e;
     }
   }
 
   public async getEvidence() {
     try {
       const res = await fetch(`${API_BASE_URL}/evidence`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        this.isOnline = false;
+        this.lastError = `HTTP ${res.status}`;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      this.isOnline = true;
+      this.lastError = null;
       return await res.json();
-    } catch (e) {
-      return [];
+    } catch (e: any) {
+      this.isOnline = false;
+      this.lastError = e?.message || 'Network Error';
+      throw e;
     }
   }
 
   public async getFindings() {
     try {
       const res = await fetch(`${API_BASE_URL}/findings`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        this.isOnline = false;
+        this.lastError = `HTTP ${res.status}`;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      this.isOnline = true;
+      this.lastError = null;
       return await res.json();
-    } catch (e) {
-      return [];
+    } catch (e: any) {
+      this.isOnline = false;
+      this.lastError = e?.message || 'Network Error';
+      throw e;
     }
   }
 

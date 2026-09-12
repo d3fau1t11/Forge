@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Wifi, WifiOff, RefreshCw } from 'lucide-react';
 import { 
   Play, 
   Pause, 
@@ -38,6 +39,8 @@ interface ChallengeWorkspaceProps {
   onSubmitCheckpoint?: (text: string) => Promise<any>;
   onBackToChallenges: () => void;
   onToggleStatus: (id: string) => void;
+  wsStatus?: 'CONNECTING' | 'CONNECTED' | 'DISCONNECTED' | 'RECONNECTING' | 'ERROR';
+  backendError?: string | null;
 }
 
 export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
@@ -52,7 +55,9 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   checkpoint,
   onSubmitCheckpoint,
   onBackToChallenges,
-  onToggleStatus
+  onToggleStatus,
+  wsStatus = 'CONNECTED',
+  backendError = null
 }) => {
   const [activeTab, setActiveTab] = useState<
     'overview' | 'todo_plan' | 'workflow' | 'terminal' | 'ai_decisions' | 'evidence' | 'findings' | 'readme'
@@ -238,6 +243,31 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
 
   return (
     <div className="space-y-5 font-mono text-slate-100 pb-10">
+      {/* Connectivity / Backend Error Banner — visible when WS or API is unavailable */}
+      {(wsStatus !== 'CONNECTED' || backendError) && (
+        <div className={`rounded-xl p-3 border flex items-center space-x-3 text-xs font-bold ${
+          backendError
+            ? 'bg-rose-950/70 border-rose-500/60 text-rose-300 shadow-[0_0_15px_rgba(244,63,94,0.2)]'
+            : 'bg-amber-950/70 border-amber-500/60 text-amber-300 shadow-[0_0_15px_rgba(245,158,11,0.2)]'
+        }`}>
+          {wsStatus === 'CONNECTED' ? (
+            <Wifi className="w-4 h-4 text-emerald-400 shrink-0" />
+          ) : wsStatus === 'RECONNECTING' || wsStatus === 'CONNECTING' ? (
+            <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
+          ) : (
+            <WifiOff className="w-4 h-4 shrink-0" />
+          )}
+          <div className="flex flex-col">
+            {wsStatus !== 'CONNECTED' && (
+              <span>WebSocket: {wsStatus} — live events may be delayed. Polling backend every 10s.</span>
+            )}
+            {backendError && (
+              <span>⚠️ API Error: {backendError} — showing cached state.</span>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Captured flag — prominent, one-click copy (click the field to select-all as a fallback) */}
       {challenge.flag && (
         <div className="glass-panel border-2 border-cyber-emerald/60 rounded-xl p-5 space-y-3 shadow-[0_0_30px_rgba(16,185,129,0.2)] cyber-corner">
