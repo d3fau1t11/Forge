@@ -36,9 +36,12 @@ from backend.agent_runtime.recovery import RecoveryEngine, RecoveryStrategy
 from backend.agent_runtime.repetition import RepetitionDetector, RepetitionKind
 from backend.agent_runtime.session import AgentSession, SessionManager, session_manager
 from backend.agent_runtime.trajectory import TrajectoryStore, trajectory_store
-from backend.agent_runtime.verifier import FlagSource, FlagStatus, FlagVerifier
+from backend.agent_runtime.verifier import (
+    FlagSource, FlagStatus, FlagVerifier, AnswerStatus, AnswerResolver, VerifierAgent,
+)
 
 logger = logging.getLogger("forge.agent_runtime.runtime")
+
 
 
 @dataclass
@@ -122,6 +125,7 @@ class AgentRuntime:
         self.observations = observation_engine or ObservationEngine()
         self.context = context_builder or ContextBuilder()
         self.verifier = verifier or FlagVerifier()
+        self.verifier_agent = VerifierAgent(resolver=self.verifier)
         self.decider = DecisionEngine(self.gateway)
         self.learn_on_completion = learn_on_completion
 
@@ -336,23 +340,27 @@ class AgentRuntime:
                 self._record(session, "OBSERVATION", result=exec_result.status,
                              observation=obs.to_dict(), decision_summary=obs.summary)
 
-            # ── Flag verification from REAL tool output (only path to VERIFIED) ──
+            # ── Flag / Answer verification from REAL tool output ──
             if obs.flag_candidates:
                 verdict = self.verifier.assess_observation(
                     obs, command=exec_result.command, action_succeeded=exec_result.succeeded,
-                    target_scope=state.target, expected_format=state.flag_format)
-                if verdict and verdict.status == FlagStatus.VERIFIED:
+                    target_scope=state.target, expected_format=state.flag_format,
+                    description=getattr(state, "description", "") or getattr(state, "current_objective", ""),
+                    category=getattr(state, "category", ""))
+                if verdict and (verdict.is_resolved or verdict.is_verified):
                     state.set_verified_flag(verdict.candidate)
                     state.record_success(decision.strategy or action.display())
-                    self._record(session, "FLAG_VERIFIED", result="VERIFIED",
-                                 decision_summary=f"Flag verified from command output: {verdict.candidate}")
+                    self._record(session, "FLAG_VERIFIED", result=verdict.status.value,
+                                 decision_summary=f"Answer {verdict.status.value} from command output: {verdict.candidate}")
                     self.sessions.complete(session, outcome="success", verified_flag=verdict.candidate)
                     self._learn(session, "success", all_retrieved_ids)
                     return self._result(session, "COMPLETED", turns,
-                                        "Flag verified from real command output.")
+                                        f"Answer {verdict.status.value} from real command output.")
+
                 elif verdict:
                     self._record(session, "FLAG_CANDIDATE", result="CANDIDATE",
                                  decision_summary=f"Candidate (unverified): {verdict.candidate} — {verdict.reasons}")
+
 
             # ── (Step 9) update state; (STATE_UPDATE) record the delta ──
             delta = state.apply_observation(obs)

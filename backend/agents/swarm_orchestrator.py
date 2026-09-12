@@ -44,8 +44,9 @@ from backend.agents import checkpoint_pipeline
 from backend.agents.checkpoint_pipeline import AgentCheckpointRecord
 from backend.agent_runtime.verifier import (
     AnswerResolver, AnswerCandidate, AnswerVerdict, AnswerStatus, AnswerSource,
-    FLAG_REGEX, FALSE_FLAG_PATTERNS,
+    VerifierAgent, FLAG_REGEX, FALSE_FLAG_PATTERNS,
 )
+
 
 logger = logging.getLogger("forge.swarm")
 
@@ -446,6 +447,7 @@ class SwarmBlackboard:
         self.artifact_classification = None            # ClassificationResult | None
         self.env_info: Dict[str, Any] = {}
         self.answer_resolver = AnswerResolver()
+        self.verifier_agent = VerifierAgent(resolver=self.answer_resolver)
 
         # ── Encoded-artifact reconstruction & escalation (deterministic) ────────
         # When a tool output or attached artifact turns out to be an ENCODED file
@@ -579,7 +581,8 @@ class SwarmBlackboard:
                 task_context=task_context,
                 provenance={"worker_id": worker_id, "command": command, "action_succeeded": action_succeeded},
             )
-            verdict = self.answer_resolver.resolve(cand_obj)
+            verdict = self.verifier_agent.verify_sync(cand_obj)
+
 
             if verdict.status == AnswerStatus.REJECTED:
                 logger.info(f"[SwarmBlackboard] Rejected false/invalid candidate: {candidate} (reasons: {verdict.reasons})")
@@ -2148,9 +2151,21 @@ class SwarmOrchestrator:
         if outcome is None:
             return
 
-        # Any readable rendering is scanned for a flag with explicit provenance. This is
-        # what lets a "no flag" step be overturned by a reconstructed artifact (req #9/#11).
+        task_context = {
+            "description": board.description,
+            "challenge_name": board.challenge_name,
+            "category": board.category,
+            "flag_pattern": board.flag_pattern,
+            "target_scope": board.target_scope,
+        }
+
+        # Any readable rendering is scanned for candidates with explicit provenance.
         if outcome.decoded_text:
+            extracted = board.answer_resolver.extract_candidates(
+                outcome.decoded_text, task_context=task_context, source=AnswerSource.RECONSTRUCTED_ARTIFACT
+            )
+            for cand in extracted:
+                await board.record_flag_candidate(cand.value, worker_id, "reconstructed_artifact")
             m = FLAG_REGEX.search(outcome.decoded_text)
             if m and not FALSE_FLAG_PATTERNS.search(m.group(0)):
                 await board.record_flag_candidate(m.group(0).strip(), worker_id, "reconstructed_artifact")
@@ -2174,6 +2189,11 @@ class SwarmOrchestrator:
                     d["ocr_available"] = bool(ocr.get("available"))
                     break
             if ocr.get("available") and ocr.get("text"):
+                extracted_ocr = board.answer_resolver.extract_candidates(
+                    ocr["text"], task_context=task_context, source=AnswerSource.RECONSTRUCTED_ARTIFACT_OCR
+                )
+                for cand in extracted_ocr:
+                    await board.record_flag_candidate(cand.value, worker_id, "reconstructed_artifact_ocr")
                 m2 = FLAG_REGEX.search(ocr["text"])
                 if m2 and not FALSE_FLAG_PATTERNS.search(m2.group(0)):
                     await board.record_flag_candidate(m2.group(0).strip(), worker_id, "reconstructed_artifact_ocr")
@@ -2183,19 +2203,35 @@ class SwarmOrchestrator:
     async def analyze_derived_artifact(
         self, board: "SwarmBlackboard", derived_path: str, worker_id: str
     ) -> Optional[str]:
-        """Analyze a derived artifact via vision_read (or applicable tool) and record candidate flags."""
+        """Analyze a derived artifact via vision_read (or applicable tool) and record candidate flags/answers."""
         if not derived_path or not os.path.isfile(derived_path):
             return None
+
+        task_context = {
+            "description": board.description,
+            "challenge_name": board.challenge_name,
+            "category": board.category,
+            "flag_pattern": board.flag_pattern,
+            "target_scope": board.target_scope,
+        }
 
         # Execute vision_read capability on derived_path
         res = await tool_manager.execute_capability("vision_read", target=derived_path)
         if res.status == "SUCCESS" and res.stdout:
-            # Check stdout for flag candidates
+            # Check stdout for generic and flag candidates
+            extracted = board.answer_resolver.extract_candidates(
+                res.stdout, task_context=task_context, source=AnswerSource.VISION_READ
+            )
+            for cand in extracted:
+                await board.record_flag_candidate(
+                    cand.value, worker_id, "vision_read",
+                    evidence={"derived_path": derived_path, "tool": "vision_read", "stdout": res.stdout[:500]}
+                )
             for m in FLAG_REGEX.finditer(res.stdout):
-                cand = m.group(0).strip()
-                if not FALSE_FLAG_PATTERNS.search(cand):
+                cand_str = m.group(0).strip()
+                if not FALSE_FLAG_PATTERNS.search(cand_str):
                     await board.record_flag_candidate(
-                        cand, worker_id, "vision_read",
+                        cand_str, worker_id, "vision_read",
                         evidence={"derived_path": derived_path, "tool": "vision_read", "stdout": res.stdout[:500]}
                     )
             board.mark_derived_analyzed(derived_path)
@@ -2239,19 +2275,27 @@ class SwarmOrchestrator:
                 logger.debug("[reconstruct] attached scan skip %s: %s", path, exc)
 
     def _check_tool_output_for_flags(self, text: str, board: SwarmBlackboard, worker_id: str):
-        """Scan ONLY tool/command output for flag patterns. Never call this on LLM prose."""
+        """Scan ONLY tool/command output for flag and answer patterns. Never call this on LLM prose."""
         if not text:
             return
+        task_context = {
+            "description": board.description,
+            "challenge_name": board.challenge_name,
+            "category": board.category,
+            "flag_pattern": board.flag_pattern,
+            "target_scope": board.target_scope,
+        }
+        extracted = board.answer_resolver.extract_candidates(
+            text, task_context=task_context, source=AnswerSource.TOOL_OUTPUT
+        )
+        for cand in extracted:
+            asyncio.create_task(board.record_flag_candidate(cand.value, worker_id, "tool_output"))
+
         match = FLAG_REGEX.search(text)
         if match:
             candidate = match.group(0).strip()
-            # Reject placeholder patterns like picoCTF{...} or FLAG{example}
-            if FALSE_FLAG_PATTERNS.search(candidate):
-                logger.info(f"[{worker_id}] Rejected false-positive from tool output: {candidate}")
-                _append_to_challenge_log(board.challenge_id, worker_id, f"⚠ Rejected placeholder flag: {candidate}")
-                return
-            # This is from tool output — high confidence, auto-promote to captured
-            asyncio.create_task(board.record_flag_candidate(candidate, worker_id, "tool_output"))
+            if not FALSE_FLAG_PATTERNS.search(candidate):
+                asyncio.create_task(board.record_flag_candidate(candidate, worker_id, "tool_output"))
 
     async def _apply_decoded_directives(self, raw: str, board: SwarmBlackboard, worker_id: str) -> bool:
         """Deterministically decode an artifact (HTML comment, task text) and act
@@ -2271,12 +2315,27 @@ class SwarmOrchestrator:
                 return False
             board.processed_decode_hashes.add(raw_hash)
 
+        task_context = {
+            "description": board.description,
+            "challenge_name": board.challenge_name,
+            "category": board.category,
+            "flag_pattern": board.flag_pattern,
+            "target_scope": board.target_scope,
+        }
+
         acted = False
         try:
             for d in _decode_artifacts(raw):
                 decoded = d["decoded"]
                 _append_to_challenge_log(board.challenge_id, worker_id, f"🔓 {d['scheme']} decode: {decoded[:160]}")
-                # Flags hidden via an encoding inside a real captured artifact.
+                # Flags/answers hidden via an encoding inside a real captured artifact.
+                extracted = board.answer_resolver.extract_candidates(
+                    decoded, task_context=task_context, source=AnswerSource.DECODED_ARTIFACT
+                )
+                for cand in extracted:
+                    await board.record_flag_candidate(cand.value, worker_id, "decoded_artifact")
+                    acted = True
+
                 for fm in FLAG_REGEX.finditer(decoded):
                     cand = fm.group(0).strip()
                     if not FALSE_FLAG_PATTERNS.search(cand):
@@ -2300,6 +2359,7 @@ class SwarmOrchestrator:
                             acted = True
         except Exception as e:
             logger.debug(f"[{worker_id}] decode-directives skip: {e}")
+
         return acted
 
     async def _learn_from_run(self, board: "SwarmBlackboard", outcome: str = "success"):

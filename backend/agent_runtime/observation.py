@@ -20,7 +20,9 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
 # Canonical flag patterns live in the verifier (single source of truth for the runtime).
-from backend.agent_runtime.verifier import FLAG_REGEX, FALSE_FLAG_PATTERNS
+from backend.agent_runtime.verifier import (
+    FLAG_REGEX, FALSE_FLAG_PATTERNS, AnswerResolver, AnswerCandidate, AnswerSource,
+)
 
 # ── Deterministic extraction patterns ────────────────────────────────────────
 _URL_RE = re.compile(r"https?://[^\s\"'<>)\]}]+", re.IGNORECASE)
@@ -100,16 +102,25 @@ class Observation:
     new_headers: Dict[str, str] = field(default_factory=dict)
     new_cookies: Dict[str, str] = field(default_factory=dict)
     flag_candidates: List[str] = field(default_factory=list)
+    answer_candidates: List[Any] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     important_output: str = ""
     summary: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if "answer_candidates" in d:
+            d["answer_candidates"] = [
+                c.to_dict() if hasattr(c, "to_dict") else str(c) for c in (self.answer_candidates or [])
+            ]
+        return d
 
 
 class ObservationEngine:
     """Deterministically converts an ExecResult into an Observation (no model calls)."""
+
+    def __init__(self, resolver: Optional[AnswerResolver] = None):
+        self.resolver = resolver or AnswerResolver()
 
     def observe(self, result: Any, state: Optional[Any] = None) -> Observation:
         stdout = getattr(result, "stdout", "") or ""
@@ -151,12 +162,29 @@ class ObservationEngine:
             if pat.search(combined):
                 obs.new_vulnerabilities.append(name)
 
-        # ── Flag candidates (real regex, minus placeholder shapes) ──
+        # ── Generic and Flag Candidate Extraction ──
+        task_context = {}
+        if state is not None:
+            task_context = {
+                "description": getattr(state, "description", "") or getattr(state, "current_objective", ""),
+                "category": getattr(state, "category", ""),
+                "flag_pattern": getattr(state, "flag_format", ""),
+                "target_scope": getattr(state, "target", ""),
+            }
+
+        extracted_cands = self.resolver.extract_candidates(
+            combined, task_context=task_context, source=AnswerSource.TOOL_OUTPUT
+        )
+        obs.answer_candidates = extracted_cands
+        for cand in extracted_cands:
+            obs.flag_candidates.append(cand.value)
+
+        # Explicit fallback flag regex scan on stdout
         for m in FLAG_REGEX.findall(stdout):
-            cand = m if isinstance(m, str) else (m[0] if m else "")
-            cand = cand.strip()
-            if cand and not FALSE_FLAG_PATTERNS.search(cand):
-                obs.flag_candidates.append(cand)
+            cand_str = m if isinstance(m, str) else (m[0] if m else "")
+            cand_str = cand_str.strip()
+            if cand_str and not FALSE_FLAG_PATTERNS.search(cand_str):
+                obs.flag_candidates.append(cand_str)
 
         # ── Errors ──
         for hint in _ERROR_HINTS.findall(combined):
@@ -176,6 +204,7 @@ class ObservationEngine:
         obs.novelty = self._compute_novelty(obs, state)
         obs.summary = self._summarize(obs, result)
         return obs
+
 
     # ------------------------------------------------------------------ #
 

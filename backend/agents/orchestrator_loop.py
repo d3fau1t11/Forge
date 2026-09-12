@@ -27,7 +27,7 @@ from backend.agents.stream_condenser import stream_condenser
 from backend.agents.strategic_planner import strategic_planner
 from backend.agent_runtime.verifier import (
     AnswerResolver, AnswerCandidate, AnswerVerdict, AnswerStatus, AnswerSource,
-    FLAG_REGEX, FALSE_FLAG_PATTERNS,
+    VerifierAgent, FLAG_REGEX, FALSE_FLAG_PATTERNS,
 )
 
 logger = logging.getLogger("forge.orchestrator")
@@ -55,6 +55,8 @@ class AutonomousOrchestrator:
         self._root_events: dict[str, asyncio.Event] = {}
         self._root_results: dict[str, dict] = {}
         self.answer_resolver = AnswerResolver()
+        self.verifier_agent = VerifierAgent(resolver=self.answer_resolver)
+
         # ── Agent-runtime facade (Step 5) ──────────────────────────────────────
         # The new HERMES-inspired runtime owns canonical session/trajectory state.
         # These are lazily bound so importing the orchestrator never forces the
@@ -813,20 +815,40 @@ class AutonomousOrchestrator:
                 db.add(ev)
                 db.commit()
 
-                # Check for REAL Flag / Answer pattern in STDOUT/STDERR via AnswerResolver
+                # Check for REAL Flag / Answer pattern in STDOUT/STDERR via AnswerResolver & VerifierAgent
                 combined_output = f"{stdout_text}\n{stderr_text}"
+                task_ctx = {
+                    "description": getattr(challenge, "description", "") or "",
+                    "challenge_name": getattr(challenge, "name", "") or "",
+                    "category": getattr(challenge, "category", "") or "",
+                    "flag_pattern": getattr(challenge, "flag_pattern", "") or "",
+                    "target_scope": target,
+                }
+                
+                # 1. Extract generic and specialized candidates
+                candidates = self.answer_resolver.extract_candidates(
+                    combined_output, task_context=task_ctx, source=AnswerSource.TOOL_OUTPUT
+                )
+
+                # 2. Add any direct FLAG_REGEX matches if not already present
+                seen_cand_vals = {c.value for c in candidates}
                 for m in FLAG_REGEX.finditer(combined_output):
-                    cand = m.group(0).strip()
-                    verdict = self.answer_resolver.assess(
-                        cand,
-                        source=AnswerSource.TOOL_OUTPUT,
+                    fval = m.group(0).strip()
+                    if fval not in seen_cand_vals and not FALSE_FLAG_PATTERNS.search(fval):
+                        candidates.append(AnswerCandidate(
+                            value=fval,
+                            source=AnswerSource.TOOL_OUTPUT,
+                            task_context=task_ctx,
+                        ))
+                        seen_cand_vals.add(fval)
+
+                # 3. Evaluate each candidate through VerifierAgent
+                for cand_obj in candidates:
+                    verdict = self.verifier_agent.verify_sync(
+                        cand_obj,
+                        task_context=task_ctx,
                         command=cmd_line,
                         action_succeeded=(tool_res.exit_code == 0),
-                        target_scope=target,
-                        expected_format=getattr(challenge, "flag_pattern", ""),
-                        description=getattr(challenge, "description", ""),
-                        challenge_name=getattr(challenge, "name", ""),
-                        category=getattr(challenge, "category", ""),
                         evidence={"stdout": stdout_text, "stderr": stderr_text},
                     )
                     if verdict.is_verified or verdict.is_resolved:
@@ -835,6 +857,7 @@ class AutonomousOrchestrator:
                         break
                 if challenge.flag_status == "CAPTURED":
                     break
+
 
                 # State Checkpoint
                 checkpoint_manager.create_checkpoint(

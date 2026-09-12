@@ -28,8 +28,10 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.agent_runtime import (
-    FlagVerifier, FlagSource, FlagStatus, session_manager, trajectory_store,
+    FlagVerifier, FlagSource, FlagStatus, VerifierAgent, AnswerCandidate, AnswerStatus,
+    session_manager, trajectory_store,
 )
+
 from backend.swarm import events
 from backend.swarm.agents import AgentResult, SpecialistAgent
 from backend.swarm.evidence import Evidence, EvidenceBus, EvidenceType
@@ -120,7 +122,9 @@ class SwarmCoordinator:
         self.enable_report = enable_report
         self.kill_switch = kill_switch
         self.verifier = verifier or FlagVerifier()
+        self.verifier_agent = VerifierAgent(resolver=self.verifier)
         self.workspace_root = workspace_root
+
         self.mission_id = mission_id or str(uuid.uuid4())
         self._stopped = False
         self._stop_reason = ""
@@ -259,21 +263,25 @@ class SwarmCoordinator:
 
     def submit_flag_candidate(self, candidate: str, *, source: str = "tool_output",
                               command: str = "", action_succeeded: bool = True,
-                              agent_id: str = "external", evidence: Optional[Dict[str, Any]] = None) -> bool:
+                              agent_id: str = "external", evidence: Optional[Dict[str, Any]] = None,
+                              authoritative: bool = False) -> bool:
         """Central, authoritative flag/answer verification for candidates from any source.
         Returns True iff VERIFIED / RESOLVED."""
-        verdict = self.verifier.assess(
+        task_context = {
+            "target_scope": self.mission.target,
+            "flag_pattern": self.mission.flag_format,
+            "description": self.mission.description,
+            "challenge_name": self.mission.challenge_name,
+            "category": self.mission.category,
+        }
+        verdict = self.verifier_agent.verify_sync(
             candidate,
             source=source,
             command=command,
             action_succeeded=action_succeeded,
-            target_scope=self.mission.target,
-            expected_format=self.mission.flag_format,
-            description=self.mission.description,
-            challenge_name=self.mission.challenge_name,
-            category=self.mission.category,
+            task_context=task_context,
             evidence=evidence or {},
-            worker_id=agent_id,
+            authoritative=authoritative,
         )
         if verdict.is_verified or verdict.is_resolved:
             self._accept_verified_flag(verdict.candidate, agent_id=agent_id, task=None)
@@ -282,6 +290,7 @@ class SwarmCoordinator:
             self.mission.flag_candidates.append(verdict.candidate)
             self._broadcast_flag_candidate(verdict.candidate, agent_id)
         return False
+
 
     def snapshot(self) -> Dict[str, Any]:
         """Read-only view of the swarm for the API/WebSocket (§13)."""

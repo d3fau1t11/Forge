@@ -130,11 +130,15 @@ class AnswerVerdict:
 
     @property
     def is_verified(self) -> bool:
-        return self.status in (AnswerStatus.VERIFIED, AnswerStatus.RESOLVED)
+        return self.status == AnswerStatus.VERIFIED
 
     @property
     def is_resolved(self) -> bool:
         return self.status in (AnswerStatus.VERIFIED, AnswerStatus.RESOLVED)
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.is_resolved and self.confidence >= 0.7
 
 
 # Backward compatibility alias
@@ -159,19 +163,19 @@ def infer_expected_answer_type(
         return AnswerType.FLAG, flag_pattern
 
     # Explicit question analysis
-    if re.search(r"\b(?:what is the|find the|hidden|admin|account|login)\s+username\b|\bwho is the user\b", combined):
+    if re.search(r"\b(?:username|user name|who is the user|login name|account name|user)\b", combined) and "flag" not in combined:
         return AnswerType.USERNAME, None
 
-    if re.search(r"\b(?:what is the|find the|calculate the)\s+(?:sha256|sha1|md5|sha-256|sha-1|hash)\b|\bhash of\b", combined):
+    if re.search(r"\b(?:sha256|sha1|md5|sha-256|sha-1|hash|checksum)\b", combined) and "flag" not in combined:
         return AnswerType.HASH, None
 
-    if re.search(r"\b(?:what is the|find the|which)\s+(?:port|port number|number of|integer|count)\b|\bhow many\b", combined):
+    if re.search(r"\b(?:port|port number|port\b|number of|how many|integer|count|total|pid)\b", combined) and "flag" not in combined:
         return AnswerType.NUMBER, None
 
-    if re.search(r"\b(?:what is the|find the)\s+(?:filename|file name|path to the file)\b", combined):
+    if re.search(r"\b(?:filename|file name|file path|path to the file|which file)\b", combined) and "flag" not in combined:
         return AnswerType.FILENAME, None
 
-    if re.search(r"\b(?:secret key|api key|encryption key|access token|auth key)\b", combined):
+    if re.search(r"\b(?:secret key|api key|encryption key|access token|auth key|secret token|passphrase|password)\b", combined) and "flag" not in combined:
         return AnswerType.KEY, None
 
     # CTF default: flags
@@ -180,6 +184,7 @@ def infer_expected_answer_type(
         return AnswerType.FLAG, flag_pattern or None
 
     return AnswerType.STRING, None
+
 
 
 class AnswerResolver:
@@ -194,7 +199,7 @@ class AnswerResolver:
         if not source:
             return AnswerSource.UNKNOWN
         s = str(source).lower()
-        if s in ("tool_output", "tool", "stdout", "command"):
+        if s in ("tool_output", "tool", "stdout", "command", "step_execution"):
             return AnswerSource.TOOL_OUTPUT
         if s in ("vision_read", "vision", "gemini_vision"):
             return AnswerSource.VISION_READ
@@ -208,6 +213,98 @@ class AnswerResolver:
             return AnswerSource.LLM_PROSE
         return AnswerSource.UNKNOWN
 
+    def extract_candidates(
+        self,
+        text: str,
+        task_context: Optional[Dict[str, Any]] = None,
+        source: AnswerSource | str = AnswerSource.TOOL_OUTPUT,
+    ) -> List[AnswerCandidate]:
+        """Extract candidate answers from text/output based on flags, explicit annotations, and challenge semantics."""
+        if not text:
+            return []
+
+        task_context = task_context or {}
+        candidates: List[AnswerCandidate] = []
+        seen_values = set()
+        src = self.normalize_source(source)
+
+        def _add(val: str, atype: AnswerType, conf: float = 0.8, reasons: Optional[List[str]] = None):
+            v = val.strip()
+            if not v or v in seen_values:
+                return
+            if FALSE_FLAG_PATTERNS.search(v):
+                return
+            seen_values.add(v)
+            candidates.append(AnswerCandidate(
+                value=v,
+                answer_type=atype,
+                source=src,
+                confidence=conf,
+                task_context=task_context,
+                reasons=reasons or [],
+            ))
+
+        # 1. Flag candidates via FLAG_REGEX (high-value extractor)
+        for m in FLAG_REGEX.finditer(text):
+            flag_val = m.group(0).strip()
+            _add(flag_val, AnswerType.FLAG, conf=0.9, reasons=["Matched standard CTF flag regex."])
+
+        # 2. Explicit ANSWER / FLAG / KEY / SECRET prefix claims in text
+        for m in re.finditer(r"\b(?:FLAG|ANSWER|SECRET|KEY|SOLUTION)\s*[:=]\s*['\"]?([^\s'\"]+)['\"]?", text, re.IGNORECASE):
+            claim = m.group(1).strip()
+            _add(claim, AnswerType.CUSTOM, conf=0.8, reasons=["Explicitly prefixed in evidence text."])
+
+        # 3. Context-driven extraction based on expected challenge answer type
+        expected_type, custom_pat = infer_expected_answer_type(
+            question=task_context.get("description", "") or task_context.get("question", ""),
+            description=task_context.get("description", ""),
+            name=task_context.get("challenge_name", ""),
+            category=task_context.get("category", ""),
+            flag_pattern=task_context.get("flag_pattern", ""),
+        )
+
+        if custom_pat:
+            try:
+                pat = re.compile(custom_pat.replace("{...}", r"\{[^\}]+\}"), re.IGNORECASE)
+                for m in pat.finditer(text):
+                    _add(m.group(0).strip(), expected_type, conf=0.85, reasons=["Matched custom challenge flag pattern."])
+            except Exception:
+                pass
+
+        if expected_type == AnswerType.HASH:
+            for m in SHA256_REGEX.finditer(text):
+                _add(m.group(0).lower(), AnswerType.HASH, conf=0.85, reasons=["Matched SHA256 hash format."])
+            for m in SHA1_REGEX.finditer(text):
+                _add(m.group(0).lower(), AnswerType.HASH, conf=0.8, reasons=["Matched SHA1 hash format."])
+            for m in MD5_REGEX.finditer(text):
+                _add(m.group(0).lower(), AnswerType.HASH, conf=0.75, reasons=["Matched MD5 hash format."])
+
+        elif expected_type == AnswerType.NUMBER:
+            for m in re.finditer(r"\b(?:port|port\s+number|number|id|count|value)\s*[:=]?\s*(\d{1,8})\b", text, re.IGNORECASE):
+                _add(m.group(1), AnswerType.NUMBER, conf=0.85, reasons=["Matched labeled numeric value."])
+            for line in text.splitlines():
+                line_str = line.strip()
+                if line_str.isdigit() and len(line_str) <= 10:
+                    _add(line_str, AnswerType.NUMBER, conf=0.75, reasons=["Isolated line containing number."])
+
+        elif expected_type == AnswerType.USERNAME:
+            for m in re.finditer(r"\b(?:user(?:name)?|login|account|admin|operator)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{3,32})['\"]?", text, re.IGNORECASE):
+                cand_u = m.group(1).strip()
+                if cand_u.lower() not in ["not", "the", "found", "error", "true", "false", "null", "undefined", "successful", "failed", "access"]:
+                    _add(cand_u, AnswerType.USERNAME, conf=0.85, reasons=["Discovered username pattern in evidence."])
+
+
+
+        elif expected_type == AnswerType.FILENAME:
+            for m in re.finditer(r"\b([A-Za-z0-9_\-/\\]+\.[A-Za-z0-9]{1,6})\b", text):
+                _add(m.group(1), AnswerType.FILENAME, conf=0.75, reasons=["Discovered filename path pattern."])
+
+        elif expected_type == AnswerType.KEY:
+            for m in re.finditer(r"\b(?:key|api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{8,64})['\"]?", text, re.IGNORECASE):
+                _add(m.group(1), AnswerType.KEY, conf=0.85, reasons=["Discovered secret/key pattern."])
+
+        return candidates
+
     def resolve(self, candidate_obj: AnswerCandidate) -> AnswerVerdict:
         """Resolve a full AnswerCandidate against its task_context and evidence."""
         task_ctx = candidate_obj.task_context or {}
@@ -218,7 +315,7 @@ class AnswerResolver:
             action_succeeded=candidate_obj.provenance.get("action_succeeded", True),
             target_scope=task_ctx.get("target_scope", ""),
             expected_format=task_ctx.get("flag_pattern", ""),
-            description=task_ctx.get("description", ""),
+            description=task_ctx.get("description", "") or task_ctx.get("question", ""),
             challenge_name=task_ctx.get("challenge_name", ""),
             category=task_ctx.get("category", ""),
             evidence=candidate_obj.evidence,
@@ -239,6 +336,7 @@ class AnswerResolver:
         category: str = "",
         evidence: Optional[Dict[str, Any]] = None,
         worker_id: str = "",
+        authoritative: bool = False,
     ) -> AnswerVerdict:
         """Assess whether a candidate value resolves the challenge."""
         candidate = (candidate or "").strip()
@@ -264,7 +362,7 @@ class AnswerResolver:
                                  ["Matches a placeholder/example shape, not a real answer."],
                                  AnswerType.CUSTOM, evidence)
 
-        # ── Infer Expected Answer Type & Semantic Semantics ──
+        # ── Infer Expected Answer Type & Semantic Requirements ──
         expected_type, custom_pattern = infer_expected_answer_type(
             question=description,
             description=description,
@@ -275,7 +373,7 @@ class AnswerResolver:
 
         resolved_type = expected_type
 
-        # ── Specific Type Checks ──
+        # ── Semantic Type Validation ──
         if expected_type == AnswerType.USERNAME:
             # If challenge specifically asks for a username, reject flag envelopes like picoCTF{...}
             if FLAG_REGEX.search(candidate):
@@ -293,7 +391,6 @@ class AnswerResolver:
                 )
 
         elif expected_type == AnswerType.HASH:
-            # Hash must match hexadecimal hash length
             clean_hash = candidate.strip().lower()
             if FLAG_REGEX.search(candidate):
                 return AnswerVerdict(
@@ -310,6 +407,12 @@ class AnswerResolver:
             candidate = clean_hash
 
         elif expected_type == AnswerType.NUMBER:
+            if FLAG_REGEX.search(candidate):
+                return AnswerVerdict(
+                    AnswerStatus.REJECTED, 0.1, candidate,
+                    ["Challenge asks for a number, but candidate is formatted as a CTF flag."],
+                    AnswerType.FLAG, evidence
+                )
             if not candidate.isdigit():
                 return AnswerVerdict(
                     AnswerStatus.CANDIDATE, 0.2, candidate,
@@ -332,7 +435,6 @@ class AnswerResolver:
                     pass
 
         # ── Evidence Quality & Source Weighting ──
-        # High-confidence execution & evidence sources
         is_high_confidence_source = src in (
             AnswerSource.TOOL_OUTPUT,
             AnswerSource.VISION_READ,
@@ -355,7 +457,14 @@ class AnswerResolver:
                     reasons.append(f"Prefix '{prefix}' differs from expected format '{expected_format}'.")
 
             conf = 0.95 if not any(r.startswith("Prefix") for r in reasons) else 0.85
-            return AnswerVerdict(AnswerStatus.VERIFIED, conf, candidate, reasons, resolved_type, evidence)
+
+            # Meaningful separation: Only authoritatively verified submissions become VERIFIED.
+            # Evidence-based solutions are RESOLVED.
+            if authoritative:
+                reasons.append("Authoritatively confirmed via submission/check mechanism.")
+                return AnswerVerdict(AnswerStatus.VERIFIED, 1.0, candidate, reasons, resolved_type, evidence)
+
+            return AnswerVerdict(AnswerStatus.RESOLVED, conf, candidate, reasons, resolved_type, evidence)
 
         if src == AnswerSource.LLM_PROSE:
             reasons.append("Asserted in model prose; not verified against direct tool/artifact evidence.")
@@ -374,14 +483,16 @@ class AnswerResolver:
         expected_format: str = "",
         description: str = "",
         challenge_name: str = "",
-        category: str = ""
+        category: str = "",
+        authoritative: bool = False,
     ) -> Optional[AnswerVerdict]:
         """Verify the first answer/flag candidate found on a structured Observation."""
-        candidates = getattr(obs, "flag_candidates", None) or []
+        candidates = getattr(obs, "flag_candidates", None) or getattr(obs, "answer_candidates", None) or []
         if not candidates:
             return None
+        cand_val = candidates[0].value if isinstance(candidates[0], AnswerCandidate) else str(candidates[0])
         return self.assess(
-            candidates[0],
+            cand_val,
             source=AnswerSource.TOOL_OUTPUT,
             command=command,
             action_succeeded=action_succeeded,
@@ -390,8 +501,124 @@ class AnswerResolver:
             description=description,
             challenge_name=challenge_name,
             category=category,
+            authoritative=authoritative,
         )
+
+
+class VerifierAgent:
+    """Dedicated 4th Verifier Agent in FORGE's agent architecture.
+
+    Independently evaluates:
+    - the challenge question / task
+    - expected answer semantics & type
+    - candidate value
+    - candidate source
+    - supporting evidence
+    - provenance
+    - confidence
+    - whether the evidence actually answers what the challenge is asking for.
+    """
+
+    def __init__(self, resolver: Optional[AnswerResolver] = None, router: Optional[Any] = None):
+        self.resolver = resolver or AnswerResolver()
+        self.router = router
+
+    async def verify(
+        self,
+        candidate: AnswerCandidate | str,
+        *,
+        task_context: Optional[Dict[str, Any]] = None,
+        source: AnswerSource | str = AnswerSource.UNKNOWN,
+        evidence: Optional[Dict[str, Any]] = None,
+        command: str = "",
+        action_succeeded: bool = True,
+        authoritative: bool = False,
+    ) -> AnswerVerdict:
+        """Asynchronously verify a candidate answer with full evaluation."""
+        return self.verify_sync(
+            candidate,
+            task_context=task_context,
+            source=source,
+            evidence=evidence,
+            command=command,
+            action_succeeded=action_succeeded,
+            authoritative=authoritative,
+        )
+
+    def verify_sync(
+        self,
+        candidate: AnswerCandidate | str,
+        *,
+        task_context: Optional[Dict[str, Any]] = None,
+        source: AnswerSource | str = AnswerSource.UNKNOWN,
+        evidence: Optional[Dict[str, Any]] = None,
+        command: str = "",
+        action_succeeded: bool = True,
+        authoritative: bool = False,
+    ) -> AnswerVerdict:
+        """Synchronously verify an answer candidate against challenge semantics and evidence."""
+        if isinstance(candidate, AnswerCandidate):
+            cand_obj = candidate
+            if task_context:
+                cand_obj.task_context = {**(cand_obj.task_context or {}), **task_context}
+            if evidence:
+                cand_obj.evidence = {**(cand_obj.evidence or {}), **evidence}
+            val = cand_obj.value
+            src = cand_obj.source
+            cmd = cand_obj.provenance.get("command", command)
+            succ = cand_obj.provenance.get("action_succeeded", action_succeeded)
+            ev = cand_obj.evidence
+            tctx = cand_obj.task_context or {}
+            worker_id = cand_obj.worker_id
+        else:
+            val = str(candidate)
+            src = source
+            cmd = command
+            succ = action_succeeded
+            ev = evidence or {}
+            tctx = task_context or {}
+            worker_id = ""
+
+        # 1. Evaluate via AnswerResolver
+        verdict = self.resolver.assess(
+            val,
+            source=src,
+            command=cmd,
+            action_succeeded=succ,
+            target_scope=tctx.get("target_scope", ""),
+            expected_format=tctx.get("flag_pattern", ""),
+            description=tctx.get("description", "") or tctx.get("question", ""),
+            challenge_name=tctx.get("challenge_name", ""),
+            category=tctx.get("category", ""),
+            evidence=ev,
+            worker_id=worker_id,
+            authoritative=authoritative,
+        )
+
+        # 2. Semantic Distractor & Intent Audit
+        # Check if candidate is a flag-shaped distractor that does NOT answer the challenge question
+        question = (tctx.get("description", "") or tctx.get("question", "")).lower()
+        if verdict.answer_type in (AnswerType.USERNAME, AnswerType.NUMBER, AnswerType.HASH, AnswerType.FILENAME, AnswerType.KEY):
+            if FLAG_REGEX.search(val):
+                return AnswerVerdict(
+                    AnswerStatus.REJECTED,
+                    0.05,
+                    val,
+                    [f"Candidate is formatted as a flag, but challenge specifically asks for a {verdict.answer_type.value}."],
+                    verdict.answer_type,
+                    ev,
+                )
+
+        # Check for distractor flag strings when challenge question asks for something specific
+        if "not the flag" in question or "fake" in question or "distractor" in question:
+            if "fake" in val.lower() or "distractor" in val.lower() or "not_the_flag" in val.lower():
+                verdict.status = AnswerStatus.REJECTED
+                verdict.reasons.append("Identified as a challenge distractor.")
+                verdict.confidence = 0.1
+
+        return verdict
 
 
 # Backward compatibility class
 FlagVerifier = AnswerResolver
+

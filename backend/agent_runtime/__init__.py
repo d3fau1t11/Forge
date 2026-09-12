@@ -39,7 +39,7 @@ from backend.agent_runtime.recovery import (
 from backend.agent_runtime.verifier import (
     FlagVerifier, FlagStatus, FlagSource, FlagVerdict, FLAG_REGEX, FALSE_FLAG_PATTERNS,
     AnswerResolver, AnswerCandidate, AnswerVerdict, AnswerType, AnswerStatus, AnswerSource,
-    infer_expected_answer_type,
+    infer_expected_answer_type, VerifierAgent,
 )
 from backend.agent_runtime.context import ContextBuilder, BuiltContext
 from backend.agent_runtime.trajectory import (
@@ -62,7 +62,7 @@ __all__ = [
     "RecoveryEngine", "RecoveryPlan", "RecoveryStrategy", "FailureCategory",
     "FlagVerifier", "FlagStatus", "FlagSource", "FlagVerdict", "FLAG_REGEX", "FALSE_FLAG_PATTERNS",
     "AnswerResolver", "AnswerCandidate", "AnswerVerdict", "AnswerType", "AnswerStatus", "AnswerSource",
-    "infer_expected_answer_type",
+    "infer_expected_answer_type", "VerifierAgent",
     "ContextBuilder", "BuiltContext",
     "TrajectoryStore", "TrajectorySearch", "trajectory_store", "trajectory_search",
     "AgentSession", "SessionManager", "session_manager",
@@ -70,3 +70,4 @@ __all__ = [
     "CapabilityReport", "ExecutionBackend", "LocalExecutionBackend", "execution_backend",
     "RuntimeBoardAdapter", "RuntimeLearner", "runtime_learner",
 ]
+

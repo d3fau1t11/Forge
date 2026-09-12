@@ -26,11 +26,12 @@ class AgentRole(str, Enum):
     CRYPTO = "crypto"
     PWN = "pwn"
     REV = "rev"
+    VERIFIER = "verifier"
     SUPERVISOR = "supervisor"
 
     @classmethod
     def specialists(cls) -> List["AgentRole"]:
-        return [cls.RECON, cls.WEB, cls.FORENSICS, cls.CRYPTO, cls.PWN, cls.REV]
+        return [cls.RECON, cls.WEB, cls.FORENSICS, cls.CRYPTO, cls.PWN, cls.REV, cls.VERIFIER]
 
     @classmethod
     def from_value(cls, value: str) -> "AgentRole":
@@ -123,7 +124,19 @@ ROLE_PROFILES: Dict[AgentRole, RoleProfile] = {
         keywords=["disassemble", "decompile", "ghidra", "objdump", "reverse", "assembly",
                   "function", "algorithm", "license", "keygen"],
     ),
+    AgentRole.VERIFIER: RoleProfile(
+        role=AgentRole.VERIFIER,
+        objective=(
+            "Independently audit, evaluate, and verify answer candidates against the "
+            "challenge question, semantic requirements, supporting evidence, and provenance. "
+            "Confirm whether candidates conclusively answer the challenge."
+        ),
+        capabilities=["answer_verification", "candidate_evaluation", "evidence_audit"],
+        categories=["web", "crypto", "forensics", "pwn", "rev", "misc", "recon"],
+        keywords=["verify", "flag", "candidate", "answer", "solve", "confirm", "verdict"],
+    ),
 }
+
 
 
 def profile(role: AgentRole) -> RoleProfile:

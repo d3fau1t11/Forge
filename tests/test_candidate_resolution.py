@@ -12,6 +12,7 @@ Validates:
 8. Weak/noisy conflicting evidence does not automatically destroy a strong candidate.
 9. The live competition execution path actually exercises the resolver.
 10. Backward compatibility with FlagVerifier / FlagVerdict.
+11. Regression Tests A through H (Traditional flag, username, hash, number, distractor, vision, no fake verification, termination).
 """
 
 import asyncio
@@ -30,6 +31,7 @@ from backend.agent_runtime.verifier import (
     FlagStatus,
     FlagVerdict,
     FlagVerifier,
+    VerifierAgent,
     infer_expected_answer_type,
 )
 from backend.agents.swarm_orchestrator import SwarmBlackboard, SwarmOrchestrator
@@ -43,6 +45,7 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         init_db()
         self.resolver = AnswerResolver()
+        self.verifier_agent = VerifierAgent(resolver=self.resolver)
 
     def test_01_generic_answer_candidate_creation_from_evidence(self):
         """1. A generic answer candidate can be created from evidence with full metadata."""
@@ -143,7 +146,7 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(board.flag_captured, "picoCTF{binary_digits_reconstructed_jpeg_flag}")
         self.assertTrue(board.flag_event.is_set())
         self.assertEqual(len(board.flag_candidates), 1)
-        self.assertEqual(board.flag_candidates[0]["status"], "FLAG_VERIFIED")
+        self.assertEqual(board.flag_candidates[0]["status"], "RESOLVED")
 
     async def test_06_resolved_answer_causes_completion_termination(self):
         """6. A successfully resolved answer causes swarm completion/termination."""
@@ -251,17 +254,177 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
                 description=ch.description,
                 category=ch.category,
             )
-            self.assertTrue(verdict.is_verified)
+            self.assertTrue(verdict.is_resolved)
         finally:
             db.close()
 
     def test_10_backward_compatibility_with_flag_verifier(self):
-        """10. Existing FlagVerifier and FlagVerdict interfaces remain 100% compatible."""
+        """10. Existing FlagVerifier and FlagVerdict interfaces remain compatible."""
         fv = FlagVerifier()
         verdict = fv.assess("picoCTF{compat_test_1234}", source=FlagSource.TOOL_OUTPUT)
-        self.assertTrue(verdict.is_verified)
-        self.assertEqual(verdict.status, FlagStatus.VERIFIED)
+        self.assertTrue(verdict.is_resolved)
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
         self.assertEqual(verdict.candidate, "picoCTF{compat_test_1234}")
+
+    # =========================================================================
+    # FOCUSED REGRESSION TESTS (A - H)
+    # =========================================================================
+
+    def test_A_traditional_flag(self):
+        """Test A — traditional flag: Evidence contains a flag-shaped answer."""
+        verdict = self.verifier_agent.verify_sync(
+            "FLAG{synthetic_traditional_flag_abc}",
+            task_context={"description": "Find the secret flag in the service", "category": "web"},
+            source=AnswerSource.TOOL_OUTPUT,
+            action_succeeded=True,
+        )
+        self.assertTrue(verdict.is_resolved)
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertEqual(verdict.answer_type, AnswerType.FLAG)
+        self.assertEqual(verdict.candidate, "FLAG{synthetic_traditional_flag_abc}")
+
+    def test_B_username_answer(self):
+        """Test B — username: Challenge asks for username; evidence has NO flag string."""
+        evidence_text = "Login successful for user: shadow_operator_42"
+        extracted = self.resolver.extract_candidates(
+            evidence_text,
+            task_context={"description": "What username is exposed on the dashboard?", "category": "web"},
+            source=AnswerSource.TOOL_OUTPUT,
+        )
+        self.assertGreater(len(extracted), 0)
+        user_cand = extracted[0]
+        self.assertEqual(user_cand.value, "shadow_operator_42")
+
+        verdict = self.verifier_agent.verify_sync(
+            user_cand,
+            task_context={"description": "What username is exposed on the dashboard?", "category": "web"},
+        )
+        self.assertTrue(verdict.is_resolved)
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertEqual(verdict.answer_type, AnswerType.USERNAME)
+        self.assertEqual(verdict.candidate, "shadow_operator_42")
+
+    def test_C_hash_answer(self):
+        """Test C — hash: Challenge asks for SHA256; evidence contains hash, NO flag format."""
+        sha256_val = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+        evidence_text = f"Result payload hash computed: {sha256_val}"
+        extracted = self.resolver.extract_candidates(
+            evidence_text,
+            task_context={"description": "What is the SHA256 hash of the payload?", "category": "crypto"},
+            source=AnswerSource.TOOL_OUTPUT,
+        )
+        self.assertGreater(len(extracted), 0)
+        hash_cand = extracted[0]
+        self.assertEqual(hash_cand.value, sha256_val)
+
+        verdict = self.verifier_agent.verify_sync(
+            hash_cand,
+            task_context={"description": "What is the SHA256 hash of the payload?", "category": "crypto"},
+        )
+        self.assertTrue(verdict.is_resolved)
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertEqual(verdict.answer_type, AnswerType.HASH)
+        self.assertEqual(verdict.candidate, sha256_val)
+
+    def test_D_number_answer(self):
+        """Test D — number: Challenge asks for port/number; evidence has number, NO flag format."""
+        evidence_text = "Hidden backdoor listening on port: 31337"
+        extracted = self.resolver.extract_candidates(
+            evidence_text,
+            task_context={"description": "What port number is open for the admin service?", "category": "recon"},
+            source=AnswerSource.TOOL_OUTPUT,
+        )
+        self.assertGreater(len(extracted), 0)
+        num_cand = extracted[0]
+        self.assertEqual(num_cand.value, "31337")
+
+        verdict = self.verifier_agent.verify_sync(
+            num_cand,
+            task_context={"description": "What port number is open for the admin service?", "category": "recon"},
+        )
+        self.assertTrue(verdict.is_resolved)
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertEqual(verdict.answer_type, AnswerType.NUMBER)
+        self.assertEqual(verdict.candidate, "31337")
+
+    def test_E_flag_shaped_distractor(self):
+        """Test E — flag-shaped distractor: Evidence has flag format that does NOT answer challenge question."""
+        # Challenge specifically asks for a username
+        distractor_flag = "picoCTF{this_is_a_distractor_not_a_username}"
+        verdict = self.verifier_agent.verify_sync(
+            distractor_flag,
+            task_context={"description": "What username is exposed in the database dump?", "category": "web"},
+            source=AnswerSource.TOOL_OUTPUT,
+        )
+        # Verifier must NOT blindly accept flag when username is asked
+        self.assertEqual(verdict.status, AnswerStatus.REJECTED)
+        self.assertFalse(verdict.is_resolved)
+
+    async def test_F_vision_reconstructed_evidence(self):
+        """Test F — vision/reconstructed evidence: reaches the exact same resolver/verifier pipeline."""
+        board = SwarmBlackboard(
+            challenge_id="ch-vision-pipeline",
+            run_id="run-vision-pipeline",
+            target_scope="local",
+            description="Reconstruct image and find flag.",
+            category="forensics",
+        )
+        await board.record_flag_candidate(
+            candidate="FLAG{vision_reconstructed_pipeline_test}",
+            worker_id="agent-recon",
+            source="vision_read",
+            evidence={"tool": "vision_read", "derived_path": "/tmp/test.png"},
+        )
+        self.assertEqual(board.flag_captured, "FLAG{vision_reconstructed_pipeline_test}")
+        self.assertTrue(board.flag_event.is_set())
+        self.assertEqual(len(board.flag_candidates), 1)
+        self.assertEqual(board.flag_candidates[0]["status"], "RESOLVED")
+
+    def test_G_no_fake_verification(self):
+        """Test G — no fake verification: Strong evidence candidate without authoritative check is RESOLVED, not VERIFIED."""
+        # Normal evidence source without authoritative submission/check
+        verdict = self.verifier_agent.verify_sync(
+            "FLAG{strong_evidence_candidate}",
+            task_context={"description": "Find the flag", "category": "crypto"},
+            source=AnswerSource.TOOL_OUTPUT,
+            action_succeeded=True,
+            authoritative=False,
+        )
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertTrue(verdict.is_resolved)
+        self.assertFalse(verdict.is_verified)  # Meaningful distinction preserved!
+
+        # Explicitly authoritative verification
+        auth_verdict = self.verifier_agent.verify_sync(
+            "FLAG{strong_evidence_candidate}",
+            task_context={"description": "Find the flag", "category": "crypto"},
+            source=AnswerSource.TOOL_OUTPUT,
+            action_succeeded=True,
+            authoritative=True,
+        )
+        self.assertEqual(auth_verdict.status, AnswerStatus.VERIFIED)
+        self.assertTrue(auth_verdict.is_verified)
+
+    async def test_H_termination_on_resolved_answer(self):
+        """Test H — termination: Live orchestration stops unnecessary additional iterations once answer is resolved."""
+        board = SwarmBlackboard(
+            challenge_id="ch-termination-test",
+            run_id="run-termination-test",
+            target_scope="local",
+            description="Find the flag.",
+            category="pwn",
+        )
+        self.assertFalse(board.flag_event.is_set())
+        self.assertIsNone(board.flag_captured)
+
+        # Resolving an answer sets flag_captured and triggers flag_event
+        await board.record_flag_candidate(
+            candidate="FLAG{termination_confirmed}",
+            worker_id="agent-pwn",
+            source="tool_output",
+        )
+        self.assertEqual(board.flag_captured, "FLAG{termination_confirmed}")
+        self.assertTrue(board.flag_event.is_set())
 
 
 if __name__ == "__main__":
