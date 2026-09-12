@@ -100,6 +100,59 @@ class TestSwarmBugFixes(unittest.TestCase):
         self.assertIn("target.local:403:forbidden", board2.blocked_failure_sigs)
         self.assertIn("sudo", board2.blocked_capabilities)
 
+    # ── Bug 3 End-to-End Integration Pre/Post Check Test ─────────────────────
+
+    def test_bug3_precheck_postcheck_integration_skip(self):
+        """Integration test for Bug 3:
+        1. Runs failing command 3 times through real pre-check + post-check flow.
+        2. Asserts command shape is added to blocked_failure_sigs.
+        3. Runs command a 4th time and asserts it is skipped via pre-check (execute_tool not called).
+        """
+        from unittest.mock import AsyncMock, patch
+        from backend.agents.swarm_orchestrator import SwarmOrchestrator, _normalize_command_shape
+
+        board = SwarmBlackboard("chal-int-1", "run-int-1", "http://target.local")
+        orchestrator = SwarmOrchestrator()
+
+        cmd = "python solve_exploit.py --target http://target.local/admin"
+        cmd_shape = _normalize_command_shape(cmd)
+
+        mock_tool_res = AsyncMock()
+        mock_tool_res.exit_code = 1
+        mock_tool_res.stdout = ""
+        mock_tool_res.stderr = "Traceback (most recent call last):\n  File 'solve.py', line 10\n    ConnectionRefusedError: [Errno 111] Connection refused"
+        mock_tool_res.execution_failure = True
+        mock_tool_res.failure_category = "CONNECTION_REFUSED"
+
+        iter_n = 0
+        def fake_route_request(*args, **kwargs):
+            nonlocal iter_n
+            iter_n += 1
+            cmd_variant = f"python solve_exploit.py --target http://target.local/admin?v={iter_n}"
+            resp = AsyncMock()
+            resp.is_refusal = False
+            resp.content = f"I will run the exploit script:\n```bash\n{cmd_variant}\n```"
+            resp.model_name = "test-model"
+            return resp
+
+        exec_count = 0
+        async def fake_execute_tool(*args, **kwargs):
+            nonlocal exec_count
+            exec_count += 1
+            return mock_tool_res
+
+        with patch("backend.agents.swarm_orchestrator.model_router.route_request", side_effect=fake_route_request), \
+             patch("backend.agents.swarm_orchestrator.tool_manager.execute_tool", side_effect=fake_execute_tool):
+
+            board.max_iterations = 4
+            asyncio.run(orchestrator._agent_worker("agent_1", board, ".", "code_execution"))
+
+            self.assertEqual(exec_count, 3, "Tool should have executed exactly 3 times across 4 iterations (4th iteration skipped by pre-check)")
+            self.assertIn(cmd_shape, board.blocked_failure_sigs, f"Command shape '{cmd_shape}' must be in blocked_failure_sigs")
+            self.assertTrue(any("[SIGNATURE BLOCKED]" in line for line in board.agent_transcripts.get("agent_1", [])))
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

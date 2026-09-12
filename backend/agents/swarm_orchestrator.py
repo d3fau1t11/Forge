@@ -333,6 +333,43 @@ def _normalize_failure_signature(cmd: str, category: str, output_or_stderr: str)
     return f"{target}:{cat_str}:{norm_line}"
 
 
+def _normalize_command_shape(cmd: str) -> str:
+    """Computes an execution-independent command shape key for pre/post check matching."""
+    if not cmd or not isinstance(cmd, str):
+        return "empty_cmd"
+
+    recon_key = _normalize_recon_target(cmd)
+    if recon_key:
+        return recon_key
+
+    try:
+        tokens = shlex.split(cmd.strip())
+    except Exception:
+        tokens = cmd.strip().split()
+    if not tokens:
+        return "empty_cmd"
+
+    prog = os.path.basename(tokens[0]).lower()
+
+    target_host = "local"
+    url_m = re.search(r"https?://([^/\s'\"]+)", cmd)
+    if url_m:
+        target_host = url_m.group(1).lower()
+    elif re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", cmd):
+        target_host = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", cmd).group(0)
+
+    norm_tokens = []
+    for t in tokens[1:]:
+        # Strip content hash from solve scripts
+        t_clean = re.sub(r"solve_([a-zA-Z0-9_]+)_[0-9a-fA-F]{8}\.py", r"solve_\1.py", t)
+        # Strip query parameters from URL arguments so cosmetic query variations collapse to the same shape
+        t_clean = re.sub(r"(https?://[^\s'\"]+?)\?[^\s'\"]*", r"\1", t_clean)
+        norm_tokens.append(t_clean)
+
+    args_str = " ".join(norm_tokens[:5]).lower()
+    return f"{target_host}:{prog}:{args_str}"
+
+
 class SwarmTask:
     def __init__(self, task_id: str, category: str, description: str, priority: int = 1, metadata: Optional[Dict] = None):
         self.task_id = task_id
@@ -1672,10 +1709,10 @@ class SwarmOrchestrator:
                     await asyncio.sleep(0.5)
                     continue
 
-                # Bug 3 Pre-check: Blocked failure signature check
-                sig_key_preview = _normalize_failure_signature(cmd, "PRECHECK", "")
-                if sig_key_preview in board.blocked_failure_sigs:
-                    board.record_agent_step(agent_id, command=cmd, note=f"[SIGNATURE BLOCKED] Attempting a signature '{sig_key_preview}' blocked after repeated failures.")
+                # Bug 3 Pre-check: Blocked failure signature / command shape check
+                cmd_shape = _normalize_command_shape(cmd)
+                if cmd_shape in board.blocked_failure_sigs:
+                    board.record_agent_step(agent_id, command=cmd, note=f"[SIGNATURE BLOCKED] Command shape '{cmd_shape}' is blocked after repeated failures.")
                     await asyncio.sleep(0.5)
                     continue
 
@@ -1706,12 +1743,13 @@ class SwarmOrchestrator:
                         board.blocked_capabilities.add(f"cmd:{bin_name}")
                         board.record_agent_step(agent_id, note=f"[CAPABILITY BLOCKED] Binary '{bin_name}' not found; blocked for remaining run.")
 
-                    # Bug 3 Post-check: Track failure signature & block on repeat limit
+                    # Bug 3 Post-check: Track failure signature & block command shape on repeat limit
                     sig_key = _normalize_failure_signature(cmd, fail_cat or "EXEC_FAIL", res.stderr or output)
                     board.failure_signatures[sig_key] = board.failure_signatures.get(sig_key, 0) + 1
-                    if board.failure_signatures[sig_key] >= 3 and sig_key not in board.blocked_failure_sigs:
-                        board.blocked_failure_sigs.add(sig_key)
-                        board.record_agent_step(agent_id, note=f"[FAILURE REPEAT LIMIT] Signature '{sig_key}' hit threshold (3); blocking repeated attempts.")
+                    if board.failure_signatures[sig_key] >= 3:
+                        if cmd_shape not in board.blocked_failure_sigs:
+                            board.blocked_failure_sigs.add(cmd_shape)
+                            board.record_agent_step(agent_id, note=f"[FAILURE REPEAT LIMIT] Command shape '{cmd_shape}' hit threshold (3); blocking repeated attempts.")
 
                 # Local execution failures (Errno 2 / SyntaxError / permission / missing dep)
                 # never reached the target — a broken invocation, not a target response. Don't
