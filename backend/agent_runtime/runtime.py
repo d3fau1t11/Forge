@@ -38,6 +38,7 @@ from backend.agent_runtime.session import AgentSession, SessionManager, session_
 from backend.agent_runtime.trajectory import TrajectoryStore, trajectory_store
 from backend.agent_runtime.verifier import (
     FlagSource, FlagStatus, FlagVerifier, AnswerStatus, AnswerResolver, VerifierAgent,
+    AnswerCandidate, AnswerSource,
 )
 
 logger = logging.getLogger("forge.agent_runtime.runtime")
@@ -115,6 +116,7 @@ class AgentRuntime:
         observation_engine: Optional[ObservationEngine] = None,
         context_builder: Optional[ContextBuilder] = None,
         verifier: Optional[FlagVerifier] = None,
+        verifier_agent: Optional[VerifierAgent] = None,
         execution_backend: Optional[Any] = None,
         learn_on_completion: bool = True,
     ):
@@ -125,7 +127,8 @@ class AgentRuntime:
         self.observations = observation_engine or ObservationEngine()
         self.context = context_builder or ContextBuilder()
         self.verifier = verifier or FlagVerifier()
-        self.verifier_agent = VerifierAgent(resolver=self.verifier)
+        router = getattr(self.gateway, "router", None) or self.gateway
+        self.verifier_agent = verifier_agent or VerifierAgent(resolver=self.verifier, router=router)
         self.decider = DecisionEngine(self.gateway)
         self.learn_on_completion = learn_on_completion
 
@@ -286,9 +289,19 @@ class AgentRuntime:
                     self.sessions.complete(session, outcome="incomplete")
                     return self._result(session, "FAILED", turns, "Agent reported BUDGET_EXHAUSTED.")
                 # A model-asserted flag is a CANDIDATE only (never auto-verified from prose).
-                verdict = self.verifier.assess(action.command, source=FlagSource.LLM_PROSE,
-                                               expected_format=state.flag_format)
-                if verdict.status == FlagStatus.CANDIDATE:
+                task_ctx = {
+                    "description": getattr(state, "description", "") or getattr(state, "current_objective", ""),
+                    "challenge_name": getattr(state, "challenge_name", ""),
+                    "category": getattr(state, "category", ""),
+                    "flag_pattern": getattr(state, "flag_format", ""),
+                    "target_scope": getattr(state, "target", ""),
+                }
+                verdict = await self.verifier_agent.verify(
+                    action.command,
+                    source=AnswerSource.LLM_PROSE,
+                    task_context=task_ctx,
+                )
+                if verdict.status == AnswerStatus.CANDIDATE:
                     if verdict.candidate not in state.flag_candidates:
                         state.flag_candidates.append(verdict.candidate)
                     self._record(session, "FLAG_CANDIDATE", result="CANDIDATE",
@@ -341,25 +354,69 @@ class AgentRuntime:
                              observation=obs.to_dict(), decision_summary=obs.summary)
 
             # ── Flag / Answer verification from REAL tool output ──
-            if obs.flag_candidates:
-                verdict = self.verifier.assess_observation(
-                    obs, command=exec_result.command, action_succeeded=exec_result.succeeded,
-                    target_scope=state.target, expected_format=state.flag_format,
-                    description=getattr(state, "description", "") or getattr(state, "current_objective", ""),
-                    category=getattr(state, "category", ""))
-                if verdict and (verdict.is_resolved or verdict.is_verified):
+            candidates_to_eval: List[AnswerCandidate | str] = []
+            if getattr(obs, "answer_candidates", None):
+                candidates_to_eval.extend(obs.answer_candidates)
+            if getattr(obs, "flag_candidates", None):
+                for fc in obs.flag_candidates:
+                    if not any(
+                        (isinstance(c, AnswerCandidate) and c.value == fc) or c == fc
+                        for c in candidates_to_eval
+                    ):
+                        candidates_to_eval.append(fc)
+
+            task_ctx = {
+                "description": getattr(state, "description", "") or getattr(state, "current_objective", ""),
+                "challenge_name": getattr(state, "challenge_name", ""),
+                "category": getattr(state, "category", ""),
+                "flag_pattern": getattr(state, "flag_format", ""),
+                "target_scope": getattr(state, "target", ""),
+            }
+
+            for cand in candidates_to_eval:
+                val = cand.value if isinstance(cand, AnswerCandidate) else str(cand)
+                if not val or not val.strip():
+                    continue
+
+                verdict = await self.verifier_agent.verify(
+                    cand,
+                    task_context=task_ctx,
+                    command=exec_result.command or action.display(),
+                    action_succeeded=exec_result.succeeded,
+                    evidence={"stdout": exec_result.stdout, "stderr": exec_result.stderr},
+                    authoritative=False,
+                )
+
+                if verdict.status == AnswerStatus.VERIFIED:
                     state.set_verified_flag(verdict.candidate)
                     state.record_success(decision.strategy or action.display())
-                    self._record(session, "FLAG_VERIFIED", result=verdict.status.value,
-                                 decision_summary=f"Answer {verdict.status.value} from command output: {verdict.candidate}")
+                    self._record(session, "FLAG_VERIFIED", result=AnswerStatus.VERIFIED.value,
+                                 decision_summary=f"Answer VERIFIED from command output: {verdict.candidate}")
                     self.sessions.complete(session, outcome="success", verified_flag=verdict.candidate)
                     self._learn(session, "success", all_retrieved_ids)
                     return self._result(session, "COMPLETED", turns,
                                         f"Answer {verdict.status.value} from real command output.")
 
-                elif verdict:
-                    self._record(session, "FLAG_CANDIDATE", result="CANDIDATE",
+                elif verdict.status == AnswerStatus.RESOLVED:
+                    if verdict.candidate not in state.flag_candidates:
+                        state.flag_candidates.append(verdict.candidate)
+                    state.record_success(decision.strategy or action.display())
+                    self._record(session, "ANSWER_RESOLVED", result=AnswerStatus.RESOLVED.value,
+                                 decision_summary=f"Answer RESOLVED from command output: {verdict.candidate} (confidence={verdict.confidence})")
+                    self.sessions.complete(session, outcome="resolved", verified_flag=None)
+                    self._learn(session, "success", all_retrieved_ids)
+                    return self._result(session, "COMPLETED", turns,
+                                        f"Answer {verdict.status.value} from real command output.")
+
+                elif verdict.status == AnswerStatus.CANDIDATE:
+                    if verdict.candidate not in state.flag_candidates:
+                        state.flag_candidates.append(verdict.candidate)
+                    self._record(session, "FLAG_CANDIDATE", result=AnswerStatus.CANDIDATE.value,
                                  decision_summary=f"Candidate (unverified): {verdict.candidate} — {verdict.reasons}")
+
+                elif verdict.status == AnswerStatus.REJECTED:
+                    self._record(session, "FLAG_REJECTED", result=AnswerStatus.REJECTED.value,
+                                 decision_summary=f"Rejected candidate {verdict.candidate}: {verdict.reasons}")
 
 
             # ── (Step 9) update state; (STATE_UPDATE) record the delta ──

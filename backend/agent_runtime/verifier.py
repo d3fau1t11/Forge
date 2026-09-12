@@ -705,7 +705,7 @@ class VerifierAgent:
         if authoritative or verdict.status == AnswerStatus.REJECTED:
             return verdict
 
-        # 2. If ModelRouter is available, execute LLM-assisted verification (Agent #4)
+        # 2. If ModelRouter / ProviderGateway is available, execute LLM-assisted verification (Agent #4)
         if self.router is not None:
             try:
                 llm_verdict = await self._llm_evaluate(
@@ -737,7 +737,7 @@ class VerifierAgent:
         deterministic_verdict: AnswerVerdict,
         authoritative: bool,
     ) -> Optional[AnswerVerdict]:
-        """Invoke ModelRouter with capability='verification' and validate structured response."""
+        """Invoke ModelRouter / ProviderGateway with capability='verification' and validate structured response."""
         prompt = (
             f"Challenge Information:\n"
             f"- Name: {tctx.get('challenge_name', 'Unknown')}\n"
@@ -755,13 +755,29 @@ class VerifierAgent:
             f"- Deterministic Confidence: {deterministic_verdict.confidence}\n"
         )
 
-        resp = await self.router.route_request(
-            prompt=prompt,
-            capability="verification",
-            system_instruction=VERIFIER_SYSTEM_PROMPT,
-        )
+        resp = None
+        if hasattr(self.router, "route_request"):
+            resp = await self.router.route_request(
+                prompt=prompt,
+                capability="verification",
+                system_instruction=VERIFIER_SYSTEM_PROMPT,
+            )
+        elif hasattr(self.router, "complete"):
+            resp = await self.router.complete(
+                prompt=prompt,
+                system_instruction=VERIFIER_SYSTEM_PROMPT,
+                capability="verification",
+            )
+        else:
+            return None
 
-        content = getattr(resp, "content", "") or ""
+        if resp is None or getattr(resp, "is_refusal", False) is True:
+            return None
+
+        content = getattr(resp, "content", "")
+        if not isinstance(content, str) or not content.strip():
+            return None
+
         return self._validate_llm_decision(
             llm_text=content,
             val=val,
@@ -822,7 +838,7 @@ class VerifierAgent:
             reasons.append(f"Agent #4 Verifier: {reasoning}")
 
         # Enforce Trust Boundary Invariants:
-        # 1. Distractor detection
+        # 1. Distractor detection / REJECT
         if is_distractor or verdict_str == "REJECT":
             return AnswerVerdict(
                 status=AnswerStatus.REJECTED,
@@ -858,12 +874,16 @@ class VerifierAgent:
         # 4. Validated RESOLVED or CANDIDATE
         if verdict_str == "RESOLVE" and llm_conf >= 0.7:
             final_status = AnswerStatus.RESOLVED
+            final_conf = llm_conf
         else:
             final_status = AnswerStatus.CANDIDATE
+            final_conf = min(llm_conf, 0.6)
+            if verdict_str == "NEEDS_MORE_EVIDENCE":
+                reasons.append("Agent #4: Needs more corroborating evidence.")
 
         return AnswerVerdict(
             status=final_status,
-            confidence=llm_conf,
+            confidence=final_conf,
             candidate=val,
             reasons=reasons,
             answer_type=resolved_type,

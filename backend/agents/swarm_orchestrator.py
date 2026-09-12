@@ -447,7 +447,13 @@ class SwarmBlackboard:
         self.artifact_classification = None            # ClassificationResult | None
         self.env_info: Dict[str, Any] = {}
         self.answer_resolver = AnswerResolver()
-        self.verifier_agent = VerifierAgent(resolver=self.answer_resolver)
+        router = None
+        try:
+            from backend.providers.router import model_router
+            router = model_router
+        except Exception:
+            pass
+        self.verifier_agent = VerifierAgent(resolver=self.answer_resolver, router=router)
 
         # ── Encoded-artifact reconstruction & escalation (deterministic) ────────
         # When a tool output or attached artifact turns out to be an ENCODED file
@@ -563,6 +569,7 @@ class SwarmBlackboard:
         action_succeeded: bool = True,
     ):
         """Record an answer candidate, resolve against challenge semantics, and promote if verified/resolved."""
+        # Phase 1 (lock): read board fields to build candidate object (fast, no I/O)
         async with self._lock:
             task_context = {
                 "challenge_id": self.challenge_id,
@@ -581,9 +588,13 @@ class SwarmBlackboard:
                 task_context=task_context,
                 provenance={"worker_id": worker_id, "command": command, "action_succeeded": action_succeeded},
             )
-            verdict = self.verifier_agent.verify_sync(cand_obj)
 
+        # Phase 2 (unlocked): invoke Agent #4 async LLM-assisted verification.
+        # Lock is released so other workers are not blocked during the LLM call.
+        verdict = await self.verifier_agent.verify(cand_obj)
 
+        # Phase 3 (lock): record the verdict (dedup, append, broadcast)
+        async with self._lock:
             if verdict.status == AnswerStatus.REJECTED:
                 logger.info(f"[SwarmBlackboard] Rejected false/invalid candidate: {candidate} (reasons: {verdict.reasons})")
                 _append_to_challenge_log(self.challenge_id, worker_id, f"⚠ Rejected candidate: {candidate} ({'; '.join(verdict.reasons)})")

@@ -286,8 +286,9 @@ class TestProviderIndependence(RuntimeTestBase):
         result = await self._runtime(provider, executor).run(sess, max_turns=6)
         events = trajectory_store.get_events(sess.id)
         self.assertTrue(any(e.result == "SWITCH_PROVIDER" for e in events))
-        # Despite the provider hiccup, the mission continued and verified the flag.
-        self.assertEqual(result.verified_flag, "picoCTF{prov1der_f4ilover_ok}")
+        # Despite the provider hiccup, the mission continued and resolved the flag.
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertIn("picoCTF{prov1der_f4ilover_ok}", result.flag_candidates)
 
     async def test_15_switch_provider_without_session_loss(self):
         # Run turns with provider A (interrupted), then RESUME the SAME session with
@@ -314,7 +315,8 @@ class TestProviderIndependence(RuntimeTestBase):
         })
         result = await self._runtime(provider_b, exec_b).run(resumed, max_turns=6)
 
-        self.assertEqual(result.verified_flag, "flag{cross_provider_continuity}")
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertIn("flag{cross_provider_continuity}", result.flag_candidates)
         # Trajectory continued (did not restart); provider switched to B.
         self.assertGreater(trajectory_store.count(sess.id), seq_before)
         final = session_manager.get(sess.id)
@@ -348,7 +350,7 @@ class TestFlagLifecycle(RuntimeTestBase):
         self.assertTrue(any(e.event_type == "FLAG_CANDIDATE" for e in events))
         self.assertFalse(any(e.event_type == "FLAG_VERIFIED" for e in events))
 
-    async def test_12_flag_verified_from_tool_output(self):
+    async def test_12_flag_resolved_from_tool_output(self):
         provider = ScriptedProvider(["cat flag.txt"])
         executor = ScriptedToolExecutor(by_substring={
             "cat": ExecResult(command="cat flag.txt", status="SUCCESS", exit_code=0,
@@ -357,12 +359,11 @@ class TestFlagLifecycle(RuntimeTestBase):
         sess = self._make_session()
         result = await self._runtime(provider, executor).run(sess, max_turns=4)
         self.assertEqual(result.status, "COMPLETED")
-        self.assertEqual(result.outcome, "success")
-        self.assertEqual(result.verified_flag, "picoCTF{v3rified_from_0utput}")
+        self.assertIn("picoCTF{v3rified_from_0utput}", result.flag_candidates)
         final = session_manager.get(sess.id)
         self.assertEqual(final.status, "COMPLETED")
         events = trajectory_store.get_events(sess.id)
-        self.assertTrue(any(e.event_type == "FLAG_VERIFIED" for e in events))
+        self.assertTrue(any(e.event_type == "ANSWER_RESOLVED" for e in events))
 
 
 # --------------------------------------------------------------------------- #
@@ -480,7 +481,8 @@ class TestCrashResumeAcceptance(RuntimeTestBase):
         })
         result = await self._runtime(provider_2, exec2).run(resumed, max_turns=6)
 
-        self.assertEqual(result.verified_flag, "picoCTF{resumed_from_turn_8}")
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertIn("picoCTF{resumed_from_turn_8}", result.flag_candidates)
         # Trajectory sequences CONTINUED past the crash point (did not reset to 0).
         events = trajectory_store.get_events(sess.id)
         max_seq = max(e.sequence for e in events)

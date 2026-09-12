@@ -122,7 +122,13 @@ class SwarmCoordinator:
         self.enable_report = enable_report
         self.kill_switch = kill_switch
         self.verifier = verifier or FlagVerifier()
-        self.verifier_agent = VerifierAgent(resolver=self.verifier)
+        router = None
+        try:
+            from backend.providers.router import model_router
+            router = model_router
+        except Exception:
+            pass
+        self.verifier_agent = VerifierAgent(resolver=self.verifier, router=router)
         self.workspace_root = workspace_root
 
         self.mission_id = mission_id or str(uuid.uuid4())
@@ -275,6 +281,35 @@ class SwarmCoordinator:
             "category": self.mission.category,
         }
         verdict = self.verifier_agent.verify_sync(
+            candidate,
+            source=source,
+            command=command,
+            action_succeeded=action_succeeded,
+            task_context=task_context,
+            evidence=evidence or {},
+            authoritative=authoritative,
+        )
+        if verdict.is_verified or verdict.is_resolved:
+            self._accept_verified_flag(verdict.candidate, agent_id=agent_id, task=None)
+            return True
+        if verdict.candidate and verdict.candidate not in self.mission.flag_candidates:
+            self.mission.flag_candidates.append(verdict.candidate)
+            self._broadcast_flag_candidate(verdict.candidate, agent_id)
+        return False
+
+    async def submit_flag_candidate_async(self, candidate: str, *, source: str = "tool_output",
+                                         command: str = "", action_succeeded: bool = True,
+                                         agent_id: str = "external", evidence: Optional[Dict[str, Any]] = None,
+                                         authoritative: bool = False) -> bool:
+        """Central, authoritative async flag/answer verification for candidates from any source."""
+        task_context = {
+            "target_scope": self.mission.target,
+            "flag_pattern": self.mission.flag_format,
+            "description": self.mission.description,
+            "challenge_name": self.mission.challenge_name,
+            "category": self.mission.category,
+        }
+        verdict = await self.verifier_agent.verify(
             candidate,
             source=source,
             command=command,

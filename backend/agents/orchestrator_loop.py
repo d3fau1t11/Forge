@@ -55,7 +55,7 @@ class AutonomousOrchestrator:
         self._root_events: dict[str, asyncio.Event] = {}
         self._root_results: dict[str, dict] = {}
         self.answer_resolver = AnswerResolver()
-        self.verifier_agent = VerifierAgent(resolver=self.answer_resolver)
+        self.verifier_agent = VerifierAgent(resolver=self.answer_resolver, router=model_router)
 
         # ── Agent-runtime facade (Step 5) ──────────────────────────────────────
         # The new HERMES-inspired runtime owns canonical session/trajectory state.
@@ -844,7 +844,7 @@ class AutonomousOrchestrator:
 
                 # 3. Evaluate each candidate through VerifierAgent
                 for cand_obj in candidates:
-                    verdict = self.verifier_agent.verify_sync(
+                    verdict = await self.verifier_agent.verify(
                         cand_obj,
                         task_context=task_ctx,
                         command=cmd_line,

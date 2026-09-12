@@ -133,6 +133,7 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
             description="Reconstruct the JPEG image from binary digits and find the flag.",
             category="forensics",
         )
+        board.verifier_agent.router = None  # deterministic-only for unit tests
 
         # Candidate produced by vision_read on reconstructed artifact
         await board.record_flag_candidate(
@@ -157,6 +158,7 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
             description="Extract the flag from the binary.",
             category="rev",
         )
+        board.verifier_agent.router = None  # deterministic-only for unit tests
 
         await board.record_flag_candidate(
             candidate="FLAG{solved_via_tool_output}",
@@ -177,6 +179,7 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
             description="Find the flag.",
             category="crypto",
         )
+        board.verifier_agent.router = None  # deterministic-only for unit tests
 
         # Model prose claim (unverified)
         await board.record_flag_candidate(
@@ -208,6 +211,7 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
             description="Find the flag.",
             category="web",
         )
+        board.verifier_agent.router = None  # deterministic-only for unit tests
 
         # 1. High confidence evidence candidate
         await board.record_flag_candidate(
@@ -369,6 +373,7 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
             description="Reconstruct image and find flag.",
             category="forensics",
         )
+        board.verifier_agent.router = None  # deterministic-only for unit tests
         await board.record_flag_candidate(
             candidate="FLAG{vision_reconstructed_pipeline_test}",
             worker_id="agent-recon",
@@ -414,6 +419,7 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
             description="Find the flag.",
             category="pwn",
         )
+        board.verifier_agent.router = None  # deterministic-only for unit tests
         self.assertFalse(board.flag_event.is_set())
         self.assertIsNone(board.flag_captured)
 
@@ -517,6 +523,250 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
         # Successfully falls back to deterministic AnswerResolver
         self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
         self.assertGreaterEqual(verdict.confidence, 0.8)
+
+    # =========================================================================
+    # Explicit Coverage for 12 Integration Requirements
+    # =========================================================================
+
+    async def test_req01_real_tool_output_normal_picoctf_flag(self):
+        """Req 1: Real tool output containing a normal picoCTF flag."""
+        output = "Connected to server.\nAuthenticating...\nHere is your key: picoCTF{standard_flag_1234_alpha}\nGoodbye!"
+        cands = self.resolver.extract_candidates(
+            output,
+            task_context={"description": "Find the flag", "category": "web"},
+            source=AnswerSource.TOOL_OUTPUT,
+        )
+        self.assertTrue(any(c.value == "picoCTF{standard_flag_1234_alpha}" for c in cands))
+        verdict = await self.verifier_agent.verify(
+            cands[0],
+            task_context={"description": "Find the flag", "category": "web"},
+            command="curl http://target/flag",
+            action_succeeded=True,
+        )
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertEqual(verdict.answer_type, AnswerType.FLAG)
+
+    async def test_req02_real_tool_output_non_flag_username(self):
+        """Req 2: Real tool output containing a non-flag answer such as a username."""
+        output = "Admin panel loaded.\nLogged in as user: admin_svc_account_99\nSession active."
+        task_ctx = {"description": "Find the admin username on the server", "category": "web"}
+        cands = self.resolver.extract_candidates(output, task_context=task_ctx, source=AnswerSource.TOOL_OUTPUT)
+        self.assertTrue(len(cands) > 0)
+        verdict = await self.verifier_agent.verify(
+            cands[0],
+            task_context=task_ctx,
+            command="curl http://target/profile",
+            action_succeeded=True,
+        )
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertEqual(verdict.answer_type, AnswerType.USERNAME)
+
+    async def test_req03_flag_shaped_distractor_when_challenge_asks_for_username(self):
+        """Req 3: A flag-shaped distractor when the challenge asks for a username/hash/number."""
+        task_ctx = {"description": "What is the database administrator username?", "category": "web"}
+        verdict = await self.verifier_agent.verify(
+            "picoCTF{fake_distractor_flag}",
+            task_context=task_ctx,
+            source=AnswerSource.TOOL_OUTPUT,
+            command="cat /etc/passwd",
+            action_succeeded=True,
+        )
+        self.assertEqual(verdict.status, AnswerStatus.REJECTED)
+        self.assertLessEqual(verdict.confidence, 0.1)
+
+    async def test_req04_llm_verifier_returning_resolve(self):
+        """Req 4: LLM verifier returning RESOLVE produces RESOLVED."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content='{"verdict": "RESOLVE", "confidence": 0.95, "answer_type": "flag", "is_distractor": false, "reasoning": "Direct match from command output."}'
+        )
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "picoCTF{agent4_resolve_test}",
+            source=AnswerSource.TOOL_OUTPUT,
+            command="./solve",
+            action_succeeded=True,
+            task_context={"description": "Find the flag", "category": "pwn"},
+        )
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertEqual(verdict.confidence, 0.95)
+        self.assertFalse(verdict.is_verified)
+
+    async def test_req05_llm_verifier_returning_reject(self):
+        """Req 5: LLM verifier returning REJECT produces REJECTED."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content='{"verdict": "REJECT", "confidence": 0.0, "answer_type": "flag", "is_distractor": true, "reasoning": "Decoy string in comments."}'
+        )
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "picoCTF{decoy_flag}",
+            source=AnswerSource.TOOL_OUTPUT,
+            command="cat app.js",
+            action_succeeded=True,
+            task_context={"description": "Find the flag", "category": "web"},
+        )
+        self.assertEqual(verdict.status, AnswerStatus.REJECTED)
+        self.assertLessEqual(verdict.confidence, 0.1)
+
+    async def test_req06_llm_verifier_returning_needs_more_evidence(self):
+        """Req 6: LLM verifier returning NEEDS_MORE_EVIDENCE preserves CANDIDATE."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content='{"verdict": "NEEDS_MORE_EVIDENCE", "confidence": 0.5, "answer_type": "flag", "is_distractor": false, "reasoning": "String looks like a flag fragment, need full decrypt."}'
+        )
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "picoCTF{partial_fragment_only}",
+            source=AnswerSource.TOOL_OUTPUT,
+            command="strings bin",
+            action_succeeded=True,
+            task_context={"description": "Find the flag", "category": "rev"},
+        )
+        self.assertEqual(verdict.status, AnswerStatus.CANDIDATE)
+        self.assertLessEqual(verdict.confidence, 0.6)
+
+    async def test_req07_malformed_llm_json_fallback(self):
+        """Req 7: Malformed LLM JSON falls back gracefully to deterministic assessment."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content="This is not valid JSON at all!"
+        )
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "picoCTF{valid_flag_despite_bad_json}",
+            source=AnswerSource.TOOL_OUTPUT,
+            command="cat flag.txt",
+            action_succeeded=True,
+            task_context={"description": "Find flag", "category": "misc"},
+        )
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+
+    async def test_req08_router_provider_failure_or_refusal(self):
+        """Req 8: Router/provider failure or refusal falls back cleanly to deterministic assessment."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content="",
+            is_refusal=True,
+            refusal_reason="Model refused safety policy"
+        )
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "picoCTF{flag_after_refusal}",
+            source=AnswerSource.TOOL_OUTPUT,
+            command="cat flag.txt",
+            action_succeeded=True,
+            task_context={"description": "Find flag", "category": "misc"},
+        )
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+
+    async def test_req09_llm_prose_candidate_cannot_become_verified(self):
+        """Req 9: LLM prose candidate cannot become VERIFIED."""
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content='{"verdict": "RESOLVE", "confidence": 1.0, "answer_type": "flag", "is_distractor": false, "reasoning": "Asserted in prose."}'
+        )
+        agent = VerifierAgent(resolver=self.resolver, router=mock_router)
+        verdict = await agent.verify(
+            "picoCTF{prose_unsupported_flag}",
+            source=AnswerSource.LLM_PROSE,
+            task_context={"description": "Find flag", "category": "misc"},
+        )
+        self.assertEqual(verdict.status, AnswerStatus.CANDIDATE)
+        self.assertFalse(verdict.is_verified)
+        self.assertLessEqual(verdict.confidence, 0.5)
+
+    async def test_req10_resolved_is_not_reported_as_verified(self):
+        """Req 10: RESOLVED is not reported as VERIFIED."""
+        verdict = await self.verifier_agent.verify(
+            "picoCTF{resolved_evidence_flag}",
+            source=AnswerSource.TOOL_OUTPUT,
+            command="cat flag.txt",
+            action_succeeded=True,
+            authoritative=False,
+            task_context={"description": "Find flag", "category": "misc"},
+        )
+        self.assertEqual(verdict.status, AnswerStatus.RESOLVED)
+        self.assertFalse(verdict.is_verified)
+        self.assertTrue(verdict.is_resolved)
+
+    async def test_req11_agent4_invoked_by_live_runtime_verification_path(self):
+        """Req 11: Agent #4 is actually invoked by the live runtime verification path."""
+        from backend.agent_runtime import AgentRuntime, MissionState, session_manager
+        from backend.agent_runtime.action import Action, ActionType, ExecResult
+        from backend.agent_runtime.decision import ProviderCompletion
+
+        class MockToolExec:
+            async def execute(self, action, **kwargs):
+                return ExecResult(
+                    status="SUCCESS",
+                    stdout="Flag captured: picoCTF{live_runtime_flag_999}\n",
+                    stderr="",
+                    exit_code=0,
+                    command=action.display(),
+                )
+
+        mock_router = AsyncMock()
+        mock_router.route_request.return_value = AsyncMock(
+            content='{"verdict": "RESOLVE", "confidence": 0.98, "answer_type": "flag", "is_distractor": false, "reasoning": "Real command output contains valid flag."}',
+            is_refusal=False,
+        )
+
+        class MockProviderGateway:
+            def __init__(self, router):
+                self.router = router
+
+            async def complete(self, **kwargs):
+                return ProviderCompletion(
+                    content="cat /flag.txt\nstrategy: exfil\nobjective: read flag",
+                    provider_name="mock_provider",
+                    model_name="mock_model",
+                )
+
+        gateway = MockProviderGateway(mock_router)
+        runtime = AgentRuntime(tool_executor=MockToolExec(), provider_gateway=gateway)
+
+        session = session_manager.create(
+            agent_id="test_worker_1",
+            engine="forge",
+            target_scope="http://target:8080",
+            category="web",
+            description="Find the flag on the web server",
+        )
+
+        result = await runtime.run(session, max_turns=2)
+
+        # Agent #4 router MUST have been awaited
+        mock_router.route_request.assert_awaited()
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertIn("picoCTF{live_runtime_flag_999}", result.flag_candidates)
+        # RESOLVED does not falsely claim authoritative VERIFIED
+        self.assertIsNone(result.verified_flag)
+
+    async def test_req12_authoritative_verification_only_path_producing_verified(self):
+        """Req 12: Authoritative verification is the only path producing VERIFIED."""
+        # Non-authoritative
+        non_auth = await self.verifier_agent.verify(
+            "picoCTF{test_auth_flag}",
+            source=AnswerSource.TOOL_OUTPUT,
+            action_succeeded=True,
+            authoritative=False,
+            task_context={"description": "Find flag", "category": "web"},
+        )
+        self.assertEqual(non_auth.status, AnswerStatus.RESOLVED)
+        self.assertFalse(non_auth.is_verified)
+
+        # Authoritative
+        auth = await self.verifier_agent.verify(
+            "picoCTF{test_auth_flag}",
+            source=AnswerSource.TOOL_OUTPUT,
+            action_succeeded=True,
+            authoritative=True,
+            task_context={"description": "Find flag", "category": "web"},
+        )
+        self.assertEqual(auth.status, AnswerStatus.VERIFIED)
+        self.assertTrue(auth.is_verified)
+        self.assertEqual(auth.confidence, 1.0)
 
 
 if __name__ == "__main__":
