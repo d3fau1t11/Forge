@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { NavTab, Challenge, Target, AgentInfo, ToolItem, AiDecision, ModelRoute, EvidenceItem, TerminalLog, ProviderInfo, CheckpointItem, AuditLog, Finding, WorkflowNode } from './types';
 import { 
   INITIAL_CHALLENGES, 
@@ -120,6 +120,13 @@ export default function App() {
   const [rootRequests, setRootRequests] = useState<RootPermissionRequest[]>([]);
   const [knowledgeRefreshTrigger, setKnowledgeRefreshTrigger] = useState(0);
 
+  // Connectivity & Observability States
+  const [wsStatus, setWsStatus] = useState<'CONNECTING' | 'CONNECTED' | 'DISCONNECTED' | 'RECONNECTING' | 'ERROR'>('CONNECTING');
+  const [backendError, setBackendError] = useState<string | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<any>(null);
+  const pendingTempIdsRef = useRef<Set<string>>(new Set());
+
   const activeChallengeRef = useRef<Challenge | null>(activeChallenge);
   useEffect(() => {
     activeChallengeRef.current = activeChallenge;
@@ -184,17 +191,22 @@ export default function App() {
   useEffect(() => {
     fetchBackendData();
 
-    // Setup live WebSocket listener with automatic reconnection & resync
-    let ws: WebSocket | null = null;
-    let reconnectTimer: any = null;
-
+    // Setup live WebSocket listener with automatic reconnection, state tracking & resync
     const connectWs = () => {
+      if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
+      setWsStatus('CONNECTING');
       try {
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsHost = window.location.host || 'localhost:8000';
-        ws = new WebSocket(`${wsProtocol}//${wsHost}/ws/events`);
+        const ws = new WebSocket(`${wsProtocol}//${wsHost}/ws/events`);
+        wsRef.current = ws;
 
         ws.onopen = () => {
+          setWsStatus('CONNECTED');
+          setBackendError(null);
           // Trigger a resync on successful connection/reconnection to fill any gaps
           fetchBackendData();
           if (activeChallengeRef.current?.id) {
@@ -205,6 +217,25 @@ export default function App() {
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
+
+            // Optimistic ID transition resolution:
+            // If the incoming event contains a backend challenge_id that isn't yet present
+            // in state, but we have a pending temporary challenge ID (from handleCreateChallenge),
+            // bind the temporary ID to the backend challenge_id immediately so early events are never lost!
+            if (data.challenge_id) {
+              const realId = data.challenge_id;
+              setChallenges((prevChallenges) => {
+                const exists = prevChallenges.some((c) => c.id === realId);
+                if (!exists && pendingTempIdsRef.current.size > 0) {
+                  const tempId = Array.from(pendingTempIdsRef.current)[0];
+                  pendingTempIdsRef.current.delete(tempId);
+                  setActiveChallenge((prev) => (prev && prev.id === tempId ? { ...prev, id: realId } : prev));
+                  setTargets((prev) => prev.map((t) => (t.challengeId === tempId ? { ...t, challengeId: realId } : t)));
+                  return prevChallenges.map((c) => (c.id === tempId ? { ...c, id: realId } : c));
+                }
+                return prevChallenges;
+              });
+            }
             if (data.event === 'RUN_STARTED') {
               setChallenges((prev) =>
                 prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
@@ -566,18 +597,32 @@ export default function App() {
         };
 
         ws.onclose = () => {
-          reconnectTimer = setTimeout(connectWs, 3000);
+          setWsStatus('RECONNECTING');
+          wsRef.current = null;
+          if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = setTimeout(connectWs, 3000);
+        };
+
+        ws.onerror = (err) => {
+          console.error('WebSocket connection error:', err);
+          setWsStatus('ERROR');
         };
       } catch (e) {
-        reconnectTimer = setTimeout(connectWs, 5000);
+        setWsStatus('ERROR');
+        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = setTimeout(connectWs, 5000);
       }
     };
 
     connectWs();
 
     return () => {
-      if (ws) ws.close();
-      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
   }, []);
 
@@ -705,8 +750,9 @@ export default function App() {
       if (Array.isArray(backendAgents) && backendAgents.length > 0) {
         setAgents(mapSwarmAgents(backendAgents));
       }
-    } catch (e) {
-      console.log('Backend sync active.');
+    } catch (e: any) {
+      console.warn('Backend sync failed:', e);
+      setBackendError(e?.message || 'Backend API server unreachable');
     }
   };
 
@@ -726,8 +772,11 @@ export default function App() {
     instanceExpiryMinutes?: number;
     attachedFilePaths?: string[];
   }) => {
+    const tempId = `ch-${Date.now()}`;
+    pendingTempIdsRef.current.add(tempId);
+
     const createdLocally: Challenge = {
-      id: `ch-${Date.now()}`,
+      id: tempId,
       name: newCh.name,
       category: newCh.category,
       difficulty: newCh.difficulty,
@@ -754,7 +803,7 @@ export default function App() {
       discoveryMethod: 'FORGE Auto Ingest',
       lastVerified: 'Just now',
       addressHistory: [newCh.target],
-      challengeId: createdLocally.id
+      challengeId: tempId
     };
     setTargets((prev) => [newTargetObj, ...prev]);
 
@@ -775,8 +824,15 @@ export default function App() {
         attached_file_paths: newCh.attachedFilePaths
       });
       if (resp && resp.id) {
+        pendingTempIdsRef.current.delete(tempId);
         setChallenges((prev) =>
-          prev.map((c) => (c.id === createdLocally.id ? { ...c, id: resp.id } : c))
+          prev.map((c) => (c.id === tempId ? { ...c, id: resp.id } : c))
+        );
+        setActiveChallenge((prev) =>
+          prev && prev.id === tempId ? { ...prev, id: resp.id } : prev
+        );
+        setTargets((prev) =>
+          prev.map((t) => (t.challengeId === tempId ? { ...t, challengeId: resp.id } : t))
         );
         // Resync from the API: the mission plan can race past the optimistic-id swap,
         // so pull the freshly generated plan instead of relying on the WS event alone.
@@ -951,6 +1007,8 @@ export default function App() {
           operationalMode={operationalMode}
           onModeChange={setOperationalMode}
           onResumeKillSwitch={handleResumeKillSwitch}
+          wsStatus={wsStatus}
+          backendError={backendError}
         />
 
         {/* 3. Page Router Body */}

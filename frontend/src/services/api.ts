@@ -1,11 +1,30 @@
 // API Service Client connecting FORGE Frontend to FastAPI REST Endpoints & WebSockets
 
-const API_BASE_URL = 'http://localhost:8000/api';
-const WS_BASE_URL = 'ws://localhost:8000/ws/events';
+const getApiBaseUrl = (): string => {
+  if (typeof window !== 'undefined' && window.location) {
+    if (window.location.port === '5173') {
+      return '/api';
+    }
+    return '/api';
+  }
+  return 'http://127.0.0.1:8000/api';
+};
+
+const getWsBaseUrl = (): string => {
+  if (typeof window !== 'undefined' && window.location) {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}/ws/events`;
+  }
+  return 'ws://127.0.0.1:8000/ws/events';
+};
+
+const API_BASE_URL = getApiBaseUrl();
 
 export class ApiService {
   private ws: WebSocket | null = null;
   private wsListeners: Array<(eventData: any) => void> = [];
+  public isOnline: boolean = true;
+  public lastError: string | null = null;
 
   // ----------------------------------------------------
   // WEBSOCKET REAL-TIME EVENTS
@@ -19,7 +38,7 @@ export class ApiService {
     }
 
     try {
-      this.ws = new WebSocket(WS_BASE_URL);
+      this.ws = new WebSocket(getWsBaseUrl());
 
       this.ws.onmessage = (ev) => {
         try {
@@ -48,24 +67,21 @@ export class ApiService {
   // ----------------------------------------------------
 
   public async getHealth() {
-    try {
-      const res = await fetch(`${API_BASE_URL}/health`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    } catch (e) {
-      console.warn('API getHealth failed, returning offline status:', e);
-      return { status: 'offline', installed_tools_count: 0 };
+    const res = await fetch(`${getApiBaseUrl()}/health`);
+    if (!res.ok) {
+      this.isOnline = false;
+      this.lastError = `HTTP ${res.status}`;
+      throw new Error(`HTTP ${res.status}`);
     }
+    this.isOnline = true;
+    this.lastError = null;
+    return await res.json();
   }
 
   public async getEnvironment() {
-    try {
-      const res = await fetch(`${API_BASE_URL}/environment`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    } catch (e) {
-      return null;
-    }
+    const res = await fetch(`${getApiBaseUrl()}/environment`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
   }
 
   // ----------------------------------------------------
@@ -73,13 +89,15 @@ export class ApiService {
   // ----------------------------------------------------
 
   public async getChallenges() {
-    try {
-      const res = await fetch(`${API_BASE_URL}/challenges`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    } catch (e) {
-      return [];
+    const res = await fetch(`${getApiBaseUrl()}/challenges`);
+    if (!res.ok) {
+      this.isOnline = false;
+      this.lastError = `HTTP ${res.status}`;
+      throw new Error(`HTTP ${res.status}`);
     }
+    this.isOnline = true;
+    this.lastError = null;
+    return await res.json();
   }
 
   public async getChallengePlan(challengeId: string) {

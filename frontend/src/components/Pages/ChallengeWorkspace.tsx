@@ -330,18 +330,28 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
             </button>
 
             <div>
-              <div className="flex items-center space-x-3 flex-wrap">
+              <div className="flex items-center space-x-3 flex-wrap gap-y-1">
                 <h1 className="text-2xl font-display font-bold tracking-wider text-slate-100 neon-text-cyan">{challenge.name}</h1>
                 <span className="px-2.5 py-1 rounded bg-cyan-950/80 border border-cyber-cyan/60 text-cyber-cyan text-xs font-bold uppercase">
                   {challenge.category} CTF
                 </span>
-                <span className="px-2.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-400 text-[11px] font-bold font-mono">
-                  🐧 OS: Linux (Parrot/Kali) — Optimal Operational Mode
+                <span className="px-2.5 py-0.5 rounded bg-obsidian-900 border border-slate-700 text-slate-300 text-[11px] font-bold font-mono">
+                  RUN ID: {challenge.id}
                 </span>
                 {challenge.status === 'RUNNING' && (
-                  <span className="px-2.5 py-0.5 rounded bg-amber-950/90 border border-amber-500/80 text-amber-300 text-[11px] font-bold font-mono flex items-center space-x-1 animate-pulse shadow-[0_0_10px_rgba(245,158,11,0.3)]">
-                    <Zap className="w-3 h-3 text-amber-400 fill-amber-400" />
-                    <span>⚡ KEEP-AWAKE: Sleep Prevention Active</span>
+                  <span className="px-2.5 py-0.5 rounded bg-emerald-950/90 border border-emerald-500/80 text-emerald-300 text-[11px] font-bold font-mono flex items-center space-x-1 animate-pulse shadow-[0_0_10px_rgba(16,185,129,0.3)]">
+                    <Zap className="w-3 h-3 text-emerald-400 fill-emerald-400" />
+                    <span>⚡ SWARM ACTIVE & RUNNING</span>
+                  </span>
+                )}
+                {challenge.status === 'AWAITING_FLAG' && (
+                  <span className="px-2.5 py-0.5 rounded bg-purple-950/90 border border-purple-500/80 text-purple-300 text-[11px] font-bold font-mono animate-pulse">
+                    🚩 AWAITING FLAG VERIFICATION
+                  </span>
+                )}
+                {challenge.status === 'FAILED' && (
+                  <span className="px-2.5 py-0.5 rounded bg-rose-950/90 border border-rose-500/80 text-rose-300 text-[11px] font-bold font-mono">
+                    ❌ RUN FAILED / STALLED
                   </span>
                 )}
               </div>
@@ -352,13 +362,27 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
           <div className="flex items-center space-x-4 flex-wrap gap-2">
             <div className="flex items-center space-x-2 text-xs bg-obsidian-900/90 px-3 py-1.5 rounded-lg border border-slate-800 shadow-inner">
               <Clock className="w-3.5 h-3.5 text-cyber-cyan" />
+              <span className="text-slate-400 font-bold text-[10px] uppercase">LAST EVENT:</span>
+              <span className="text-slate-100 font-bold font-mono text-xs">{challenge.lastActivity || 'Just now'}</span>
+            </div>
+
+            <div className="flex items-center space-x-2 text-xs bg-obsidian-900/90 px-3 py-1.5 rounded-lg border border-slate-800 shadow-inner">
+              <Clock className="w-3.5 h-3.5 text-cyber-cyan" />
               <span className="text-slate-400 font-bold text-[10px] uppercase">UPTIME:</span>
               <span className="text-slate-100 font-bold font-mono text-xs">{formatDuration(elapsedSeconds)}</span>
             </div>
 
             <div className="flex items-center space-x-2 text-xs">
-              <span className={`w-3 h-3 rounded-full ${challenge.status === 'RUNNING' ? 'bg-cyber-emerald animate-ping' : 'bg-cyber-amber'}`}></span>
-              <span className="font-bold text-cyber-emerald tracking-wider">● {challenge.status}</span>
+              <span className={`w-3 h-3 rounded-full ${
+                challenge.status === 'RUNNING' ? 'bg-cyber-emerald animate-ping' :
+                challenge.status === 'FAILED' ? 'bg-rose-500' :
+                challenge.status === 'COMPLETED' ? 'bg-emerald-400' : 'bg-cyber-amber'
+              }`}></span>
+              <span className={`font-bold tracking-wider ${
+                challenge.status === 'RUNNING' ? 'text-cyber-emerald' :
+                challenge.status === 'FAILED' ? 'text-rose-400' :
+                challenge.status === 'COMPLETED' ? 'text-emerald-400' : 'text-amber-400'
+              }`}>● {challenge.status}</span>
             </div>
 
             <button
@@ -468,6 +492,7 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
                       VIEW TODO LIST →
                     </button>
                   </div>
+                )}
                 {challenge.candidates && challenge.candidates.length > 0 && (
                   <div className="bg-amber-950/40 p-4 rounded-lg border-2 border-amber-500/70 space-y-2.5 shadow-[0_0_20px_rgba(245,158,11,0.15)]">
                     <div className="flex items-center justify-between">

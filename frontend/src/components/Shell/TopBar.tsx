@@ -4,7 +4,10 @@ import {
   CheckCircle2, 
   AlertTriangle,
   Zap,
-  SlidersHorizontal
+  SlidersHorizontal,
+  Wifi,
+  WifiOff,
+  RefreshCw
 } from 'lucide-react';
 import { NavTab, Challenge } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
@@ -16,6 +19,8 @@ interface TopBarProps {
   operationalMode: string;
   onModeChange: (mode: string) => void;
   onResumeKillSwitch?: () => void;
+  wsStatus?: 'CONNECTING' | 'CONNECTED' | 'DISCONNECTED' | 'RECONNECTING' | 'ERROR';
+  backendError?: string | null;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -24,7 +29,9 @@ export const TopBar: React.FC<TopBarProps> = ({
   killSwitchActive,
   operationalMode,
   onModeChange,
-  onResumeKillSwitch
+  onResumeKillSwitch,
+  wsStatus = 'CONNECTED',
+  backendError = null
 }) => {
   const [timeStr, setTimeStr] = useState<string>('');
   const [useLocalTime, setUseLocalTime] = useState<boolean>(false);
@@ -64,6 +71,18 @@ export const TopBar: React.FC<TopBarProps> = ({
 
   return (
     <div className="flex flex-col select-none z-10">
+      {/* Backend Offline / API Error Sticky Banner */}
+      {backendError && (
+        <div className="bg-rose-950/90 border-b border-rose-500/60 text-rose-300 px-5 py-1.5 text-xs flex items-center justify-between font-mono shadow-[0_0_15px_rgba(244,63,94,0.3)]">
+          <div className="flex items-center space-x-2">
+            <AlertTriangle className="w-4 h-4 text-rose-400 animate-pulse" />
+            <span className="font-bold tracking-wider">
+              ⚠️ BACKEND ERROR: {backendError} (Serving cached state)
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* Emergency Lockdown Sticky Banner */}
       {killSwitchActive && (
         <div className="bg-red-950 border-b border-cyber-rose/60 text-cyber-rose px-5 py-2 text-xs flex items-center justify-between shadow-[0_0_20px_rgba(255,42,109,0.4)] animate-pulse font-mono">
@@ -116,6 +135,26 @@ export const TopBar: React.FC<TopBarProps> = ({
 
         {/* Right: Essential Telemetry Controls */}
         <div className="flex items-center space-x-3 text-xs font-mono">
+          {/* WebSocket Status Indicator Badge */}
+          <div className="flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-obsidian-900 border border-slate-800">
+            {wsStatus === 'CONNECTED' ? (
+              <span className="flex items-center space-x-1.5 text-emerald-400 font-bold text-[11px]">
+                <Wifi className="w-3.5 h-3.5 text-emerald-400" />
+                <span>WS CONNECTED</span>
+              </span>
+            ) : wsStatus === 'RECONNECTING' || wsStatus === 'CONNECTING' ? (
+              <span className="flex items-center space-x-1.5 text-amber-400 font-bold text-[11px] animate-pulse">
+                <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" />
+                <span>WS {wsStatus}</span>
+              </span>
+            ) : (
+              <span className="flex items-center space-x-1.5 text-rose-400 font-bold text-[11px]">
+                <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+                <span>WS OFFLINE</span>
+              </span>
+            )}
+          </div>
+
           {/* Active Challenge Badge */}
           {activeChallenge && (
             <div className="hidden sm:flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-obsidian-900 border border-cyber-cyan/40 text-cyber-cyan">
