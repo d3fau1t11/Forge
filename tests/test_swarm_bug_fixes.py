@@ -151,6 +151,54 @@ class TestSwarmBugFixes(unittest.TestCase):
             self.assertIn(cmd_shape, board.blocked_failure_sigs, f"Command shape '{cmd_shape}' must be in blocked_failure_sigs")
             self.assertTrue(any("[SIGNATURE BLOCKED]" in line for line in board.agent_transcripts.get("agent_1", [])))
 
+    # ── Bug Fix: Challenge Log-Path Race Prevention & Line Migration ───────────
+
+    def test_challenge_log_path_race_prevention_and_migration(self):
+        import uuid
+        from backend.utils.challenge_paths import (
+            register_challenge_log_path,
+            resolve_challenge_log_path,
+            forget_challenge_log_path,
+            logs_base,
+        )
+        from backend.agents.swarm_orchestrator import _append_to_challenge_log
+
+        ch_id = f"test_race_{uuid.uuid4().hex[:8]}"
+
+        try:
+            # 1. Early write with zero metadata (resolves to provisional flat path)
+            _append_to_challenge_log(ch_id, "worker1", "EARLY_LOG_LINE_1")
+
+            # 2. Later call register_challenge_log_path with full metadata
+            final_path = register_challenge_log_path(
+                ch_id, "HackTheBox", "Web", "Easy", "MyRaceChallenge"
+            )
+
+            # 3. Late write after registration
+            _append_to_challenge_log(ch_id, "worker2", "LATE_LOG_LINE_2")
+
+            # Assert final_path exists and contains BOTH lines
+            self.assertTrue(os.path.isfile(final_path), f"Final log path '{final_path}' should exist")
+            with open(final_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            self.assertIn("EARLY_LOG_LINE_1", content, "Early log line 1 must be migrated to final file")
+            self.assertIn("LATE_LOG_LINE_2", content, "Late log line 2 must be present in final file")
+
+            # Assert provisional flat file was cleaned up / migrated
+            flat_file = os.path.join(logs_base(), f"challenge_{ch_id}.log")
+            self.assertFalse(os.path.exists(flat_file), f"Provisional flat log file '{flat_file}' should no longer exist after migration")
+
+        finally:
+            # Cleanup test files if present
+            resolved = resolve_challenge_log_path(ch_id)
+            forget_challenge_log_path(ch_id)
+            if os.path.isfile(resolved):
+                try:
+                    os.remove(resolved)
+                except OSError:
+                    pass
+
 
 if __name__ == "__main__":
     unittest.main()

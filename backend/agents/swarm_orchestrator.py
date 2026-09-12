@@ -1167,6 +1167,16 @@ class SwarmOrchestrator:
     ):
         """Dispatch N general-purpose full-context agents on the target (flexible-agent
         engine; no fixed recon/crypto/exploit roles or hardcoded task checklist)."""
+        # Register the mirrored challenge-log path FIRST before any log writes, so
+        # every append (including swarm start) lands under logs/<Platform>/<Category>/
+        # <Difficulty>/<Name>/ instead of a flat file.
+        try:
+            from backend.utils.challenge_paths import register_challenge_log_path
+            register_challenge_log_path(challenge_id, platform, category, difficulty,
+                                        challenge_name or challenge_id)
+        except Exception as exc:
+            logger.error(f"[SwarmOrchestrator] Failed to register challenge log path for challenge '{challenge_id}': {exc}", exc_info=True)
+
         logger.info(f"[SwarmOrchestrator] 🚀 Starting flexible-agent swarm for Challenge '{challenge_id}' on '{target_scope}' (resume={resume})")
         _append_to_challenge_log(challenge_id, "orchestrator", f"Swarm {'resuming' if resume else 'starting'} | target={target_scope} | category={category} | difficulty={difficulty}")
 
@@ -1190,16 +1200,6 @@ class SwarmOrchestrator:
             board.max_minutes = max_minutes
         board.attached_file_paths = list(attached_file_paths or [])
         board.instance_expiry_ts = instance_expiry_ts
-
-        # Register the mirrored challenge-log path now that the challenge metadata is
-        # known, so every subsequent append lands under logs/<Platform>/<Category>/
-        # <Difficulty>/<Name>/ instead of a flat file. Non-fatal.
-        try:
-            from backend.utils.challenge_paths import register_challenge_log_path
-            register_challenge_log_path(challenge_id, platform, category, difficulty,
-                                        challenge_name or challenge_id)
-        except Exception:
-            pass
 
         db = SessionLocal()
         try:

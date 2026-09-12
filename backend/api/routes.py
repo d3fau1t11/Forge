@@ -246,6 +246,25 @@ def get_challenge_plan(challenge_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Challenge not found")
     return challenge.mission_plan or {"tasks": [], "status": "PENDING"}
 
+@router.get("/challenges/{challenge_id}/log")
+def get_challenge_log(challenge_id: str, db: Session = Depends(get_db)):
+    """Retrieve dedicated challenge log path and file content."""
+    from backend.utils.challenge_paths import resolve_challenge_log_path
+    log_path = resolve_challenge_log_path(challenge_id)
+    content = ""
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            logger.warning(f"Error reading challenge log {log_path}: {e}")
+    return {
+        "status": "SUCCESS",
+        "challenge_id": challenge_id,
+        "log_file": log_path,
+        "content": content,
+    }
+
 @router.delete("/challenges/{challenge_id}")
 async def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
     """Deletes a challenge from the database, cascading to runs/findings, and deletes its working directory on disk."""
@@ -418,15 +437,9 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
     except Exception as rc_err:
         logger.warning(f"Could not persist run_config: {rc_err}")
 
-    # Phase 3 Turbo Recon: Pre-warm recon in background immediately
-    from backend.recon.turbo_recon import turbo_recon
-    if resolved_target:
-        asyncio.create_task(turbo_recon.start_turbo_recon(challenge.id, resolved_target, category.lower(), working_directory=working_dir))
-
-    workflow_runner.start_run(run.id, challenge.id, resolved_target)
-
-    # Initialize Challenge Dedicated Log File — stored in a subtree mirroring the
+    # Initialize Challenge Dedicated Log File FIRST — stored in a subtree mirroring the
     # challenge's own structure (logs/<Platform>/<Category>/<Difficulty>/<Name>/).
+    # Must happen BEFORE background recon or runner execution starts writing log appends.
     from backend.utils.challenge_paths import register_challenge_log_path
     ch_log_path = register_challenge_log_path(
         challenge.id, platform, category, difficulty, challenge.name)
@@ -440,6 +453,13 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
         f.write(f"Working Directory: {working_dir}\n")
         f.write(f"Run ID: {run.id}\n")
         f.write(f"=======================================\n\n")
+
+    # Phase 3 Turbo Recon: Pre-warm recon in background immediately
+    from backend.recon.turbo_recon import turbo_recon
+    if resolved_target:
+        asyncio.create_task(turbo_recon.start_turbo_recon(challenge.id, resolved_target, category.lower(), working_directory=working_dir))
+
+    workflow_runner.start_run(run.id, challenge.id, resolved_target)
 
     await ws_manager.broadcast({
         "event": "CHALLENGE_CREATED",

@@ -76,6 +76,15 @@ class WorkflowRunner:
             os.makedirs(workdir, exist_ok=True)
             db.close()
 
+            # Ensure mirrored challenge log path is registered BEFORE dispatching runner tasks
+            try:
+                from backend.utils.challenge_paths import register_challenge_log_path
+                register_challenge_log_path(
+                    challenge_id, platform, category, difficulty, challenge_name or challenge_id
+                )
+            except Exception as reg_err:
+                logger.error(f"[WorkflowRunner] Log path registration failed for {challenge_id}: {reg_err}", exc_info=True)
+
             if coordinated:
                 # Phase 4 coordinated swarm — builds ABOVE AgentRuntime/ExecutionService.
                 from backend.swarm import SwarmCoordinator, SwarmLimits

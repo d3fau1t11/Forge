@@ -37,6 +37,9 @@ _LOGS_BASE = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file
 # Memoized challenge_id -> absolute log path (warm for the whole process once resolved).
 _PATH_CACHE: Dict[str, str] = {}
 
+# Set of challenge_ids whose cached path is provisional (resolved with empty/unset metadata).
+_PROVISIONAL_PATHS: set[str] = set()
+
 # Characters allowed verbatim in a mirrored path segment; everything else (path
 # separators, ``:`` drive markers, ``..`` traversal, control chars) is replaced.
 _SAFE_SEGMENT_CHARS = set(
@@ -80,6 +83,8 @@ def register_challenge_log_path(challenge_id: str, platform: str = "", category:
 
     Called when the challenge metadata is known (creation / swarm start). The
     parent directory is created so the first append just opens the file.
+    If early writes occurred to a provisional flat file, those lines are automatically
+    migrated into the final mirrored file.
     """
     segments = _mirror_segments(platform, category, difficulty, name)
     parent = os.path.join(_LOGS_BASE, *segments) if segments else _LOGS_BASE
@@ -90,6 +95,36 @@ def register_challenge_log_path(challenge_id: str, platform: str = "", category:
         parent = _LOGS_BASE
         os.makedirs(parent, exist_ok=True)
     path = os.path.join(parent, f"challenge_{challenge_id}.log")
+
+    # If metadata was non-empty and a provisional flat file exists on disk, migrate lines.
+    flat_file = os.path.join(_LOGS_BASE, f"challenge_{challenge_id}.log")
+    if segments and os.path.abspath(flat_file) != os.path.abspath(path):
+        if os.path.isfile(flat_file):
+            try:
+                with open(flat_file, "r", encoding="utf-8", errors="replace") as f_flat:
+                    flat_content = f_flat.read()
+                if flat_content:
+                    existing_content = ""
+                    if os.path.isfile(path):
+                        with open(path, "r", encoding="utf-8", errors="replace") as f_exist:
+                            existing_content = f_exist.read()
+                    with open(path, "w", encoding="utf-8") as f_target:
+                        f_target.write(flat_content)
+                        if existing_content and not flat_content.endswith("\n"):
+                            f_target.write("\n")
+                        if existing_content:
+                            f_target.write(existing_content)
+                # Remove provisional flat file now that lines are migrated
+                os.remove(flat_file)
+                logger.info(f"[challenge_paths] Migrated provisional log lines from '{flat_file}' to '{path}'")
+            except OSError as exc:
+                logger.warning(f"[challenge_paths] Failed migrating provisional log for {challenge_id}: {exc}")
+
+    if not segments:
+        _PROVISIONAL_PATHS.add(challenge_id)
+    else:
+        _PROVISIONAL_PATHS.discard(challenge_id)
+
     _PATH_CACHE[challenge_id] = path
     return path
 
@@ -103,9 +138,13 @@ def _resolve_from_db(challenge_id: str) -> Optional[str]:
         try:
             ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
             if ch is not None:
-                return register_challenge_log_path(
-                    challenge_id, ch.platform_name or "", ch.category or "",
+                segments = _mirror_segments(
+                    ch.platform_name or "", ch.category or "",
                     ch.difficulty or "", ch.name or "")
+                if segments:
+                    return register_challenge_log_path(
+                        challenge_id, ch.platform_name or "", ch.category or "",
+                        ch.difficulty or "", ch.name or "")
         finally:
             db.close()
     except Exception as exc:  # DB not ready / import cycle — non-fatal
@@ -137,6 +176,22 @@ def resolve_challenge_log_path(challenge_id: str) -> str:
     hot append path pays the lookup cost at most once per process.
     """
     cached = _PATH_CACHE.get(challenge_id)
+    if cached and challenge_id not in _PROVISIONAL_PATHS:
+        try:
+            os.makedirs(os.path.dirname(cached), exist_ok=True)
+        except OSError:
+            pass
+        return cached
+
+    # If cached was provisional or missing, attempt DB resolution first
+    resolved = _resolve_from_db(challenge_id)
+    if resolved:
+        try:
+            os.makedirs(os.path.dirname(resolved), exist_ok=True)
+        except OSError:
+            pass
+        return resolved
+
     if cached:
         try:
             os.makedirs(os.path.dirname(cached), exist_ok=True)
@@ -144,25 +199,27 @@ def resolve_challenge_log_path(challenge_id: str) -> str:
             pass
         return cached
 
-    resolved = _resolve_from_db(challenge_id) or _find_existing_log(challenge_id)
-    if resolved:
-        _PATH_CACHE[challenge_id] = resolved
+    existing = _find_existing_log(challenge_id)
+    if existing:
+        _PATH_CACHE[challenge_id] = existing
         try:
-            os.makedirs(os.path.dirname(resolved), exist_ok=True)
+            os.makedirs(os.path.dirname(existing), exist_ok=True)
         except OSError:
             pass
-        return resolved
+        return existing
 
     # Legacy flat fallback — keeps logging working even with zero metadata.
     os.makedirs(_LOGS_BASE, exist_ok=True)
     flat = os.path.join(_LOGS_BASE, f"challenge_{challenge_id}.log")
     _PATH_CACHE[challenge_id] = flat
+    _PROVISIONAL_PATHS.add(challenge_id)
     return flat
 
 
 def forget_challenge_log_path(challenge_id: str) -> None:
     """Drop the cache entry for a challenge (called on delete)."""
     _PATH_CACHE.pop(challenge_id, None)
+    _PROVISIONAL_PATHS.discard(challenge_id)
 
 
 def iter_candidate_log_paths(challenge_id: str) -> list:
@@ -181,3 +238,75 @@ def iter_candidate_log_paths(challenge_id: str) -> list:
     if flat not in candidates:
         candidates.append(flat)
     return candidates
+
+
+def detect_and_merge_split_logs(dry_run: bool = True) -> list[dict]:
+    """Scan backend/logs/ for challenge_ids with both flat and nested mirrored logs.
+
+    Reports and optionally merges split log files.
+
+    :param dry_run: If True (default), only reports split files without modifying them.
+    :return: List of report dicts detailing discovered split logs and actions taken.
+    """
+    results = []
+    if not os.path.isdir(_LOGS_BASE):
+        return results
+
+    # Find flat files directly in _LOGS_BASE
+    flat_files = {}
+    try:
+        for fname in os.listdir(_LOGS_BASE):
+            if fname.startswith("challenge_") and fname.endswith(".log"):
+                ch_id = fname[len("challenge_"):-len(".log")]
+                if ch_id:
+                    flat_files[ch_id] = os.path.join(_LOGS_BASE, fname)
+    except OSError as exc:
+        logger.error(f"[challenge_paths] Error scanning flat log files: {exc}")
+        return results
+
+    if not flat_files:
+        return results
+
+    # Search nested directories for matching challenge_id files
+    for root, _dirs, files in os.walk(_LOGS_BASE):
+        if os.path.abspath(root) == os.path.abspath(_LOGS_BASE):
+            continue
+        for fname in files:
+            if fname.startswith("challenge_") and fname.endswith(".log"):
+                ch_id = fname[len("challenge_"):-len(".log")]
+                if ch_id in flat_files:
+                    flat_path = flat_files[ch_id]
+                    nested_path = os.path.join(root, fname)
+                    if os.path.abspath(flat_path) == os.path.abspath(nested_path):
+                        continue
+
+                    try:
+                        with open(flat_path, "r", encoding="utf-8", errors="replace") as f1:
+                            flat_lines = f1.readlines()
+                        with open(nested_path, "r", encoding="utf-8", errors="replace") as f2:
+                            nested_lines = f2.readlines()
+
+                        item = {
+                            "challenge_id": ch_id,
+                            "flat_path": flat_path,
+                            "nested_path": nested_path,
+                            "flat_lines_count": len(flat_lines),
+                            "nested_lines_count": len(nested_lines),
+                            "action": "reported_only" if dry_run else "merged"
+                        }
+
+                        if not dry_run and flat_lines:
+                            combined = flat_lines + nested_lines
+                            with open(nested_path, "w", encoding="utf-8") as f_out:
+                                f_out.writelines(combined)
+                            # Keep flat file as .bak rather than unrecoverable deletion
+                            bak_path = flat_path + ".bak"
+                            os.rename(flat_path, bak_path)
+                            item["bak_path"] = bak_path
+
+                        results.append(item)
+                    except OSError as exc:
+                        logger.error(f"[challenge_paths] Failed processing split log for {ch_id}: {exc}")
+
+    return results
+
