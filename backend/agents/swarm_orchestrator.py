@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Set
 
 from backend.database.session import SessionLocal
-from backend.database.models import RunModel, ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel, ToolExecutionModel, CheckpointModel
+from backend.database.models import RunModel, ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel, ToolExecutionModel, CheckpointModel, TrajectoryEventModel
 from backend.providers.router import model_router
 from backend.tools.manager import tool_manager, LOCAL_EXEC_CATEGORIES
 from backend.websocket.manager import ws_manager
@@ -1684,6 +1684,33 @@ class SwarmOrchestrator:
                     })
                 except Exception:
                     pass
+
+                try:
+                    db = SessionLocal()
+                    try:
+                        dec_row = TrajectoryEventModel(
+                            session_id=board.run_id or f"swarm-{board.challenge_id}",
+                            run_id=board.run_id,
+                            challenge_id=board.challenge_id,
+                            agent_id=agent_id,
+                            event_type="AI_DECISION",
+                            action_type="command",
+                            command=cmd[:2000],
+                            tool_name=capability or "swarm",
+                            decision_summary=f"{board.category} challenge next step",
+                            strategy=f"Model: {model_name}",
+                            result=cmd[:250],
+                            model=model_name
+                        )
+                        db.add(dec_row)
+                        db.commit()
+                    except Exception as e:
+                        logger.debug(f"[SwarmOrchestrator] AI decision persist skip: {e}")
+                    finally:
+                        db.close()
+                except Exception:
+                    pass
+
 
                 board.agent_iterations[agent_id] = iters + 1
 

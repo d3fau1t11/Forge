@@ -47,21 +47,41 @@ class TestDataWiringEndpoints(unittest.TestCase):
             }
         )
         self.db.add(ch)
-
-        # 2. Add a trajectory event decision
-        ev = TrajectoryEventModel(
-            id="ev-dec-1",
-            session_id="s-test-1",
-            challenge_id="ch-test-wiring-1",
-            event_type="AI_DECISION",
-            agent_id="ORCHESTRATOR",
-            decision_summary="Pivot to directory fuzzing on /admin",
-            action_type="ffuf",
-            tool_name="ffuf",
-            result="SUCCESS"
-        )
-        self.db.add(ev)
         self.db.commit()
+
+        # 2. Simulate an actual _agent_worker turn to test real pipeline persistence
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from backend.agents.swarm_orchestrator import SwarmOrchestrator, SwarmBlackboard
+
+        board = SwarmBlackboard("ch-test-wiring-1", "run-wiring-1", "http://target.local")
+        board.flag_candidates = [{"flag": "picoCTF{test_candidate_123}", "worker": "RECON", "source": "regex"}]
+        board.derived_artifacts = [{"filename": "decoded_secret.png", "artifact_type": "image", "size_bytes": 1024, "status": "RECONSTRUCTED"}]
+        orchestrator = SwarmOrchestrator()
+        from backend.agents.swarm_orchestrator import swarm_orchestrator
+        swarm_orchestrator.active_swarms["ch-test-wiring-1"] = board
+
+
+        mock_tool_res = AsyncMock()
+        mock_tool_res.exit_code = 0
+        mock_tool_res.stdout = "Found 200 OK on /admin"
+        mock_tool_res.stderr = ""
+        mock_tool_res.execution_failure = False
+
+        async def fake_route_request(*args, **kwargs):
+            resp = AsyncMock()
+            resp.is_refusal = False
+            resp.content = "I will scan the target:\n```bash\nffuf -u http://target.local/FUZZ -w wordlist.txt\n```"
+            resp.model_name = "test-model"
+            return resp
+
+        async def fake_execute_tool(*args, **kwargs):
+            return mock_tool_res
+
+        with patch("backend.agents.swarm_orchestrator.model_router.route_request", side_effect=fake_route_request), \
+             patch("backend.agents.swarm_orchestrator.tool_manager.execute_tool", side_effect=fake_execute_tool):
+            board.max_iterations = 1
+            asyncio.run(orchestrator._agent_worker("agent_1", board, ".", "web_analysis"))
 
         # 3. Query GET /challenges/{id}/candidates
         resp_cand = self.client.get("/api/challenges/ch-test-wiring-1/candidates")
@@ -77,12 +97,14 @@ class TestDataWiringEndpoints(unittest.TestCase):
         self.assertEqual(len(arts), 1)
         self.assertEqual(arts[0]["filename"], "decoded_secret.png")
 
-        # 5. Query GET /challenges/{id}/decisions
+        # 5. Query GET /challenges/{id}/decisions (verifying decision persisted by _agent_worker)
         resp_dec = self.client.get("/api/challenges/ch-test-wiring-1/decisions")
         self.assertEqual(resp_dec.status_code, 200)
         decs = resp_dec.json().get("decisions", [])
         self.assertTrue(len(decs) >= 1)
-        self.assertEqual(decs[0]["selectedTool"], "ffuf")
+        self.assertEqual(decs[0]["agent"], "agent_1")
+        self.assertIn("ffuf", decs[0]["goal"] + decs[0]["selectedTool"] + decs[0]["result"])
+
 
     def test_targets_endpoint_returns_real_fields(self):
         """Verify GET /targets returns expected_services, technologies, address_history, discovery_method."""
