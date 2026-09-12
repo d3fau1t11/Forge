@@ -100,7 +100,7 @@ HARD RULES — violation of any of these is a critical failure:
    was extracted from, verbatim.  If you cannot point to the source command output, say so explicitly
    and describe what is missing.
 5. Output ONLY one of:
-   - A single executable bash/shell command line.
+   - A single executable bash/shell command line (including interactive session primitives: interactive_open <cmd>, interactive_send <id> <data>, interactive_read <id>, interactive_send_and_read <id> <data>, interactive_close <id> for dialogue/netcat services).
    - A complete Python script inside triple-backtick python blocks (FORGE will save it as solve.py and run it).
    - FLAG: <value>  (only when verified from real observed output — include the source command).
    - BUDGET_EXHAUSTED: <findings summary>

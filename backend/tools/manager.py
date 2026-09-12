@@ -202,6 +202,194 @@ class ToolManager:
                     failure_category=None
                 )
 
+        # Persistent interactive process capabilities
+        if capability in ("interactive_open", "interactive_start"):
+            cmd_to_run = (target or "").strip()
+            if extra_args:
+                cmd_to_run = f"{cmd_to_run} {extra_args}".strip() if cmd_to_run else extra_args.strip()
+            if not cmd_to_run:
+                elapsed_ms = (time.time() - start_time) * 1000
+                return ToolExecutionResult(
+                    tool_name="interactive_open",
+                    capability="interactive_open",
+                    command="interactive_open",
+                    status="FAILED",
+                    stderr="No command specified to start interactive session.",
+                    exit_code=1,
+                    duration_ms=elapsed_ms,
+                    execution_failure=True,
+                    failure_category="SYNTAX_ERROR",
+                )
+
+            exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
+            try:
+                sess = await execution_service.open_interactive(
+                    cmd_to_run,
+                    cwd=exec_cwd,
+                    target=target,
+                )
+                read_res = await sess.read(timeout=3.0, idle_timeout=1.0)
+                elapsed_ms = (time.time() - start_time) * 1000
+                banner = read_res.data if read_res.data else "(Process started, waiting for input)"
+                stdout_text = f"[SESSION: {sess.session_key}]\n{banner}"
+                return ToolExecutionResult(
+                    tool_name="interactive_open",
+                    capability="interactive_open",
+                    command=f"interactive_open {cmd_to_run}",
+                    status="SUCCESS",
+                    stdout=stdout_text,
+                    stderr="",
+                    exit_code=0 if sess.is_alive() else (sess.returncode or 0),
+                    duration_ms=elapsed_ms,
+                    execution_failure=False,
+                    failure_category=None,
+                )
+            except Exception as e:
+                elapsed_ms = (time.time() - start_time) * 1000
+                logger.warning(f"Failed to open interactive session for '{cmd_to_run}': {e}")
+                return ToolExecutionResult(
+                    tool_name="interactive_open",
+                    capability="interactive_open",
+                    command=f"interactive_open {cmd_to_run}",
+                    status="FAILED",
+                    stderr=f"Failed to open interactive session: {e}",
+                    exit_code=1,
+                    duration_ms=elapsed_ms,
+                    execution_failure=True,
+                    failure_category="EXECUTION_ERROR",
+                )
+
+        if capability == "interactive_send":
+            session_key = (target or "").strip().strip('"').strip("'")
+            data = extra_args if extra_args is not None else ""
+            from backend.execution.interactive import interactive_manager
+            sess = interactive_manager.get(session_key)
+            elapsed_ms = (time.time() - start_time) * 1000
+            if not sess or not sess.is_alive():
+                return ToolExecutionResult(
+                    tool_name="interactive_send",
+                    capability="interactive_send",
+                    command=f"interactive_send {session_key}",
+                    status="FAILED",
+                    stderr=f"Interactive session '{session_key}' not found or already closed.",
+                    exit_code=1,
+                    duration_ms=elapsed_ms,
+                    execution_failure=True,
+                    failure_category="SESSION_NOT_FOUND",
+                )
+            sent = await sess.send(data)
+            elapsed_ms = (time.time() - start_time) * 1000
+            if not sent:
+                return ToolExecutionResult(
+                    tool_name="interactive_send",
+                    capability="interactive_send",
+                    command=f"interactive_send {session_key}",
+                    status="FAILED",
+                    stderr="Failed to send data to interactive session.",
+                    exit_code=1,
+                    duration_ms=elapsed_ms,
+                    execution_failure=True,
+                    failure_category="SEND_FAILED",
+                )
+            return ToolExecutionResult(
+                tool_name="interactive_send",
+                capability="interactive_send",
+                command=f"interactive_send {session_key}",
+                status="SUCCESS",
+                stdout=f"[SESSION: {session_key}] Sent {len(data)} characters.",
+                stderr="",
+                exit_code=0,
+                duration_ms=elapsed_ms,
+                execution_failure=False,
+                failure_category=None,
+            )
+
+        if capability == "interactive_read":
+            session_key = (target or "").strip().strip('"').strip("'")
+            until_marker = extra_args.strip() if extra_args else None
+            from backend.execution.interactive import interactive_manager
+            sess = interactive_manager.get(session_key)
+            elapsed_ms = (time.time() - start_time) * 1000
+            if not sess:
+                return ToolExecutionResult(
+                    tool_name="interactive_read",
+                    capability="interactive_read",
+                    command=f"interactive_read {session_key}",
+                    status="FAILED",
+                    stderr=f"Interactive session '{session_key}' not found or already closed.",
+                    exit_code=1,
+                    duration_ms=elapsed_ms,
+                    execution_failure=True,
+                    failure_category="SESSION_NOT_FOUND",
+                )
+            read_res = await sess.read(until=until_marker)
+            elapsed_ms = (time.time() - start_time) * 1000
+            status = "SUCCESS" if (read_res.ok or read_res.data) else ("TIMEOUT" if read_res.timed_out else "FAILED")
+            return ToolExecutionResult(
+                tool_name="interactive_read",
+                capability="interactive_read",
+                command=f"interactive_read {session_key}",
+                status=status,
+                stdout=read_res.data,
+                stderr="" if (read_res.ok or read_res.data) else ("Read timed out with no data" if read_res.timed_out else "Read failed/EOF"),
+                exit_code=0 if (sess.is_alive() or read_res.data) else (sess.returncode or 0),
+                duration_ms=elapsed_ms,
+                execution_failure=False if (read_res.ok or read_res.data) else read_res.timed_out,
+                failure_category="TIMEOUT" if (read_res.timed_out and not read_res.data) else None,
+            )
+
+        if capability == "interactive_send_and_read":
+            session_key = (target or "").strip().strip('"').strip("'")
+            data = extra_args if extra_args is not None else ""
+            from backend.execution.interactive import interactive_manager
+            sess = interactive_manager.get(session_key)
+            elapsed_ms = (time.time() - start_time) * 1000
+            if not sess or not sess.is_alive():
+                return ToolExecutionResult(
+                    tool_name="interactive_send_and_read",
+                    capability="interactive_send_and_read",
+                    command=f"interactive_send_and_read {session_key}",
+                    status="FAILED",
+                    stderr=f"Interactive session '{session_key}' not found or already closed.",
+                    exit_code=1,
+                    duration_ms=elapsed_ms,
+                    execution_failure=True,
+                    failure_category="SESSION_NOT_FOUND",
+                )
+            read_res = await sess.send_and_read(data)
+            elapsed_ms = (time.time() - start_time) * 1000
+            status = "SUCCESS" if (read_res.ok or read_res.data) else ("TIMEOUT" if read_res.timed_out else "FAILED")
+            return ToolExecutionResult(
+                tool_name="interactive_send_and_read",
+                capability="interactive_send_and_read",
+                command=f"interactive_send_and_read {session_key}",
+                status=status,
+                stdout=read_res.data,
+                stderr="" if (read_res.ok or read_res.data) else ("Read timed out with no data" if read_res.timed_out else "Read failed/EOF"),
+                exit_code=0 if (sess.is_alive() or read_res.data) else (sess.returncode or 0),
+                duration_ms=elapsed_ms,
+                execution_failure=False if (read_res.ok or read_res.data) else read_res.timed_out,
+                failure_category="TIMEOUT" if (read_res.timed_out and not read_res.data) else None,
+            )
+
+        if capability == "interactive_close":
+            session_key = (target or "").strip().strip('"').strip("'")
+            from backend.execution.interactive import interactive_manager
+            closed = await interactive_manager.close(session_key)
+            elapsed_ms = (time.time() - start_time) * 1000
+            return ToolExecutionResult(
+                tool_name="interactive_close",
+                capability="interactive_close",
+                command=f"interactive_close {session_key}",
+                status="SUCCESS" if closed else "FAILED",
+                stdout=f"[SESSION: {session_key}] Closed." if closed else "",
+                stderr="" if closed else f"Interactive session '{session_key}' not found or already closed.",
+                exit_code=0 if closed else 1,
+                duration_ms=elapsed_ms,
+                execution_failure=not closed,
+                failure_category=None if closed else "SESSION_NOT_FOUND",
+            )
+
         # 1. Resolve candidate tools for capability
         candidate_tools = tool_registry.get_tools_for_capability(capability)
         if not candidate_tools:
@@ -310,6 +498,33 @@ class ToolManager:
             target_file = raw_cmd.split(None, 1)[1].strip().strip('"').strip("'") if " " in raw_cmd or "\t" in raw_cmd else ""
             return await self.execute_capability(capability="vision_read", target=target_file, cwd=cwd)
 
+        # Model capability intercept: interactive execution primitives
+        if raw_cmd.startswith("interactive_open ") or raw_cmd.startswith("interactive_open\t") or raw_cmd == "interactive_open":
+            cmd_arg = raw_cmd.split(None, 1)[1].strip() if " " in raw_cmd or "\t" in raw_cmd else ""
+            return await self.execute_capability(capability="interactive_open", target=cmd_arg, cwd=cwd)
+
+        if raw_cmd.startswith("interactive_send ") or raw_cmd.startswith("interactive_send\t"):
+            parts = raw_cmd.split(None, 2)
+            sess_key = parts[1].strip() if len(parts) > 1 else ""
+            data_arg = parts[2] if len(parts) > 2 else ""
+            return await self.execute_capability(capability="interactive_send", target=sess_key, extra_args=data_arg, cwd=cwd)
+
+        if raw_cmd.startswith("interactive_read ") or raw_cmd.startswith("interactive_read\t") or raw_cmd == "interactive_read":
+            parts = raw_cmd.split(None, 2)
+            sess_key = parts[1].strip() if len(parts) > 1 else ""
+            until_arg = parts[2].strip() if len(parts) > 2 else ""
+            return await self.execute_capability(capability="interactive_read", target=sess_key, extra_args=until_arg, cwd=cwd)
+
+        if raw_cmd.startswith("interactive_send_and_read ") or raw_cmd.startswith("interactive_send_and_read\t"):
+            parts = raw_cmd.split(None, 2)
+            sess_key = parts[1].strip() if len(parts) > 1 else ""
+            data_arg = parts[2] if len(parts) > 2 else ""
+            return await self.execute_capability(capability="interactive_send_and_read", target=sess_key, extra_args=data_arg, cwd=cwd)
+
+        if raw_cmd.startswith("interactive_close ") or raw_cmd.startswith("interactive_close\t") or raw_cmd == "interactive_close":
+            sess_key = raw_cmd.split(None, 1)[1].strip() if " " in raw_cmd or "\t" in raw_cmd else ""
+            return await self.execute_capability(capability="interactive_close", target=sess_key, cwd=cwd)
+
         # Delegate subprocess execution to ExecutionService (Phase 3). When *stdin* is
         # supplied it is fed to the process once (Tier-1 scripted interactive, Phase 4.x §4).
         exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
@@ -360,6 +575,20 @@ class ToolManager:
                 cwd=working_directory,
                 timeout_seconds=timeout,
                 canonical_target=canonical_target
+            )
+        elif tool_name in ["interactive_open", "interactive_send", "interactive_read", "interactive_send_and_read", "interactive_close", "interactive"]:
+            action = tool_name
+            if tool_name == "interactive":
+                action = params.get("action") or "open"
+                if not action.startswith("interactive_"):
+                    action = f"interactive_{action}"
+            target = params.get("target") or params.get("command") or params.get("cmd") or params.get("session_key") or params.get("session_id") or ""
+            extra_args = params.get("extra_args") or params.get("data") or params.get("input") or params.get("until") or params.get("args") or ""
+            return await self.execute_capability(
+                capability=action,
+                target=str(target),
+                extra_args=str(extra_args) if extra_args else None,
+                cwd=working_directory
             )
         else:
             target = params.get("target") or params.get("url") or params.get("ip") or params.get("file_path") or params.get("image_path") or params.get("path") or canonical_target or ""

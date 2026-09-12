@@ -125,6 +125,9 @@ CAPABILITY_REGISTRY: Dict[str, List[ProviderSpec]] = {
     "interactive_stdin": [
         _P("execution_backend", ProviderKind.BUILTIN),   # LocalBackend scripted-stdin + InteractiveSession
     ],
+    "interactive_execution": [
+        _P("interactive_manager", ProviderKind.BUILTIN),  # InteractiveSessionManager persistent dialogue
+    ],
     "pty": [
         _P("posix_pty", ProviderKind.BUILTIN),           # POSIX only
     ],

@@ -206,6 +206,8 @@ class DecisionEngine:
             "hydra", "john", "hashcat", "binwalk", "grep", "echo", "bash", "sh", "ssh", "openssl",
             "base64", "tar", "unzip", "steghide", "exiftool", "tshark", "objdump", "readelf", "gdb",
             "pip", "pip3", "git", "awk", "sed", "tr", "cut", "sort", "uniq", "head", "tail", "find",
+            "vision_read", "interactive_open", "interactive_send", "interactive_read",
+            "interactive_send_and_read", "interactive_close",
         )
         for line in text.splitlines():
             s = line.strip().strip("`").strip()

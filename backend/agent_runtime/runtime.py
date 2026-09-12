@@ -95,9 +95,11 @@ class RealToolExecutor:
             return ExecResult.from_tool_result(r)
 
         if action.type == ActionType.TOOL_CALL:
+            args = dict(action.tool_args or {})
+            target = args.pop("target", None) or canonical_target or ""
             r = await self.tool_manager.execute_capability(
-                capability=action.capability or action.tool_name, target=canonical_target or "",
-                cwd=cwd, **(action.tool_args or {}))
+                capability=action.capability or action.tool_name, target=target,
+                cwd=cwd, **args)
             return ExecResult.from_tool_result(r)
 
         return ExecResult(status="SUCCESS", stdout="", command=action.display())

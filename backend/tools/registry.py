@@ -102,6 +102,72 @@ class ToolRegistry:
             args_template="{target}"
         ))
 
+        # Persistent Interactive Execution Primitives
+        self.register_tool(ToolMetadata(
+            tool_name="interactive_open",
+            capabilities=["interactive_open", "interactive_execution"],
+            binary="interactive_open",
+            version_command="interactive_open --version",
+            installation_recipe="built-in interactive execution",
+            os_compatibility=["linux", "windows", "darwin"],
+            privilege_requirement="SAFE",
+            risk_level="SAFE",
+            timeout_seconds=60,
+            args_template="{target}"
+        ))
+
+        self.register_tool(ToolMetadata(
+            tool_name="interactive_send",
+            capabilities=["interactive_send", "interactive_execution"],
+            binary="interactive_send",
+            version_command="interactive_send --version",
+            installation_recipe="built-in interactive execution",
+            os_compatibility=["linux", "windows", "darwin"],
+            privilege_requirement="SAFE",
+            risk_level="SAFE",
+            timeout_seconds=30,
+            args_template="{target}"
+        ))
+
+        self.register_tool(ToolMetadata(
+            tool_name="interactive_read",
+            capabilities=["interactive_read", "interactive_execution"],
+            binary="interactive_read",
+            version_command="interactive_read --version",
+            installation_recipe="built-in interactive execution",
+            os_compatibility=["linux", "windows", "darwin"],
+            privilege_requirement="SAFE",
+            risk_level="SAFE",
+            timeout_seconds=60,
+            args_template="{target}"
+        ))
+
+        self.register_tool(ToolMetadata(
+            tool_name="interactive_send_and_read",
+            capabilities=["interactive_send_and_read", "interactive_execution"],
+            binary="interactive_send_and_read",
+            version_command="interactive_send_and_read --version",
+            installation_recipe="built-in interactive execution",
+            os_compatibility=["linux", "windows", "darwin"],
+            privilege_requirement="SAFE",
+            risk_level="SAFE",
+            timeout_seconds=60,
+            args_template="{target}"
+        ))
+
+        self.register_tool(ToolMetadata(
+            tool_name="interactive_close",
+            capabilities=["interactive_close", "interactive_execution"],
+            binary="interactive_close",
+            version_command="interactive_close --version",
+            installation_recipe="built-in interactive execution",
+            os_compatibility=["linux", "windows", "darwin"],
+            privilege_requirement="SAFE",
+            risk_level="SAFE",
+            timeout_seconds=30,
+            args_template="{target}"
+        ))
+
     def register_tool(self, tool: ToolMetadata):
         self.tools[tool.tool_name] = tool
 
