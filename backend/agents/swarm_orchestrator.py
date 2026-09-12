@@ -15,6 +15,7 @@ import hashlib
 import json
 import re
 import os
+import shlex
 import sys
 import time
 import logging
@@ -201,6 +202,137 @@ def _append_to_challenge_log(challenge_id: str, worker_id: str, message: str):
         pass
 
 
+def _normalize_recon_target(cmd: str) -> Optional[str]:
+    """Extract and normalize a cache key for recon-shaped commands.
+
+    Preserves auth state (headers, cookies, user, method, body) while normalizing away
+    formatting-only flags (-s, -v, -i, -L, -k). Returns None if not a recon command.
+    """
+    if not cmd or not isinstance(cmd, str):
+        return None
+    try:
+        tokens = shlex.split(cmd.strip())
+    except Exception:
+        tokens = cmd.strip().split()
+    if not tokens:
+        return None
+
+    prog = os.path.basename(tokens[0]).lower()
+
+    if prog in ("curl", "wget"):
+        url = None
+        method = "GET"
+        headers = []
+        cookies = []
+        auth = ""
+        body = []
+
+        i = 1
+        while i < len(tokens):
+            t = tokens[i]
+            # Strip formatting flags
+            if t in ("-s", "--silent", "-v", "--verbose", "-i", "--include", "-k", "--insecure",
+                     "-L", "--location", "-q", "-N", "-O", "--compressed"):
+                i += 1
+                continue
+            if t in ("-o", "--output"):
+                i += 2
+                continue
+
+            # Preserve Method
+            if t in ("-X", "--request") and i + 1 < len(tokens):
+                method = tokens[i + 1].upper()
+                i += 2
+                continue
+
+            # Preserve Headers
+            if t in ("-H", "--header") and i + 1 < len(tokens):
+                headers.append(tokens[i + 1].strip())
+                i += 2
+                continue
+
+            # Preserve Cookies
+            if t in ("-b", "--cookie", "-c", "--cookie-jar") and i + 1 < len(tokens):
+                cookies.append(tokens[i + 1].strip())
+                i += 2
+                continue
+
+            # Preserve Auth
+            if t in ("-u", "--user") and i + 1 < len(tokens):
+                auth = tokens[i + 1].strip()
+                i += 2
+                continue
+
+            # Preserve Body / Post data
+            if t in ("-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "-F", "--form") and i + 1 < len(tokens):
+                body.append(tokens[i + 1].strip())
+                if method == "GET":
+                    method = "POST"
+                i += 2
+                continue
+
+            # Positional argument: URL
+            if not t.startswith("-") and url is None:
+                url = t.strip().rstrip("/")
+                i += 1
+                continue
+
+            i += 1
+
+        if not url:
+            return None
+
+        headers_str = ";".join(sorted(headers))
+        cookies_str = ";".join(sorted(cookies))
+        body_str = ";".join(sorted(body))
+
+        return f"web:{method}:{url.lower()}:h={headers_str}:c={cookies_str}:u={auth}:b={body_str}"
+
+    elif prog in ("cat", "head", "tail", "strings"):
+        files = [t for t in tokens[1:] if not t.startswith("-")]
+        if not files:
+            return None
+        norm_files = sorted([os.path.normpath(f) for f in files])
+        return f"file:{prog}:{','.join(norm_files)}"
+
+    elif prog == "nmap":
+        targets = [t for t in tokens[1:] if not t.startswith("-")]
+        if not targets:
+            return None
+        return f"nmap:{','.join(sorted(targets)).lower()}"
+
+    return None
+
+
+def _normalize_failure_signature(cmd: str, category: str, output_or_stderr: str) -> str:
+    """Computes a normalized failure signature key incorporating target host, category, and error text."""
+    target = "local"
+    if cmd:
+        url_match = re.search(r"https?://([^/\s'\"]+)", cmd)
+        if url_match:
+            target = url_match.group(1).lower()
+        else:
+            ip_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", cmd)
+            if ip_match:
+                target = ip_match.group(0)
+            else:
+                tokens = cmd.strip().split()
+                if tokens:
+                    target = os.path.basename(tokens[0]).lower()
+
+    lines = [l.strip() for l in (output_or_stderr or "").splitlines() if l.strip()]
+    raw_line = lines[0] if lines else "unknown_error"
+
+    norm_line = re.sub(r"0x[0-9a-fA-F]+", "0xADDR", raw_line)
+    norm_line = re.sub(r"\b\d+\b", "N", norm_line)
+    norm_line = re.sub(r"\s+", " ", norm_line).lower().strip()
+    if len(norm_line) > 100:
+        norm_line = norm_line[:100]
+
+    cat_str = (category or "EXEC_FAIL").upper()
+    return f"{target}:{cat_str}:{norm_line}"
+
+
 class SwarmTask:
     def __init__(self, task_id: str, category: str, description: str, priority: int = 1, metadata: Optional[Dict] = None):
         self.task_id = task_id
@@ -224,6 +356,10 @@ class SwarmBlackboard:
         self.deobfuscated_secrets: List[Dict[str, str]] = []
         self.execution_history: List[Dict[str, Any]] = []
         self.executed_commands_dedup: Set[str] = set()
+        self.recon_cache: Dict[str, str] = {}
+        self.failure_signatures: Dict[str, int] = {}
+        self.blocked_failure_sigs: Set[str] = set()
+        self.blocked_capabilities: Set[str] = set()
         self.task_pool: Dict[str, SwarmTask] = {}
         self.flag_captured: Optional[str] = None
         self.flag_candidates: List[Dict[str, str]] = []  # Unverified candidates
@@ -583,6 +719,10 @@ class SwarmBlackboard:
                 "derived_artifacts": [dict(d) for d in self.derived_artifacts[-40:]],
                 "reconstruction_hashes": list(self.reconstruction_hashes),
                 "processed_recon_inputs": list(self.processed_recon_inputs)[-200:],
+                "recon_cache": dict(self.recon_cache),
+                "failure_signatures": dict(self.failure_signatures),
+                "blocked_failure_sigs": list(self.blocked_failure_sigs),
+                "blocked_capabilities": list(self.blocked_capabilities),
             },
         }
 
@@ -601,6 +741,15 @@ class SwarmBlackboard:
         counts = {"endpoints": 0, "headers": 0, "commands": 0, "completed_tasks": 0,
                   "pending_tasks": 0, "transcript_lines": 0}
         snapshot = snapshot or {}
+
+        for k, v in (snapshot.get("recon_cache") or {}).items():
+            self.recon_cache[k] = v
+        for k, v in (snapshot.get("failure_signatures") or {}).items():
+            self.failure_signatures[k] = v
+        for sig in (snapshot.get("blocked_failure_sigs") or []):
+            self.blocked_failure_sigs.add(sig)
+        for cap in (snapshot.get("blocked_capabilities") or []):
+            self.blocked_capabilities.add(cap)
 
         for ep in (snapshot.get("discovered_endpoints") or []):
             if ep:
@@ -1505,6 +1654,31 @@ class SwarmOrchestrator:
                     board.record_agent_step(agent_id, command=cmd, note="skipped (already executed by the swarm)")
                     await asyncio.sleep(0.5)
                     continue
+
+                # Bug 4 Pre-check: Blocked capabilities (sudo / missing binaries)
+                cmd_tokens = cmd.strip().split()
+                bin_name = os.path.basename(cmd_tokens[0]).lower() if cmd_tokens else ""
+                if ("sudo" in board.blocked_capabilities and cmd.strip().startswith("sudo ")) or (f"cmd:{bin_name}" in board.blocked_capabilities):
+                    board.record_agent_step(agent_id, command=cmd, note=f"[CAPABILITY BLOCKED] Command '{cmd[:80]}' uses a capability/tool blocked on first failure.")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Bug 1 Pre-check: Cross-agent recon deduplication (auth-preserving)
+                recon_key = _normalize_recon_target(cmd)
+                if recon_key and recon_key in board.recon_cache:
+                    cached = board.recon_cache[recon_key]
+                    board.record_agent_step(agent_id, command=cmd, output=cached, note="[RECON CACHE HIT] Result already fetched by another agent.")
+                    _append_to_challenge_log(board.challenge_id, agent_id, f"[RECON CACHE HIT] {cmd[:100]}")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Bug 3 Pre-check: Blocked failure signature check
+                sig_key_preview = _normalize_failure_signature(cmd, "PRECHECK", "")
+                if sig_key_preview in board.blocked_failure_sigs:
+                    board.record_agent_step(agent_id, command=cmd, note=f"[SIGNATURE BLOCKED] Attempting a signature '{sig_key_preview}' blocked after repeated failures.")
+                    await asyncio.sleep(0.5)
+                    continue
+
                 board.executed_commands_dedup.add(cmd)
 
                 _append_to_challenge_log(board.challenge_id, agent_id, f"Executing: {cmd[:200]}")
@@ -1517,6 +1691,27 @@ class SwarmOrchestrator:
 
                 await board.record_tool_execution(agent_id, cmd, res)
                 board.record_agent_step(agent_id, command=cmd, output=output)
+
+                # Bug 1 Store: populate recon cache on successful execution
+                if recon_key and getattr(res, "exit_code", 1) == 0 and output.strip():
+                    board.recon_cache[recon_key] = output[:1000]
+
+                # Bug 4 Post-check: First-occurrence terminal failure blocking
+                fail_cat = getattr(res, "failure_category", None)
+                if getattr(res, "execution_failure", False):
+                    if fail_cat == "PERMISSION_DENIED" and "sudo" in (cmd + " " + output).lower():
+                        board.blocked_capabilities.add("sudo")
+                        board.record_agent_step(agent_id, note="[CAPABILITY BLOCKED] sudo requires password/tty; blocked for remaining run.")
+                    elif fail_cat == "COMMAND_NOT_FOUND" and bin_name:
+                        board.blocked_capabilities.add(f"cmd:{bin_name}")
+                        board.record_agent_step(agent_id, note=f"[CAPABILITY BLOCKED] Binary '{bin_name}' not found; blocked for remaining run.")
+
+                    # Bug 3 Post-check: Track failure signature & block on repeat limit
+                    sig_key = _normalize_failure_signature(cmd, fail_cat or "EXEC_FAIL", res.stderr or output)
+                    board.failure_signatures[sig_key] = board.failure_signatures.get(sig_key, 0) + 1
+                    if board.failure_signatures[sig_key] >= 3 and sig_key not in board.blocked_failure_sigs:
+                        board.blocked_failure_sigs.add(sig_key)
+                        board.record_agent_step(agent_id, note=f"[FAILURE REPEAT LIMIT] Signature '{sig_key}' hit threshold (3); blocking repeated attempts.")
 
                 # Local execution failures (Errno 2 / SyntaxError / permission / missing dep)
                 # never reached the target — a broken invocation, not a target response. Don't

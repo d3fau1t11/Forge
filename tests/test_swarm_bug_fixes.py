@@ -1,0 +1,105 @@
+import os
+import sys
+import unittest
+import asyncio
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from backend.agents.swarm_orchestrator import (
+    _normalize_recon_target,
+    _normalize_failure_signature,
+    SwarmBlackboard,
+)
+from backend.tools.manager import classify_tool_execution
+
+
+class TestSwarmBugFixes(unittest.TestCase):
+
+    # ── Bug 1: Recon Cache Normalization ─────────────────────────────────────
+
+    def test_recon_cache_normalization_formatting_flags(self):
+        # Formatting flags (-s, -v, -i, -k, -L) stripped, same key generated
+        cmd1 = "curl http://target.local:8080/api"
+        cmd2 = "curl -s -v -k -L http://target.local:8080/api/"
+        key1 = _normalize_recon_target(cmd1)
+        key2 = _normalize_recon_target(cmd2)
+        self.assertIsNotNone(key1)
+        self.assertEqual(key1, key2)
+
+    def test_recon_cache_preserves_auth_state(self):
+        # Unauthenticated request vs request with auth header must NOT collapse
+        cmd_unauth = "curl -s http://target.local/admin"
+        cmd_auth = "curl -s -H 'Authorization: Bearer token123' http://target.local/admin"
+        cmd_cookie = "curl -s -b 'session=xyz' http://target.local/admin"
+        cmd_post = "curl -s -X POST -d 'user=admin' http://target.local/admin"
+
+        key_unauth = _normalize_recon_target(cmd_unauth)
+        key_auth = _normalize_recon_target(cmd_auth)
+        key_cookie = _normalize_recon_target(cmd_cookie)
+        key_post = _normalize_recon_target(cmd_post)
+
+        self.assertNotEqual(key_unauth, key_auth)
+        self.assertNotEqual(key_unauth, key_cookie)
+        self.assertNotEqual(key_unauth, key_post)
+        self.assertNotEqual(key_auth, key_cookie)
+
+    def test_recon_cache_file_and_nmap(self):
+        key_cat = _normalize_recon_target("cat /etc/passwd")
+        key_cat2 = _normalize_recon_target("cat -n /etc/passwd")
+        self.assertEqual(key_cat, key_cat2)
+
+        key_nmap = _normalize_recon_target("nmap -sV 10.10.10.5")
+        key_nmap2 = _normalize_recon_target("nmap 10.10.10.5")
+        self.assertEqual(key_nmap, key_nmap2)
+
+    # ── Bug 3: Failure Signatures with Target Host Scoping ─────────────────────
+
+    def test_failure_signature_target_scoping(self):
+        # Identical error text on Host A vs Host B should produce DIFFERENT signatures
+        sig_a = _normalize_failure_signature("curl http://hostA.ctf/secret", "CONNECTION_REFUSED", "curl: (7) Failed to connect to hostA.ctf port 80: Connection refused")
+        sig_b = _normalize_failure_signature("curl http://hostB.ctf/secret", "CONNECTION_REFUSED", "curl: (7) Failed to connect to hostB.ctf port 80: Connection refused")
+        self.assertNotEqual(sig_a, sig_b)
+        self.assertTrue(sig_a.startswith("hosta.ctf:"))
+        self.assertTrue(sig_b.startswith("hostb.ctf:"))
+
+    def test_failure_signature_normalizes_volatile_data(self):
+        # Hex addresses and line numbers should be normalized out
+        err1 = "Traceback (most recent call last):\n  File 'solve.py', line 42, in <module>\n    print(0x7ffff7a00000)"
+        err2 = "Traceback (most recent call last):\n  File 'solve.py', line 88, in <module>\n    print(0x7ffff7b12345)"
+        sig1 = _normalize_failure_signature("python solve.py", "SYNTAX_ERROR", err1)
+        sig2 = _normalize_failure_signature("python solve.py", "SYNTAX_ERROR", err2)
+        self.assertEqual(sig1, sig2)
+
+    # ── Bug 4: First-Occurrence Terminal Failure Classification ──────────────
+
+    def test_sudo_password_classified_as_permission_denied(self):
+        res1 = classify_tool_execution("bash", 1, "", "sudo: a password is required")
+        res2 = classify_tool_execution("bash", 1, "", "sudo: no tty present and no askpass program specified")
+        self.assertTrue(res1["execution_failure"])
+        self.assertEqual(res1["failure_category"], "PERMISSION_DENIED")
+        self.assertTrue(res2["execution_failure"])
+        self.assertEqual(res2["failure_category"], "PERMISSION_DENIED")
+
+    # ── Blackboard Persistence Snapshot ──────────────────────────────────────
+
+    def test_blackboard_snapshot_roundtrip(self):
+        board1 = SwarmBlackboard("chal-1", "run-1", "http://target.local")
+        board1.recon_cache["web:GET:http://target.local"] = "cached data"
+        board1.failure_signatures["target.local:403:forbidden"] = 3
+        board1.blocked_failure_sigs.add("target.local:403:forbidden")
+        board1.blocked_capabilities.add("sudo")
+
+        mission_plan = board1._build_mission_plan()
+        snapshot = mission_plan["blackboard_state"]
+
+        board2 = SwarmBlackboard("chal-1", "run-1", "http://target.local")
+        board2.load_snapshot(snapshot)
+
+        self.assertEqual(board2.recon_cache.get("web:GET:http://target.local"), "cached data")
+        self.assertEqual(board2.failure_signatures.get("target.local:403:forbidden"), 3)
+        self.assertIn("target.local:403:forbidden", board2.blocked_failure_sigs)
+        self.assertIn("sudo", board2.blocked_capabilities)
+
+
+if __name__ == "__main__":
+    unittest.main()

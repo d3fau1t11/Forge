@@ -268,5 +268,46 @@ class TestAgentContextInjection(MemoryTestBase):
         self.assertNotIn(CAPTURED_FLAG, user)
 
 
+
+class TestBug5Classification(MemoryTestBase):
+    def test_rev_challenge_classified_as_reverse_engineering(self):
+        board = _solved_board(
+            category="REV",
+            description="Reverse engineer this binary using ghidra or gdb",
+            execution_history=[
+                {"agent": "a1", "command": "ghidra --headless ./chall", "output": "decompiled main", "note": ""},
+                {"agent": "a1", "command": "gdb ./chall -ex 'disassemble main'", "output": "checksec: partial relro, gdb output", "note": ""},
+            ]
+        )
+        rec = self.extractor.extract_from_board(board, flag=CAPTURED_FLAG, outcome="success")
+        self.assertEqual(rec.technique, "Reverse Engineering / Static Analysis")
+        self.assertIn("rev", rec.tags)
+
+    def test_xxe_requires_cooccurrence(self):
+        # Ordinary HTML containing <!DOCTYPE should NOT be classified as XXE
+        board = _solved_board(
+            category="WEB",
+            description="Web app with html login",
+            execution_history=[
+                {"agent": "a1", "command": "curl -s http://target/", "output": "<!DOCTYPE html><html><body>Login</body></html>", "note": ""}
+            ]
+        )
+        rec = self.extractor.extract_from_board(board, flag=CAPTURED_FLAG, outcome="success")
+        self.assertNotEqual(rec.technique, "XML External Entity (XXE)")
+
+        # Actual XXE payload containing <!ENTITY or system "file should classify as XXE
+        board_xxe = _solved_board(
+            category="WEB",
+            description="XML parser endpoint",
+            execution_history=[
+                {"agent": "a1", "command": "curl -X POST -d '<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>' http://target/xml", "output": "root:x:0:0", "note": ""}
+            ]
+        )
+        rec_xxe = self.extractor.extract_from_board(board_xxe, flag=CAPTURED_FLAG, outcome="success")
+        self.assertEqual(rec_xxe.technique, "XML External Entity (XXE)")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

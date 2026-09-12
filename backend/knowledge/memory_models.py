@@ -179,7 +179,17 @@ _TECHNIQUE_RULES = [
      ["jwt", "token_forgery"],
      ["eyJ", "alg", "none algorithm", "HS256"],
      [r"(?:HTTP/1\.[01] 200|admin|role)"]),
-    (("pwntools", "p32(", "p64(", "rop", "ret2", "checksec", "gdb", "pattern_offset"),
+    # Reverse Engineering — MUST appear before Binary Exploitation so that a pure
+    # reversing session (disassemble, decompile, strings, ltrace) is not pulled into
+    # "Binary Exploitation / Memory Corruption" just because gdb/checksec appeared.
+    (("ghidra", "ida ", "radare2", "r2 ", "objdump -d", "disassemble", "decompile",
+      "ltrace", "strace", "angr", "z3.", "strings ", "readelf", "file "),
+     "Reverse Engineering / Static Analysis",
+     ["rev", "reverse_engineering"],
+     ["ELF", "PE", "Mach-O", "stripped", "not stripped"],
+     [r"(?:flag|correct|success)"]),
+    (("pwntools", "p32(", "p64(", "rop", "ret2", "pattern_offset", "cyclic(",
+      "shellcraft", "flat(", "process(", "remote("),
      "Binary Exploitation / Memory Corruption",
      ["pwn", "buffer_overflow", "rop"],
      ["ELF", "checksec", "ROP", "GOT"],
@@ -194,7 +204,10 @@ _TECHNIQUE_RULES = [
      ["auth", "bruteforce"],
      ["401 Unauthorized", "Login", "Invalid password"],
      [r"(?:200 OK|Welcome|Dashboard)"]),
-    (("xxe", "<!doctype", "<!entity", "system \"file"),
+    # XXE: require co-occurrence — `<!doctype` alone appears in normal HTML pages.
+    # A standalone `xxe` mention is enough; `<!doctype` only counts when paired with
+    # `<!entity` or `system "file` (the actual XXE payload shape).
+    (("xxe", "<!entity", "system \"file"),
      "XML External Entity (XXE)",
      ["xxe"],
      ["<!ENTITY", "SYSTEM", "DOCTYPE"],
@@ -211,22 +224,60 @@ _TECHNIQUE_RULES = [
      [r"\{FLAG\}"]),
 ]
 
+# Maps the challenge's declared category to the technique-rule tags it corresponds to.
+# Used to boost category-agreeing rules during scored classification.
+_CATEGORY_TAG_MAP: Dict[str, List[str]] = {
+    "web": ["ssti", "template_injection", "sqli", "sql_injection", "lfi", "path_traversal",
+            "upload", "file_upload_bypass", "jwt", "token_forgery", "xss", "auth", "bruteforce",
+            "xxe", "rce", "command_injection"],
+    "pwn": ["pwn", "buffer_overflow", "rop"],
+    "rev": ["rev", "reverse_engineering"],
+    "reverse": ["rev", "reverse_engineering"],
+    "reverse_engineering": ["rev", "reverse_engineering"],
+    "crypto": ["crypto"],
+    "forensics": ["rev", "reverse_engineering", "crypto"],
+    "misc": [],
+}
+
 
 def classify_technique(evidence_text: str, category: str = "") -> Dict[str, Any]:
     """Deterministically map observed evidence to a generalized technique + tags.
 
+    Uses scored ranking: count matching needles per rule, boost by category agreement.
     Falls back to a category-scoped generic label when nothing specific matches.
     """
     low = (evidence_text or "").lower()
+    cat = (category or "").lower().strip()
+    cat_tags = set(_CATEGORY_TAG_MAP.get(cat, []))
+
+    best_score = 0
+    best_rule = None
     for needles, label, tags, sigs, indicators in _TECHNIQUE_RULES:
-        if any(n in low for n in needles):
-            return {
-                "technique": label,
-                "tags": list(dict.fromkeys(tags + ([category.lower()] if category else []))),
-                "signatures": sigs,
-                "success_indicators": indicators,
-            }
-    cat = (category or "general").lower()
+        hits = sum(1 for n in needles if n in low)
+        if hits == 0:
+            continue
+        score = hits
+        # Category-agreement boost: if any of this rule's tags match the challenge
+        # category's known tags, the rule is strongly preferred.
+        if cat_tags and any(t in cat_tags for t in tags):
+            score += 5
+        # Category-disagreement penalty: if a category IS declared and this rule
+        # has NO overlap, discount it so noise hits don't outrank a matching rule.
+        elif cat_tags:
+            score -= 2
+        if score > best_score:
+            best_score = score
+            best_rule = (label, tags, sigs, indicators)
+
+    if best_rule is not None:
+        label, tags, sigs, indicators = best_rule
+        return {
+            "technique": label,
+            "tags": list(dict.fromkeys(tags + ([cat] if cat else []))),
+            "signatures": sigs,
+            "success_indicators": indicators,
+        }
+    cat = cat or "general"
     return {
         "technique": f"{cat.upper()} solve methodology",
         "tags": [cat, "custom_exploit"],
@@ -291,6 +342,12 @@ _DETECTION_BY_TAG: Dict[str, Dict[str, List[str]]] = {
         "logs": ["authentication logs"],
         "investigation": ["Review auth logs for brute-force bursts", "Check for credential stuffing patterns"],
         "containment": ["Rate-limit / lockout", "Enforce MFA and strong passwords"],
+    },
+    "rev": {
+        "indicators": ["Binary extraction or download from production assets", "Decompilation tool artifacts on disk"],
+        "logs": ["file access logs", "download logs"],
+        "investigation": ["Check for exfiltrated binaries", "Review build artifacts for leaked symbols"],
+        "containment": ["Strip symbols from release builds", "Restrict binary distribution"],
     },
 }
 

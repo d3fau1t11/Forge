@@ -106,13 +106,21 @@ class ExperienceExtractor:
                 text, target_tokens=target_tokens, flag=flag, secrets=secrets, usernames=usernames
             )
 
-        # Full evidence corpus (for classification & tech fingerprinting).
+        # Evidence corpus for classification & tech fingerprinting.
+        # Commands (the agent's chosen technique) are weighted 3× over output (the
+        # target's response) so the classifier's needle-count scoring reflects what
+        # the agent DID, not noise in what the target returned (Bug 5 fix).
         corpus_parts: List[str] = [getattr(board, "description", "") or ""]
         corpus_parts.extend(f"{k}: {v}" for k, v in headers.items())
         corpus_parts.extend(endpoints)
         for step in exec_history:
-            corpus_parts.append(str(step.get("command", "")))
-            corpus_parts.append(str(step.get("output", "")))
+            cmd = str(step.get("command", ""))
+            out = str(step.get("output", ""))
+            # Repeat commands to weight them higher in needle-count scoring.
+            if cmd:
+                corpus_parts.extend([cmd] * 3)
+            if out:
+                corpus_parts.append(out)
         evidence_text = "\n".join(p for p in corpus_parts if p)
 
         clf = classify_technique(evidence_text, category)

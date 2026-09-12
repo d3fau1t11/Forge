@@ -97,7 +97,9 @@ def classify_tool_execution(tool_name: str, exit_code: Optional[int], stdout: st
             or "unexpected token" in combined):
         return {"execution_failure": True, "failure_category": "SYNTAX_ERROR"}
     if ("[errno 13]" in combined or "permission denied" in combined
-            or "not permitted" in combined):
+            or "not permitted" in combined or "sudo: a password is required" in combined
+            or "sudo: no tty present" in combined or "a password is required" in combined
+            or "no tty present" in combined):
         return {"execution_failure": True, "failure_category": "PERMISSION_DENIED"}
     if ("modulenotfounderror" in combined or "no module named" in combined
             or "importerror" in combined):
