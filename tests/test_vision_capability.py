@@ -152,13 +152,14 @@ class TestVisionCapability(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertIn("flag{vision_extracted_secret_flag_123}", result)
 
-        # Verify candidate flag was recorded
+        # Verify candidate flag was recorded and verified by AnswerResolver
         candidates = [c["flag"] for c in board.flag_candidates]
         self.assertIn("flag{vision_extracted_secret_flag_123}", candidates)
         self.assertEqual(board.flag_candidates[0]["source"], "vision_read")
 
-        # Verify it was NOT auto-promoted to captured flag (Requirement #4)
-        self.assertIsNone(board.flag_captured)
+        # Verify it was resolved/verified and promoted to captured flag
+        self.assertEqual(board.flag_captured, "flag{vision_extracted_secret_flag_123}")
+        self.assertTrue(board.flag_event.is_set())
 
         # Verify artifact marked as analyzed
         analyzed_flags = [d["analyzed"] for d in board.derived_artifacts if d.get("derived_path") == img_path]

@@ -259,16 +259,23 @@ class SwarmCoordinator:
 
     def submit_flag_candidate(self, candidate: str, *, source: str = "tool_output",
                               command: str = "", action_succeeded: bool = True,
-                              agent_id: str = "external") -> bool:
-        """Central, authoritative flag verification (§11) for a candidate surfaced
-        outside the runtime's own tool-output path. Returns True iff VERIFIED."""
-        src = FlagSource.TOOL_OUTPUT if source == "tool_output" else (
-            FlagSource.LLM_PROSE if source == "llm" else FlagSource.UNKNOWN)
-        verdict = self.verifier.assess(candidate, source=src, command=command,
-                                       action_succeeded=action_succeeded,
-                                       target_scope=self.mission.target,
-                                       expected_format=self.mission.flag_format)
-        if verdict.status == FlagStatus.VERIFIED:
+                              agent_id: str = "external", evidence: Optional[Dict[str, Any]] = None) -> bool:
+        """Central, authoritative flag/answer verification for candidates from any source.
+        Returns True iff VERIFIED / RESOLVED."""
+        verdict = self.verifier.assess(
+            candidate,
+            source=source,
+            command=command,
+            action_succeeded=action_succeeded,
+            target_scope=self.mission.target,
+            expected_format=self.mission.flag_format,
+            description=self.mission.description,
+            challenge_name=self.mission.challenge_name,
+            category=self.mission.category,
+            evidence=evidence or {},
+            worker_id=agent_id,
+        )
+        if verdict.is_verified or verdict.is_resolved:
             self._accept_verified_flag(verdict.candidate, agent_id=agent_id, task=None)
             return True
         if verdict.candidate and verdict.candidate not in self.mission.flag_candidates:

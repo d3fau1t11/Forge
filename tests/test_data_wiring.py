@@ -6,7 +6,7 @@ sys.path.insert(0, ".")
 from fastapi.testclient import TestClient
 from backend.main import app
 from backend.database.session import get_db, get_engine, SessionLocal, init_db
-from backend.database.models import Base, ChallengeModel, TargetProfileModel, ProviderUsageModel, TrajectoryEventModel
+from backend.database.models import Base, ChallengeModel, TargetProfileModel, ProviderUsageModel, TrajectoryEventModel, RunModel, FindingModel, EvidenceModel, CheckpointModel, AgentStateModel, ReportModel
 
 
 class TestDataWiringEndpoints(unittest.TestCase):
@@ -20,16 +20,26 @@ class TestDataWiringEndpoints(unittest.TestCase):
 
     def setUp(self):
         self.db = SessionLocal()
-
-        # Clean test records
-        self.db.query(TargetProfileModel).delete()
-        self.db.query(ChallengeModel).delete()
-        self.db.query(ProviderUsageModel).delete()
-        self.db.query(TrajectoryEventModel).delete()
-        self.db.commit()
+        try:
+            # Clean test records in FK order
+            self.db.query(AgentStateModel).delete()
+            self.db.query(CheckpointModel).delete()
+            self.db.query(EvidenceModel).delete()
+            self.db.query(FindingModel).delete()
+            self.db.query(ReportModel).delete()
+            self.db.query(RunModel).delete()
+            self.db.query(TargetProfileModel).delete()
+            self.db.query(ChallengeModel).delete()
+            self.db.query(ProviderUsageModel).delete()
+            self.db.query(TrajectoryEventModel).delete()
+            self.db.commit()
+        finally:
+            self.db.close()
+            self.db = SessionLocal()
 
     def tearDown(self):
-        self.db.close()
+        if hasattr(self, "db") and self.db:
+            self.db.close()
 
     def test_challenge_candidates_artifact_decisions_endpoints(self):
         """Verify GET /challenges/{id}/candidates, /derived-artifacts, and /decisions return persisted/live state."""
@@ -48,6 +58,7 @@ class TestDataWiringEndpoints(unittest.TestCase):
         )
         self.db.add(ch)
         self.db.commit()
+        self.db.close()
 
         # 2. Simulate an actual _agent_worker turn to test real pipeline persistence
         import asyncio
@@ -55,6 +66,7 @@ class TestDataWiringEndpoints(unittest.TestCase):
         from backend.agents.swarm_orchestrator import SwarmOrchestrator, SwarmBlackboard
 
         board = SwarmBlackboard("ch-test-wiring-1", "run-wiring-1", "http://target.local")
+        board.env_info = {"os": "windows", "tools": {}, "cpu_cores": 2}
         board.flag_candidates = [{"flag": "picoCTF{test_candidate_123}", "worker": "RECON", "source": "regex"}]
         board.derived_artifacts = [{"filename": "decoded_secret.png", "artifact_type": "image", "size_bytes": 1024, "status": "RECONSTRUCTED"}]
         orchestrator = SwarmOrchestrator()

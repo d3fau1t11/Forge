@@ -42,26 +42,12 @@ from backend.agents.agent_prompt import AgentContext, build_agent_prompt, make_c
 from backend.agents.artifact_acquisition import acquire_artifacts
 from backend.agents import checkpoint_pipeline
 from backend.agents.checkpoint_pipeline import AgentCheckpointRecord
+from backend.agent_runtime.verifier import (
+    AnswerResolver, AnswerCandidate, AnswerVerdict, AnswerStatus, AnswerSource,
+    FLAG_REGEX, FALSE_FLAG_PATTERNS,
+)
 
 logger = logging.getLogger("forge.swarm")
-
-# Strict flag regex — only known CTF platform prefixes, minimum 4 chars inside braces.
-# Does NOT include a generic catch-all to avoid false positives from CSS, LaTeX, JSON, etc.
-# The body excludes BOTH braces ([^{}]) so a template/format artifact the agent merely
-# ECHOED — e.g. the SSTI payload picoCTF{{{flag}}} — can never match as a real flag.
-FLAG_REGEX = re.compile(
-    r"(?:picoCTF\{[^{}]{4,}\}|FLAG\{[^{}]{4,}\}|flag\{[^{}]{4,}\}|HTB\{[^{}]{4,}\}|CTF\{[^{}]{4,}\}|"
-    r"DUCTF\{[^{}]{4,}\}|corctf\{[^{}]{4,}\}|TFCCTF\{[^{}]{4,}\}|pwn\.college\{[^{}]{4,}\})",
-    re.IGNORECASE
-)
-
-# Patterns that look like flags but are actually examples/placeholders from LLM responses
-FALSE_FLAG_PATTERNS = re.compile(
-    r"(?:picoCTF\{\.\.\.\}|FLAG\{\.\.\.\}|HTB\{\.\.\.\}|CTF\{\.\.\.\}|"
-    r"\{[a-z_]+_here\}|\{example[^}]*\}|\{your[^}]*\}|\{placeholder[^}]*\}|"
-    r"\{some[^}]*\}|\{flag[^}]*format[^}]*\}|\{insert[^}]*\})",
-    re.IGNORECASE
-)
 
 # HTTP header names are token characters per RFC 7230 (no spaces, no exotic
 # punctuation). Values must be printable single-line ASCII. Anything else is
@@ -383,7 +369,18 @@ class SwarmTask:
 
 class SwarmBlackboard:
     """Shared in-memory and synchronized state across all parallel swarm workers."""
-    def __init__(self, challenge_id: str, run_id: str, target_scope: str):
+    def __init__(
+        self,
+        challenge_id: str,
+        run_id: str,
+        target_scope: str,
+        *,
+        description: str = "",
+        category: str = "WEB",
+        difficulty: str = "EASY",
+        challenge_name: str = "",
+        flag_pattern: str = "",
+    ):
         self.challenge_id = challenge_id
         self.run_id = run_id
         self.target_scope = target_scope
@@ -436,18 +433,19 @@ class SwarmBlackboard:
         # ── Unified flexible-agent challenge context ────────────────────────────
         # Populated by run_swarm before agents start; baked into every agent's
         # full-context prompt via build_agent_prompt(). No per-role framing.
-        self.challenge_name: str = ""
+        self.challenge_name: str = challenge_name
         self.platform: str = ""
-        self.category: str = "WEB"
-        self.difficulty: str = "EASY"
-        self.description: str = ""
-        self.flag_pattern: str = getattr(settings, "DEFAULT_FLAG_PATTERNS",
-                                         "picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}")
+        self.category: str = category or "WEB"
+        self.difficulty: str = difficulty or "EASY"
+        self.description: str = description
+        self.flag_pattern: str = flag_pattern or getattr(settings, "DEFAULT_FLAG_PATTERNS",
+                                                         "picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}")
         self.max_iterations: int = getattr(settings, "AGENT_MAX_ITERATIONS", 40)
         self.max_minutes: int = getattr(settings, "AGENT_MAX_MINUTES", 30)
         self.attached_file_paths: List[str] = []
         self.artifact_classification = None            # ClassificationResult | None
         self.env_info: Dict[str, Any] = {}
+        self.answer_resolver = AnswerResolver()
 
         # ── Encoded-artifact reconstruction & escalation (deterministic) ────────
         # When a tool output or attached artifact turns out to be an ENCODED file
@@ -553,36 +551,76 @@ class SwarmBlackboard:
                     "solver_worker": worker_id
                 })
 
-    async def record_flag_candidate(self, candidate: str, worker_id: str, source: str):
-        """Record an unverified flag candidate for review. Only promotes to captured if from tool output."""
+    async def record_flag_candidate(
+        self,
+        candidate: str,
+        worker_id: str,
+        source: str,
+        evidence: Optional[Dict[str, Any]] = None,
+        command: str = "",
+        action_succeeded: bool = True,
+    ):
+        """Record an answer candidate, resolve against challenge semantics, and promote if verified/resolved."""
         async with self._lock:
-            # Reject obvious placeholders / examples
-            if FALSE_FLAG_PATTERNS.search(candidate):
-                logger.info(f"[SwarmBlackboard] Rejected false-positive flag candidate: {candidate}")
-                _append_to_challenge_log(self.challenge_id, worker_id, f"⚠ Rejected false flag: {candidate}")
+            task_context = {
+                "challenge_id": self.challenge_id,
+                "challenge_name": self.challenge_name,
+                "category": self.category,
+                "difficulty": self.difficulty,
+                "description": self.description,
+                "flag_pattern": self.flag_pattern,
+                "target_scope": self.target_scope,
+            }
+            cand_obj = AnswerCandidate(
+                value=candidate,
+                source=self.answer_resolver.normalize_source(source),
+                worker_id=worker_id,
+                evidence=evidence or {},
+                task_context=task_context,
+                provenance={"worker_id": worker_id, "command": command, "action_succeeded": action_succeeded},
+            )
+            verdict = self.answer_resolver.resolve(cand_obj)
+
+            if verdict.status == AnswerStatus.REJECTED:
+                logger.info(f"[SwarmBlackboard] Rejected false/invalid candidate: {candidate} (reasons: {verdict.reasons})")
+                _append_to_challenge_log(self.challenge_id, worker_id, f"⚠ Rejected candidate: {candidate} ({'; '.join(verdict.reasons)})")
                 return
 
             # Check if this candidate was already seen
             for existing in self.flag_candidates:
-                if existing["flag"] == candidate:
+                if existing.get("flag") == verdict.candidate:
                     return
 
-            self.flag_candidates.append({"flag": candidate, "worker": worker_id, "source": source})
-            _append_to_challenge_log(self.challenge_id, worker_id, f"🏳 Flag candidate from {source}: {candidate}")
-            logger.info(f"[SwarmBlackboard] Flag candidate from {source} by {worker_id}: {candidate}")
+            self.flag_candidates.append({
+                "flag": verdict.candidate,
+                "worker": worker_id,
+                "source": source,
+                "status": verdict.status.value,
+                "confidence": verdict.confidence,
+                "reasons": verdict.reasons,
+                "evidence": evidence or {},
+            })
+            _append_to_challenge_log(
+                self.challenge_id, worker_id,
+                f"🏳 Answer candidate from {source}: {verdict.candidate} [{verdict.status.value}, conf={verdict.confidence:.2f}]"
+            )
+            logger.info(f"[SwarmBlackboard] Answer candidate from {source} by {worker_id}: {verdict.candidate} [{verdict.status.value}]")
 
             await ws_manager.broadcast({
                 "event": "FLAG_CANDIDATE",
                 "challenge_id": self.challenge_id,
                 "run_id": self.run_id,
-                "candidate": candidate,
+                "candidate": verdict.candidate,
                 "source": source,
-                "worker": worker_id
+                "worker": worker_id,
+                "status": verdict.status.value,
+                "confidence": verdict.confidence,
             })
 
-        # Only auto-promote to captured if the source is actual tool/command output (not LLM prose)
-        if source == "tool_output":
-            await self.record_flag(candidate, worker_id)
+        # If resolved or verified (e.g. from tool_output, vision_read, reconstructed_artifact, etc.):
+        if verdict.is_verified or verdict.is_resolved:
+            logger.info(f"[SwarmBlackboard] 🎯 Candidate verified/resolved: {verdict.candidate} via {source}")
+            await self.record_flag(verdict.candidate, worker_id)
 
     async def register_derived_artifact(self, outcome, derived_path: Optional[str],
                                         worker_id: str) -> bool:
@@ -2152,11 +2190,14 @@ class SwarmOrchestrator:
         # Execute vision_read capability on derived_path
         res = await tool_manager.execute_capability("vision_read", target=derived_path)
         if res.status == "SUCCESS" and res.stdout:
-            # Check stdout for flag candidates (treated as unverified candidates per Req #4)
+            # Check stdout for flag candidates
             for m in FLAG_REGEX.finditer(res.stdout):
                 cand = m.group(0).strip()
                 if not FALSE_FLAG_PATTERNS.search(cand):
-                    await board.record_flag_candidate(cand, worker_id, "vision_read")
+                    await board.record_flag_candidate(
+                        cand, worker_id, "vision_read",
+                        evidence={"derived_path": derived_path, "tool": "vision_read", "stdout": res.stdout[:500]}
+                    )
             board.mark_derived_analyzed(derived_path)
             return res.stdout
         elif res.stderr:

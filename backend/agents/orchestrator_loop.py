@@ -25,6 +25,10 @@ from backend.knowledge.playbook_vault import playbook_vault
 from backend.recon.turbo_recon import turbo_recon
 from backend.agents.stream_condenser import stream_condenser
 from backend.agents.strategic_planner import strategic_planner
+from backend.agent_runtime.verifier import (
+    AnswerResolver, AnswerCandidate, AnswerVerdict, AnswerStatus, AnswerSource,
+    FLAG_REGEX, FALSE_FLAG_PATTERNS,
+)
 
 logger = logging.getLogger("forge.orchestrator")
 
@@ -50,6 +54,7 @@ class AutonomousOrchestrator:
         # Tracks pending root/privilege requests: request_id -> asyncio.Event
         self._root_events: dict[str, asyncio.Event] = {}
         self._root_results: dict[str, dict] = {}
+        self.answer_resolver = AnswerResolver()
         # ── Agent-runtime facade (Step 5) ──────────────────────────────────────
         # The new HERMES-inspired runtime owns canonical session/trajectory state.
         # These are lazily bound so importing the orchestrator never forces the
@@ -808,12 +813,27 @@ class AutonomousOrchestrator:
                 db.add(ev)
                 db.commit()
 
-                # Check for REAL Flag pattern in STDOUT/STDERR
+                # Check for REAL Flag / Answer pattern in STDOUT/STDERR via AnswerResolver
                 combined_output = f"{stdout_text}\n{stderr_text}"
-                found_flags = re.findall(r"(?:picoCTF|FORGE|CTF|HTB|FLAG|THM)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}", combined_output, re.IGNORECASE)
-                if found_flags:
-                    flag_str = found_flags[0]
-                    await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} Tool `{cmd_line}` Output", history_summary)
+                for m in FLAG_REGEX.finditer(combined_output):
+                    cand = m.group(0).strip()
+                    verdict = self.answer_resolver.assess(
+                        cand,
+                        source=AnswerSource.TOOL_OUTPUT,
+                        command=cmd_line,
+                        action_succeeded=(tool_res.exit_code == 0),
+                        target_scope=target,
+                        expected_format=getattr(challenge, "flag_pattern", ""),
+                        description=getattr(challenge, "description", ""),
+                        challenge_name=getattr(challenge, "name", ""),
+                        category=getattr(challenge, "category", ""),
+                        evidence={"stdout": stdout_text, "stderr": stderr_text},
+                    )
+                    if verdict.is_verified or verdict.is_resolved:
+                        flag_str = verdict.candidate
+                        await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} Tool `{cmd_line}` Output", history_summary)
+                        break
+                if challenge.flag_status == "CAPTURED":
                     break
 
                 # State Checkpoint
@@ -985,6 +1005,17 @@ class AutonomousOrchestrator:
         target_addr = target.current_address if target else "127.0.0.1"
 
         capability = "network_scanning" if run.current_phase == "recon" else "web_testing"
+
+        # Record step evidence
+        step_evidence = EvidenceModel(
+            challenge_id=run.challenge_id,
+            agent=current_agent_name,
+            evidence_type="step_execution",
+            source=capability,
+            content=f"Executed phase '{run.current_phase}' step for agent '{current_agent_name}' on target '{target_addr}'.",
+            confidence=0.95,
+        )
+        db.add(step_evidence)
 
         # Create State Checkpoint
         checkpoint_manager.create_checkpoint(
