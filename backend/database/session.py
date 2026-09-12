@@ -115,12 +115,16 @@ def init_db():
             for _ddl in (
                 "ALTER TABLE swarm_tasks ADD COLUMN required_capabilities JSON",
                 "ALTER TABLE swarm_tasks ADD COLUMN target_type VARCHAR DEFAULT ''",
+                "ALTER TABLE targets ADD COLUMN technologies JSON",
+                "ALTER TABLE targets ADD COLUMN address_history JSON",
+                "ALTER TABLE targets ADD COLUMN discovery_method VARCHAR DEFAULT 'FORGE Auto Ingest'",
             ):
                 try:
                     conn.execute(text(_ddl))
                     conn.commit()
                 except Exception:
                     pass
+
 
     # Phase 2: warm the in-memory FTS indexes AFTER create_all + migration. The
     # experience/trajectory singletons build their indexes at import time, which in

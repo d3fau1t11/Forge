@@ -14,7 +14,7 @@ from backend.database.models import (
     ChallengeModel, TargetProfileModel, RunModel, AgentStateModel,
     CheckpointModel, ToolExecutionModel, FindingModel, EvidenceModel,
     ReportModel, KnowledgeEntryModel, ProviderUsageModel, AuditLogModel,
-    ProviderConfigModel,
+    ProviderConfigModel, TrajectoryEventModel,
     SwarmMissionModel, SwarmTaskModel, SwarmEvidenceModel,
 )
 from backend.environment.detector import environment_detector
@@ -264,6 +264,99 @@ def get_challenge_log(challenge_id: str, db: Session = Depends(get_db)):
         "log_file": log_path,
         "content": content,
     }
+
+
+@router.get("/challenges/{challenge_id}/candidates")
+def get_challenge_candidates(challenge_id: str, db: Session = Depends(get_db)):
+    """Retrieve flag candidates (live or persisted snapshot) for a challenge."""
+    try:
+        from backend.agents.swarm_orchestrator import swarm_orchestrator
+        if challenge_id in swarm_orchestrator.active_swarms:
+            board = swarm_orchestrator.active_swarms[challenge_id]
+            return {"challenge_id": challenge_id, "candidates": list(board.flag_candidates)}
+    except Exception:
+        pass
+
+    challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    
+    plan = challenge.mission_plan or {}
+    bb_state = plan.get("blackboard_state", {}) if isinstance(plan, dict) else {}
+    candidates = bb_state.get("flag_candidates", [])
+    return {"challenge_id": challenge_id, "candidates": candidates}
+
+
+@router.get("/challenges/{challenge_id}/derived-artifacts")
+def get_challenge_derived_artifacts(challenge_id: str, db: Session = Depends(get_db)):
+    """Retrieve reconstructed derived artifacts (live or persisted snapshot) for a challenge."""
+    try:
+        from backend.agents.swarm_orchestrator import swarm_orchestrator
+        if challenge_id in swarm_orchestrator.active_swarms:
+            board = swarm_orchestrator.active_swarms[challenge_id]
+            return {"challenge_id": challenge_id, "artifacts": list(board.derived_artifacts)}
+    except Exception:
+        pass
+
+    challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    
+    plan = challenge.mission_plan or {}
+    bb_state = plan.get("blackboard_state", {}) if isinstance(plan, dict) else {}
+    artifacts = bb_state.get("derived_artifacts", [])
+    return {"challenge_id": challenge_id, "artifacts": artifacts}
+
+
+@router.get("/challenges/{challenge_id}/decisions")
+def get_challenge_decisions(challenge_id: str, db: Session = Depends(get_db)):
+    """Retrieve AI decision history from TrajectoryEventModel and live/persisted execution history."""
+    decisions = []
+    # Query database trajectory events for this challenge
+    events = (db.query(TrajectoryEventModel)
+              .filter(TrajectoryEventModel.challenge_id == challenge_id)
+              .filter(TrajectoryEventModel.event_type.in_(["DECISION", "AI_DECISION", "PLAN", "REPLAN"]))
+              .order_by(TrajectoryEventModel.created_at.desc())
+              .all())
+    
+    for ev in events:
+        decisions.append({
+            "id": ev.id,
+            "timestamp": ev.created_at.isoformat() if ev.created_at else None,
+            "agent": ev.agent_id or "ORCHESTRATOR",
+            "goal": ev.decision_summary or ev.strategy or "Strategic Action",
+            "capability": ev.tool_name or ev.action_type or "reasoning",
+            "selectedTool": ev.tool_name or ev.command or "reasoning",
+            "reason": ev.decision_summary,
+            "result": ev.result or ev.stdout[:200] or "SUCCESS",
+            "confidence": 90,
+            "model": ev.model or "FORGE Router",
+            "challengeId": challenge_id
+        })
+
+    # Check live blackboard execution history if active
+    try:
+        from backend.agents.swarm_orchestrator import swarm_orchestrator
+        if challenge_id in swarm_orchestrator.active_swarms:
+            board = swarm_orchestrator.active_swarms[challenge_id]
+            for idx, item in enumerate(board.execution_history):
+                decisions.append({
+                    "id": f"live-dec-{idx}-{item.get('ts', '')}",
+                    "timestamp": item.get("ts") or "Just now",
+                    "agent": item.get("agent", "SWARM_WORKER"),
+                    "goal": item.get("note") or f"Executed {item.get('command', '')[:50]}",
+                    "capability": "execution",
+                    "selectedTool": item.get("command", "")[:40],
+                    "result": (item.get("output") or "")[:200],
+                    "confidence": 95,
+                    "model": "Swarm Worker",
+                    "challengeId": challenge_id
+                })
+    except Exception:
+        pass
+
+    return {"challenge_id": challenge_id, "decisions": decisions}
+
 
 @router.delete("/challenges/{challenge_id}")
 async def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
@@ -646,7 +739,31 @@ def save_writeup_endpoint(challenge_id: str, req: SaveWriteupRequest,
 
 @router.get("/targets")
 def list_targets(db: Session = Depends(get_db)):
-    return db.query(TargetProfileModel).all()
+    targets = db.query(TargetProfileModel).all()
+    out = []
+    for t in targets:
+        svcs = t.expected_services or []
+        if not svcs:
+            svcs = [{"port": 80, "proto": "tcp", "service": "HTTP", "version": "Target Server"}]
+        techs = getattr(t, "technologies", None) or ["Linux", "HTTP"]
+        addr_hist = getattr(t, "address_history", None) or [t.current_address]
+        disc_method = getattr(t, "discovery_method", None) or "FORGE Auto Ingest"
+        last_ver = t.last_verified_at.isoformat() if t.last_verified_at else None
+        
+        out.append({
+            "id": t.id,
+            "challenge_id": t.challenge_id,
+            "current_address": t.current_address,
+            "hostname": t.hostname or t.current_address,
+            "expected_services": svcs,
+            "technologies": techs,
+            "address_history": addr_hist,
+            "discovery_method": disc_method,
+            "verification_status": t.verification_status,
+            "last_verified_at": last_ver
+        })
+    return out
+
 
 @router.get("/targets/{target_id}")
 def get_target(target_id: str, db: Session = Depends(get_db)):
@@ -1084,13 +1201,34 @@ async def privilege_decision(req: PrivilegeDecisionRequest, db: Session = Depend
 # ----------------------------------------------------
 
 @router.get("/providers")
-def get_providers():
+def get_providers(db: Session = Depends(get_db)):
     from backend.providers.quota_manager import quota_manager
     in_claude_window = quota_manager.is_in_claude_allowed_window()
     next_batch_str = quota_manager.get_next_batch_time_str()
 
+    # Pre-aggregate usage counts and last errors per provider
+    usage_counts = {}
+    last_errors = {}
+    try:
+        from sqlalchemy import func
+        counts = db.query(ProviderUsageModel.provider_name, func.count(ProviderUsageModel.id)).group_by(ProviderUsageModel.provider_name).all()
+        usage_counts = {pname: cnt for pname, cnt in counts}
+
+        err_rows = (db.query(ProviderUsageModel)
+                    .filter(ProviderUsageModel.success == False)
+                    .order_by(ProviderUsageModel.timestamp.desc())
+                    .all())
+        for er in err_rows:
+            if er.provider_name not in last_errors:
+                last_errors[er.provider_name] = f"Last failure at {er.timestamp.strftime('%H:%M:%S')}" if er.timestamp else "Request error"
+    except Exception as e:
+        logger.debug(f"[get_providers] DB aggregate skip: {e}")
+
+    # Derive fallback priorities from router routing map order
+    priority_order = model_router.DEFAULT_ROUTING_MAP.get("general_reasoning", [])
+
     provider_list = []
-    for p in model_router.providers.values():
+    for idx, p in enumerate(model_router.providers.values()):
         models_under_provider = [m for m, (pname, _) in model_router.MODEL_PROVIDER_MAP.items() if pname == p.name]
         is_quota_limited = any(quota_manager.is_quota_limited_model(m) for m in models_under_provider)
         
@@ -1103,6 +1241,11 @@ def get_providers():
         elif p.name == "agentrouter_codex":
             quota_label = "∞ Always Available (No Limit)"
 
+        # Fallback priority index (1-based index in router priority list, or default)
+        priority = (priority_order.index(p.name) + 1) if p.name in priority_order else (idx + 10)
+        req_count = usage_counts.get(p.name, getattr(p, "request_count", 0))
+        err_msg = last_errors.get(p.name, getattr(p, "last_error", "None"))
+
         provider_list.append({
             "name": p.name,
             "is_paid": p.is_paid,
@@ -1112,9 +1255,13 @@ def get_providers():
             "quota": quota_label,
             "is_quota_limited": is_quota_limited,
             "in_batch_window": in_claude_window if is_quota_limited else True,
-            "transport": "CLI" if "agentrouter" in p.name else "API"
+            "transport": "CLI" if "agentrouter" in p.name else "API",
+            "requests": req_count,
+            "last_error": err_msg,
+            "fallback_priority": priority
         })
     return provider_list
+
 
 @router.get("/providers/health")
 def get_providers_health():

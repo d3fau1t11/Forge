@@ -78,6 +78,9 @@ export interface Challenge {
   duration_seconds?: number;
   missionPlan?: MissionPlan;
   mission_plan?: MissionPlan;
+  candidates?: FlagCandidate[];
+  derivedArtifacts?: DerivedArtifact[];
+  decisions?: AiDecision[];
 }
 
 export interface Target {
@@ -230,3 +233,26 @@ export interface WorkflowNode {
   description: string;
   evidenceId?: string;
 }
+
+export interface FlagCandidate {
+  flag: string;
+  worker?: string;
+  source?: string;
+  timestamp?: string;
+  verified?: boolean;
+}
+
+export interface DerivedArtifact {
+  path?: string;
+  filename?: string;
+  original_path?: string;
+  artifact_type?: string;
+  encoding?: string;
+  size_bytes?: number;
+  mime_type?: string;
+  status?: string;
+  preview?: string;
+  worker_id?: string;
+  timestamp?: string;
+}
+

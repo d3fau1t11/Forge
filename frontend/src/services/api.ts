@@ -159,6 +159,25 @@ export class ApiService {
     return await res.json();
   }
 
+  public async getChallengeCandidates(challengeId: string) {
+    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/candidates`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async getChallengeDerivedArtifacts(challengeId: string) {
+    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/derived-artifacts`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  public async getChallengeDecisions(challengeId: string) {
+    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/decisions`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+
   // ----------------------------------------------------
   // TARGETS
   // ----------------------------------------------------

@@ -120,306 +120,483 @@ export default function App() {
   const [rootRequests, setRootRequests] = useState<RootPermissionRequest[]>([]);
   const [knowledgeRefreshTrigger, setKnowledgeRefreshTrigger] = useState(0);
 
+  const activeChallengeRef = useRef<Challenge | null>(activeChallenge);
+  useEffect(() => {
+    activeChallengeRef.current = activeChallenge;
+  }, [activeChallenge]);
+
+  const fetchActiveChallengeData = async (challengeId: string) => {
+    if (!challengeId) return;
+    try {
+      const [candResp, artResp, decResp] = await Promise.all([
+        apiService.getChallengeCandidates(challengeId).catch(() => ({ candidates: [] })),
+        apiService.getChallengeDerivedArtifacts(challengeId).catch(() => ({ artifacts: [] })),
+        apiService.getChallengeDecisions(challengeId).catch(() => ({ decisions: [] }))
+      ]);
+
+      const cands = candResp.candidates || [];
+      const arts = artResp.artifacts || [];
+      const decs = decResp.decisions || [];
+
+      setChallenges((prev) =>
+        prev.map((c) =>
+          c.id === challengeId
+            ? {
+                ...c,
+                candidates: cands,
+                derivedArtifacts: arts,
+                decisions: decs.length > 0 ? decs : c.decisions
+              }
+            : c
+        )
+      );
+
+      setActiveChallenge((prev) => {
+        if (prev && prev.id === challengeId) {
+          return {
+            ...prev,
+            candidates: cands,
+            derivedArtifacts: arts,
+            decisions: decs.length > 0 ? decs : prev.decisions
+          };
+        }
+        return prev;
+      });
+
+      if (decs.length > 0) {
+        setDecisions((prev) => {
+          const existingIds = new Set(prev.map((d) => d.id));
+          const newItems = decs.filter((d: any) => !existingIds.has(d.id));
+          return newItems.length > 0 ? [...newItems, ...prev] : prev;
+        });
+      }
+    } catch (e) {
+      console.debug('Scoped challenge resync skip:', e);
+    }
+  };
+
+  useEffect(() => {
+    if (activeChallenge?.id) {
+      fetchActiveChallengeData(activeChallenge.id);
+    }
+  }, [activeChallenge?.id]);
+
   useEffect(() => {
     fetchBackendData();
 
-    // Setup live WebSocket listener
+    // Setup live WebSocket listener with automatic reconnection & resync
     let ws: WebSocket | null = null;
-    try {
-      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsHost = window.location.host || 'localhost:8000';
-      ws = new WebSocket(`${wsProtocol}//${wsHost}/ws/events`);
+    let reconnectTimer: any = null;
 
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.event === 'RUN_STARTED') {
-            setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
-            );
-            setActiveChallenge((prev) => (prev && prev.id === data.challenge_id ? { ...prev, status: 'RUNNING' } : prev));
-          } else if (data.event === 'PLAN_GENERATED' || data.event === 'PLAN_UPDATED') {
-            setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, missionPlan: data.plan, mission_plan: data.plan } : c))
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id ? { ...prev, missionPlan: data.plan, mission_plan: data.plan } : prev
-            );
-          } else if (data.event === 'STRATEGIC_REVIEW_TRIGGERED') {
-            setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, missionPlan: data.plan, mission_plan: data.plan } : c))
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id ? { ...prev, missionPlan: data.plan, mission_plan: data.plan } : prev
-            );
-          } else if (data.event === 'PROGRESS_UPDATED') {
-            setChallenges((prev) =>
-              prev.map((c) =>
-                c.id === data.challenge_id
+    const connectWs = () => {
+      try {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsHost = window.location.host || 'localhost:8000';
+        ws = new WebSocket(`${wsProtocol}//${wsHost}/ws/events`);
+
+        ws.onopen = () => {
+          // Trigger a resync on successful connection/reconnection to fill any gaps
+          fetchBackendData();
+          if (activeChallengeRef.current?.id) {
+            fetchActiveChallengeData(activeChallengeRef.current.id);
+          }
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.event === 'RUN_STARTED') {
+              setChallenges((prev) =>
+                prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
+              );
+              setActiveChallenge((prev) => (prev && prev.id === data.challenge_id ? { ...prev, status: 'RUNNING' } : prev));
+            } else if (data.event === 'PLAN_GENERATED' || data.event === 'PLAN_UPDATED') {
+              setChallenges((prev) =>
+                prev.map((c) => (c.id === data.challenge_id ? { ...c, missionPlan: data.plan, mission_plan: data.plan } : c))
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id ? { ...prev, missionPlan: data.plan, mission_plan: data.plan } : prev
+              );
+            } else if (data.event === 'STRATEGIC_REVIEW_TRIGGERED') {
+              setChallenges((prev) =>
+                prev.map((c) => (c.id === data.challenge_id ? { ...c, missionPlan: data.plan, mission_plan: data.plan } : c))
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id ? { ...prev, missionPlan: data.plan, mission_plan: data.plan } : prev
+              );
+            } else if (data.event === 'PROGRESS_UPDATED') {
+              setChallenges((prev) =>
+                prev.map((c) =>
+                  c.id === data.challenge_id
+                    ? {
+                        ...c,
+                        progress: data.progress,
+                        status: 'RUNNING',
+                        durationSeconds: data.duration_seconds ?? c.durationSeconds,
+                        duration_seconds: data.duration_seconds ?? c.duration_seconds
+                      }
+                    : c
+                )
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id
                   ? {
-                      ...c,
+                      ...prev,
                       progress: data.progress,
                       status: 'RUNNING',
-                      durationSeconds: data.duration_seconds ?? c.durationSeconds,
-                      duration_seconds: data.duration_seconds ?? c.duration_seconds
+                      durationSeconds: data.duration_seconds ?? prev.durationSeconds,
+                      duration_seconds: data.duration_seconds ?? prev.duration_seconds
                     }
-                  : c
-              )
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id
-                ? {
-                    ...prev,
-                    progress: data.progress,
-                    status: 'RUNNING',
-                    durationSeconds: data.duration_seconds ?? prev.durationSeconds,
-                    duration_seconds: data.duration_seconds ?? prev.duration_seconds
-                  }
-                : prev
-            );
-          } else if (data.event === 'LOG_OUTPUT') {
-            const newLog: TerminalLog = {
-              id: `log-${Date.now()}-${Math.random()}`,
-              timestamp: data.timestamp || new Date().toLocaleTimeString(),
-              command: data.command,
-              output: data.output,
-              exitCode: data.exit_code,
-              duration: '1.2s',
-              type: 'EXECUTION',
-              challengeId: data.challenge_id
-            };
-            setTerminalLogs((prev) => [newLog, ...prev]);
-          } else if (data.event === 'AI_DECISION') {
-            const newDecision: AiDecision = {
-              id: `dec-${Date.now()}`,
-              timestamp: new Date().toLocaleTimeString(),
-              agent: data.agent,
-              goal: data.goal,
-              capability: data.capability,
-              selectedTool: data.capability,
-              result: data.result,
-              confidence: data.confidence || 90,
-              costUsd: 0,
-              model: data.model,
-              challengeId: data.challenge_id
-            };
-            setDecisions((prev) => [newDecision, ...prev]);
-          } else if (data.event === 'AI_PROMPT_TRANSPARENCY') {
-            const newDecision: AiDecision = {
-              id: `dec-prompt-${Date.now()}`,
-              timestamp: new Date().toLocaleTimeString(),
-              agent: 'ORCHESTRATOR',
-              goal: `Turn #${data.turn} AI Prompt & Strategy Generation`,
-              capability: '1-command-react-loop',
-              selectedTool: 'bash_cli',
-              result: data.raw_response,
-              confidence: 95,
-              costUsd: 0,
-              model: data.model,
-              challengeId: data.challenge_id
-            };
-            setDecisions((prev) => [newDecision, ...prev]);
-          } else if (data.event === 'EVIDENCE_CAPTURED') {
-            const newEv: EvidenceItem = {
-              id: data.evidence_id || `ev-${Date.now()}`,
-              timestamp: new Date().toLocaleTimeString(),
-              agent: 'RECON',
-              type: data.type || 'command_output',
-              source: data.source || 'tool',
-              description: data.description || 'Captured Telemetry',
-              content: `Evidence generated for challenge ${data.challenge_id}`,
-              hash: `sha256-${Date.now()}`,
-              challengeId: data.challenge_id
-            };
-            setEvidenceList((prev) => [newEv, ...prev]);
-          } else if (data.event === 'FLAG_CAPTURED') {
-            setChallenges((prev) =>
-              prev.map((c) =>
-                c.id === data.challenge_id
+                  : prev
+              );
+            } else if (data.event === 'LOG_OUTPUT') {
+              const newLog: TerminalLog = {
+                id: `log-${Date.now()}-${Math.random()}`,
+                timestamp: data.timestamp || new Date().toLocaleTimeString(),
+                command: data.command,
+                output: data.output,
+                exitCode: data.exit_code,
+                duration: '1.2s',
+                type: 'EXECUTION',
+                challengeId: data.challenge_id
+              };
+              setTerminalLogs((prev) => [newLog, ...prev]);
+            } else if (data.event === 'AI_DECISION') {
+              const newDecision: AiDecision = {
+                id: `dec-${Date.now()}`,
+                timestamp: new Date().toLocaleTimeString(),
+                agent: data.agent,
+                goal: data.goal,
+                capability: data.capability,
+                selectedTool: data.capability,
+                result: data.result,
+                confidence: data.confidence || 90,
+                costUsd: 0,
+                model: data.model,
+                challengeId: data.challenge_id
+              };
+              setDecisions((prev) => [newDecision, ...prev]);
+            } else if (data.event === 'AI_PROMPT_TRANSPARENCY') {
+              const newDecision: AiDecision = {
+                id: `dec-prompt-${Date.now()}`,
+                timestamp: new Date().toLocaleTimeString(),
+                agent: 'ORCHESTRATOR',
+                goal: `Turn #${data.turn} AI Prompt & Strategy Generation`,
+                capability: '1-command-react-loop',
+                selectedTool: 'bash_cli',
+                result: data.raw_response,
+                confidence: 95,
+                costUsd: 0,
+                model: data.model,
+                challengeId: data.challenge_id
+              };
+              setDecisions((prev) => [newDecision, ...prev]);
+            } else if (data.event === 'FLAG_CANDIDATE') {
+              const newCand = {
+                flag: data.candidate || data.flag || '',
+                worker: data.worker || data.worker_id || 'SWARM',
+                source: data.source || 'unverified_regex',
+                timestamp: new Date().toLocaleTimeString()
+              };
+              if (newCand.flag) {
+                setChallenges((prev) =>
+                  prev.map((c) =>
+                    c.id === data.challenge_id
+                      ? { ...c, candidates: [...(c.candidates || []), newCand] }
+                      : c
+                  )
+                );
+                setActiveChallenge((prev) =>
+                  prev && prev.id === data.challenge_id
+                    ? { ...prev, candidates: [...(prev.candidates || []), newCand] }
+                    : prev
+                );
+              }
+            } else if (data.event === 'ENCODED_ARTIFACT_RECONSTRUCTED') {
+              const newArt = {
+                filename: data.filename || data.derived_path?.split(/[\/\\]/).pop() || 'reconstructed_artifact',
+                path: data.derived_path || data.path || '',
+                artifact_type: data.artifact_type || 'binary',
+                size_bytes: data.size_bytes || 0,
+                status: data.status || 'RECONSTRUCTED',
+                preview: data.preview || '',
+                worker_id: data.worker || data.worker_id || 'RECONSTRUCT',
+                timestamp: new Date().toLocaleTimeString()
+              };
+              setChallenges((prev) =>
+                prev.map((c) =>
+                  c.id === data.challenge_id
+                    ? { ...c, derivedArtifacts: [...(c.derivedArtifacts || []), newArt] }
+                    : c
+                )
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id
+                  ? { ...prev, derivedArtifacts: [...(prev.derivedArtifacts || []), newArt] }
+                  : prev
+              );
+            } else if (data.event === 'SWARM_BLACKBOARD_UPDATE') {
+              if (data.challenge_id) {
+                fetchActiveChallengeData(data.challenge_id);
+              }
+            } else if (data.event === 'MEMORY_RETRIEVED') {
+              const newDec: AiDecision = {
+                id: `mem-ret-${Date.now()}`,
+                timestamp: new Date().toLocaleTimeString(),
+                agent: 'MEMORY_ENGINE',
+                goal: `Retrieved experience memory context for strategy`,
+                capability: 'experience_memory',
+                selectedTool: 'experience_vault',
+                result: `Memory Context: ${data.memory_context || data.query || 'Tactical guidance applied'}`,
+                confidence: 90,
+                challengeId: data.challenge_id
+              };
+              setDecisions((prev) => [newDec, ...prev]);
+            } else if (data.event === 'MEMORY_LEARNED') {
+              setKnowledgeRefreshTrigger((prev) => prev + 1);
+            } else if (data.event === 'TARGET_CHANGED') {
+              const newAddr = data.command || data.target || data.current_address;
+              if (newAddr) {
+                setTargets((prev) =>
+                  prev.map((t) =>
+                    t.challengeId === data.challenge_id || t.currentIp === newAddr
+                      ? {
+                          ...t,
+                          currentIp: newAddr,
+                          addressHistory: Array.from(new Set([...t.addressHistory, newAddr]))
+                        }
+                      : t
+                  )
+                );
+                setActiveChallenge((prev) =>
+                  prev && prev.id === data.challenge_id ? { ...prev, target: newAddr } : prev
+                );
+              }
+            } else if (data.event === 'EVIDENCE_CAPTURED') {
+              const newEv: EvidenceItem = {
+                id: data.evidence_id || `ev-${Date.now()}`,
+                timestamp: new Date().toLocaleTimeString(),
+                agent: 'RECON',
+                type: data.type || 'command_output',
+                source: data.source || 'tool',
+                description: data.description || 'Captured Telemetry',
+                content: `Evidence generated for challenge ${data.challenge_id}`,
+                hash: `sha256-${Date.now()}`,
+                challengeId: data.challenge_id
+              };
+              setEvidenceList((prev) => [newEv, ...prev]);
+            } else if (data.event === 'FLAG_CAPTURED') {
+              setChallenges((prev) =>
+                prev.map((c) =>
+                  c.id === data.challenge_id
+                    ? {
+                        ...c,
+                        flagStatus: 'CAPTURED',
+                        flag: data.flag,
+                        status: 'COMPLETED',
+                        progress: 100,
+                        durationSeconds: data.duration_seconds ?? c.durationSeconds,
+                        duration_seconds: data.duration_seconds ?? c.duration_seconds
+                      }
+                    : c
+                )
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id
                   ? {
-                      ...c,
+                      ...prev,
                       flagStatus: 'CAPTURED',
                       flag: data.flag,
                       status: 'COMPLETED',
                       progress: 100,
-                      durationSeconds: data.duration_seconds ?? c.durationSeconds,
-                      duration_seconds: data.duration_seconds ?? c.duration_seconds
+                      durationSeconds: data.duration_seconds ?? prev.durationSeconds,
+                      duration_seconds: data.duration_seconds ?? prev.duration_seconds
                     }
-                  : c
-              )
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id
-                ? {
-                    ...prev,
-                    flagStatus: 'CAPTURED',
-                    flag: data.flag,
-                    status: 'COMPLETED',
-                    progress: 100,
-                    durationSeconds: data.duration_seconds ?? prev.durationSeconds,
-                    duration_seconds: data.duration_seconds ?? prev.duration_seconds
-                  }
-                : prev
-            );
-            const newFinding: Finding = {
-              id: `find-${Date.now()}`,
-              title: `Flag Extracted`,
-              severity: 'CRITICAL',
-              endpoint: 'Target System',
-              status: 'VERIFIED',
-              description: `Successfully extracted flag: ${data.flag}`,
-              challengeId: data.challenge_id
-            };
-            setFindings((prev) => [newFinding, ...prev]);
-          } else if (data.event === 'RUN_COMPLETED') {
-            setChallenges((prev) =>
-              prev.map((c) =>
-                c.id === data.challenge_id
+                  : prev
+              );
+              const newFinding: Finding = {
+                id: `find-${Date.now()}`,
+                title: `Flag Extracted`,
+                severity: 'CRITICAL',
+                endpoint: 'Target System',
+                status: 'VERIFIED',
+                description: `Successfully extracted flag: ${data.flag}`,
+                challengeId: data.challenge_id
+              };
+              setFindings((prev) => [newFinding, ...prev]);
+            } else if (data.event === 'RUN_COMPLETED') {
+              setChallenges((prev) =>
+                prev.map((c) =>
+                  c.id === data.challenge_id
+                    ? {
+                        ...c,
+                        status: 'COMPLETED',
+                        progress: 100,
+                        durationSeconds: data.duration_seconds ?? c.durationSeconds,
+                        duration_seconds: data.duration_seconds ?? c.duration_seconds
+                      }
+                    : c
+                )
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id
                   ? {
-                      ...c,
+                      ...prev,
                       status: 'COMPLETED',
                       progress: 100,
-                      durationSeconds: data.duration_seconds ?? c.durationSeconds,
-                      duration_seconds: data.duration_seconds ?? c.duration_seconds
+                      durationSeconds: data.duration_seconds ?? prev.durationSeconds,
+                      duration_seconds: data.duration_seconds ?? prev.duration_seconds
                     }
-                  : c
-              )
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id
-                ? {
-                    ...prev,
-                    status: 'COMPLETED',
-                    progress: 100,
-                    durationSeconds: data.duration_seconds ?? prev.durationSeconds,
-                    duration_seconds: data.duration_seconds ?? prev.duration_seconds
-                  }
-                : prev
-            );
-          } else if (data.event === 'RUN_AWAITING_FLAG') {
-            setChallenges((prev) =>
-              prev.map((c) =>
-                c.id === data.challenge_id
+                  : prev
+              );
+            } else if (data.event === 'RUN_AWAITING_FLAG') {
+              setChallenges((prev) =>
+                prev.map((c) =>
+                  c.id === data.challenge_id
+                    ? {
+                        ...c,
+                        status: 'AWAITING_FLAG',
+                        durationSeconds: data.duration_seconds ?? c.durationSeconds,
+                        duration_seconds: data.duration_seconds ?? c.duration_seconds
+                      }
+                    : c
+                )
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id
                   ? {
-                      ...c,
+                      ...prev,
                       status: 'AWAITING_FLAG',
-                      durationSeconds: data.duration_seconds ?? c.durationSeconds,
-                      duration_seconds: data.duration_seconds ?? c.duration_seconds
+                      durationSeconds: data.duration_seconds ?? prev.durationSeconds,
+                      duration_seconds: data.duration_seconds ?? prev.duration_seconds
                     }
-                  : c
-              )
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id
-                ? {
-                    ...prev,
-                    status: 'AWAITING_FLAG',
-                    durationSeconds: data.duration_seconds ?? prev.durationSeconds,
-                    duration_seconds: data.duration_seconds ?? prev.duration_seconds
-                  }
-                : prev
-            );
-          } else if (data.event === 'AGENT_UPDATE') {
-            if (Array.isArray(data.agents) && data.agents.length > 0) {
-              setAgents(mapSwarmAgents(data.agents));
+                  : prev
+              );
+            } else if (data.event === 'AGENT_UPDATE') {
+              if (Array.isArray(data.agents) && data.agents.length > 0) {
+                setAgents(mapSwarmAgents(data.agents));
+              }
+            } else if (data.event === 'RUN_STALLED' || data.event === 'RUN_FAILED') {
+              setChallenges((prev) =>
+                prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'FAILED' } : c))
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id ? { ...prev, status: 'FAILED' } : prev
+              );
+            } else if (data.event === 'RUN_PAUSED' || data.event === 'CHALLENGE_PAUSED') {
+              setChallenges((prev) =>
+                prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'PAUSED' } : c))
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id ? { ...prev, status: 'PAUSED' } : prev
+              );
+            } else if (data.event === 'CHECKPOINT_REACHED') {
+              setCheckpointReports((prev) => ({
+                ...prev,
+                [data.challenge_id]: { cycle: data.cycle, report: data.report || '' }
+              }));
+              setChallenges((prev) =>
+                prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'WAITING_FOR_USER' } : c))
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id ? { ...prev, status: 'WAITING_FOR_USER' } : prev
+              );
+              try { soundEngine.playWarning(); } catch (e) {}
+            } else if (data.event === 'CHECKPOINT_RESUMED' || data.event === 'CHECKPOINT_PARSE_ERROR') {
+              setCheckpointReports((prev) => {
+                const next = { ...prev };
+                delete next[data.challenge_id];
+                return next;
+              });
+              setChallenges((prev) =>
+                prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id ? { ...prev, status: 'RUNNING' } : prev
+              );
+            } else if (data.event === 'KILL_SWITCH_ACTIVATED') {
+              setKillSwitchActive(true);
+              setShowModalKillSwitch(true);
+            } else if (data.event === 'PACKAGE_INSTALL_REQUEST') {
+              setPackageRequests((prev) => [
+                ...prev.filter((r) => r.requestId !== data.request_id),
+                {
+                  requestId: data.request_id,
+                  challengeId: data.challenge_id,
+                  challengeName: data.challenge_name || 'Autonomous Target',
+                  packageName: data.package_name,
+                  importName: data.import_name,
+                  errorSnippet: data.error_snippet || '',
+                  timestamp: data.timestamp || new Date().toLocaleTimeString()
+                }
+              ]);
+            } else if (data.event === 'PACKAGE_INSTALL_RESULT') {
+              setPackageRequests((prev) => prev.filter((r) => r.requestId !== data.request_id));
+            } else if (data.event === 'ROOT_PERMISSION_REQUEST') {
+              setRootRequests((prev) => [
+                ...prev.filter((r) => r.requestId !== data.request_id),
+                {
+                  requestId: data.request_id,
+                  challengeId: data.challenge_id,
+                  challengeName: data.challenge_name || 'Autonomous Agent',
+                  command: data.command,
+                  reason: data.reason || 'Superuser privilege required',
+                  errorSnippet: data.error_snippet || '',
+                  timestamp: data.timestamp || new Date().toLocaleTimeString()
+                }
+              ]);
+            } else if (data.event === 'ROOT_PERMISSION_RESULT') {
+              setRootRequests((prev) => prev.filter((r) => r.requestId !== data.request_id));
+            } else if (data.type === 'PROVIDER_FALLBACK_TRIGGERED' || data.event === 'PROVIDER_FALLBACK_TRIGGERED') {
+              const fallbackData = data.data || data;
+              setFallbackNotice({
+                failedProvider: fallbackData.failed_provider || 'Provider',
+                reason: fallbackData.reason || 'Quota Exceeded / Endpoint Error',
+                nextProvider: fallbackData.next_provider || 'Auto-Fallback Candidate',
+                timestamp: new Date().toLocaleTimeString()
+              });
+              try { soundEngine.playWarning(); } catch (e) {}
+              setTimeout(() => setFallbackNotice(null), 8000);
+            } else if (data.event === 'KNOWLEDGE_UPDATED' || data.event === 'KNOWLEDGE_BULK_INGESTED') {
+              setKnowledgeRefreshTrigger((prev) => prev + 1);
             }
-          } else if (data.event === 'RUN_STALLED' || data.event === 'RUN_FAILED') {
-            setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'FAILED' } : c))
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id ? { ...prev, status: 'FAILED' } : prev
-            );
-          } else if (data.event === 'RUN_PAUSED' || data.event === 'CHALLENGE_PAUSED') {
-            setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'PAUSED' } : c))
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id ? { ...prev, status: 'PAUSED' } : prev
-            );
-          } else if (data.event === 'CHECKPOINT_REACHED') {
-            // Hard-pause HITL checkpoint: store the consolidated report + flip status.
-            setCheckpointReports((prev) => ({
-              ...prev,
-              [data.challenge_id]: { cycle: data.cycle, report: data.report || '' }
-            }));
-            setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'WAITING_FOR_USER' } : c))
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id ? { ...prev, status: 'WAITING_FOR_USER' } : prev
-            );
-            try { soundEngine.playWarning(); } catch (e) {}
-          } else if (data.event === 'CHECKPOINT_RESUMED' || data.event === 'CHECKPOINT_PARSE_ERROR') {
-            setCheckpointReports((prev) => {
-              const next = { ...prev };
-              delete next[data.challenge_id];
-              return next;
-            });
-            setChallenges((prev) =>
-              prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
-            );
-            setActiveChallenge((prev) =>
-              prev && prev.id === data.challenge_id ? { ...prev, status: 'RUNNING' } : prev
-            );
-          } else if (data.event === 'KILL_SWITCH_ACTIVATED') {
-            setKillSwitchActive(true);
-            setShowModalKillSwitch(true);
-          } else if (data.event === 'PACKAGE_INSTALL_REQUEST') {
-            setPackageRequests((prev) => [
-              ...prev.filter((r) => r.requestId !== data.request_id),
-              {
-                requestId: data.request_id,
-                challengeId: data.challenge_id,
-                challengeName: data.challenge_name || 'Autonomous Target',
-                packageName: data.package_name,
-                importName: data.import_name,
-                errorSnippet: data.error_snippet || '',
-                timestamp: data.timestamp || new Date().toLocaleTimeString()
-              }
-            ]);
-          } else if (data.event === 'PACKAGE_INSTALL_RESULT') {
-            setPackageRequests((prev) => prev.filter((r) => r.requestId !== data.request_id));
-          } else if (data.event === 'ROOT_PERMISSION_REQUEST') {
-            setRootRequests((prev) => [
-              ...prev.filter((r) => r.requestId !== data.request_id),
-              {
-                requestId: data.request_id,
-                challengeId: data.challenge_id,
-                challengeName: data.challenge_name || 'Autonomous Agent',
-                command: data.command,
-                reason: data.reason || 'Superuser privilege required',
-                errorSnippet: data.error_snippet || '',
-                timestamp: data.timestamp || new Date().toLocaleTimeString()
-              }
-            ]);
-          } else if (data.event === 'ROOT_PERMISSION_RESULT') {
-            setRootRequests((prev) => prev.filter((r) => r.requestId !== data.request_id));
-          } else if (data.type === 'PROVIDER_FALLBACK_TRIGGERED' || data.event === 'PROVIDER_FALLBACK_TRIGGERED') {
-            const fallbackData = data.data || data;
-            setFallbackNotice({
-              failedProvider: fallbackData.failed_provider || 'Provider',
-              reason: fallbackData.reason || 'Quota Exceeded / Endpoint Error',
-              nextProvider: fallbackData.next_provider || 'Auto-Fallback Candidate',
-              timestamp: new Date().toLocaleTimeString()
-            });
-            try { soundEngine.playWarning(); } catch (e) {}
-            setTimeout(() => setFallbackNotice(null), 8000);
-          } else if (data.event === 'KNOWLEDGE_UPDATED' || data.event === 'KNOWLEDGE_BULK_INGESTED') {
-            setKnowledgeRefreshTrigger((prev) => prev + 1);
+          } catch (err) {
+            console.error('WS Parse Error', err);
           }
-        } catch (err) {
-          console.error('WS Parse Error', err);
-        }
-      };
-    } catch (e) {
-      console.log('WS Connection notice: local fallback mode active.');
-    }
+        };
+
+        ws.onclose = () => {
+          reconnectTimer = setTimeout(connectWs, 3000);
+        };
+      } catch (e) {
+        reconnectTimer = setTimeout(connectWs, 5000);
+      }
+    };
+
+    connectWs();
 
     return () => {
       if (ws) ws.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
     };
   }, []);
+
+  // Periodic lightweight resync while any challenge is RUNNING / AWAITING_FLAG
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const isAnyRunning = challenges.some(
+        (c) => c.status === 'RUNNING' || c.status === 'AWAITING_FLAG' || c.status === 'WAITING'
+      );
+      if (isAnyRunning) {
+        fetchBackendData();
+        if (activeChallengeRef.current?.id) {
+          fetchActiveChallengeData(activeChallengeRef.current.id);
+        }
+      }
+    }, 10000);
+
+    return () => clearInterval(interval);
+  }, [challenges]);
 
   const fetchBackendData = async () => {
     try {
@@ -433,7 +610,7 @@ export default function App() {
           target: c.target_address || c.target || '127.0.0.1',
           status: c.status,
           progress: c.progress || 0,
-          lastActivity: 'Just now',
+          lastActivity: c.updated_at ? new Date(c.updated_at).toLocaleTimeString() : (c.started_at ? new Date(c.started_at).toLocaleTimeString() : 'Just now'),
           flagStatus: c.flagStatus || c.flag_status || 'UNFOUND',
           flag: c.flag,
           description: c.description,
@@ -458,15 +635,15 @@ export default function App() {
         const formattedT: Target[] = backendTargets.map((t: any) => ({
           id: t.id,
           currentIp: t.current_address,
-          hostname: t.hostname,
-          services: [
-            { port: 80, proto: 'tcp', service: 'HTTP', version: 'Target Server' }
-          ],
-          technologies: ['Linux'],
-          status: t.verification_status.toUpperCase(),
-          discoveryMethod: 'FORGE Auto Ingest',
-          lastVerified: 'Just now',
-          addressHistory: [t.current_address],
+          hostname: t.hostname || t.current_address,
+          services: Array.isArray(t.expected_services) && t.expected_services.length > 0
+            ? t.expected_services.map((s: any) => (typeof s === 'string' ? { port: 80, proto: 'tcp', service: s } : s))
+            : [{ port: 80, proto: 'tcp', service: 'HTTP', version: 'Target Server' }],
+          technologies: Array.isArray(t.technologies) && t.technologies.length > 0 ? t.technologies : ['Linux', 'HTTP'],
+          status: (t.verification_status || 'unverified').toUpperCase(),
+          discoveryMethod: t.discovery_method || 'FORGE Auto Ingest',
+          lastVerified: t.last_verified_at ? new Date(t.last_verified_at).toLocaleTimeString() : 'Just now',
+          addressHistory: Array.isArray(t.address_history) && t.address_history.length > 0 ? t.address_history : [t.current_address],
           challengeId: t.challenge_id
         }));
         setTargets(formattedT);
@@ -484,7 +661,19 @@ export default function App() {
 
       const backendTools = await apiService.getTools();
       if (Array.isArray(backendTools) && backendTools.length > 0) {
-        setTools(backendTools);
+        setTools(
+          backendTools.map((t: any) => ({
+            name: t.name || t.tool_name || 'tool',
+            capabilityCategory: Array.isArray(t.capabilities) && t.capabilities.length > 0 ? t.capabilities[0] : (t.capabilityCategory || 'general'),
+            binary: t.binary || t.name || 'binary',
+            installed: t.installed ?? true,
+            version: t.version || '1.0',
+            status: t.status || 'READY',
+            executionCount: Number(t.executionCount ?? t.execution_count) || 0,
+            lastExecution: t.lastExecution || t.last_execution || 'Idle',
+            fallbackTool: t.fallbackTool || t.fallback_tool || 'bash'
+          }))
+        );
       }
 
       const backendProviders = await apiService.getProviders();
@@ -498,10 +687,10 @@ export default function App() {
           model: p.default_model || p.model || p.name || '',
           transport: p.transport === 'CLI' ? 'CLI' : 'API',
           latency: p.latency_ms ? `${p.latency_ms}ms` : '—',
-          requests: 0,
+          requests: Number(p.requests) || 0,
           quota: p.quota || '—',
-          lastError: 'None',
-          fallbackPriority: 0
+          lastError: p.last_error || 'None',
+          fallbackPriority: Number(p.fallback_priority) || 0
         })));
       }
 
@@ -520,6 +709,7 @@ export default function App() {
       console.log('Backend sync active.');
     }
   };
+
 
   const handleCreateChallenge = async (newCh: {
     name: string;

@@ -468,9 +468,35 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
                       VIEW TODO LIST →
                     </button>
                   </div>
+                {challenge.candidates && challenge.candidates.length > 0 && (
+                  <div className="bg-amber-950/40 p-4 rounded-lg border-2 border-amber-500/70 space-y-2.5 shadow-[0_0_20px_rgba(245,158,11,0.15)]">
+                    <div className="flex items-center justify-between">
+                      <span className="text-amber-400 font-bold text-xs uppercase flex items-center space-x-1.5">
+                        <AlertTriangle className="w-4 h-4 text-amber-400" />
+                        <span>FLAG CANDIDATES DISCOVERED (UNVERIFIED)</span>
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-amber-900 border border-amber-600 text-amber-300 text-[10px] font-bold">
+                        {challenge.candidates.length} CANDIDATE(S)
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-300">
+                      Unverified candidate strings extracted by swarm workers during execution. Pending verifier assertion:
+                    </p>
+                    <div className="space-y-1.5">
+                      {challenge.candidates.map((cand, idx) => (
+                        <div key={idx} className="flex items-center justify-between p-2.5 bg-obsidian-950 rounded border border-amber-800/60 font-mono text-xs">
+                          <code className="text-amber-300 font-bold select-all">{cand.flag}</code>
+                          <span className="text-[10px] text-slate-400">
+                            Worker: <span className="text-cyan-400">{cand.worker || 'SWARM'}</span> {cand.source ? `(${cand.source})` : ''}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 )}
               </div>
             </div>
+
 
             <div className="glass-panel border border-slate-800 p-5 rounded-xl space-y-4">
               <h2 className="font-display font-bold text-slate-100 uppercase border-b border-slate-800 pb-2 text-sm neon-text-cyan">
@@ -871,6 +897,52 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
       {/* TAB 5: EVIDENCE */}
       {activeTab === 'evidence' && (
         <div className="space-y-4 font-mono text-xs">
+          {challenge.derivedArtifacts && challenge.derivedArtifacts.length > 0 && (
+            <div className="glass-panel border-2 border-cyber-cyan/60 rounded-xl p-5 space-y-3 shadow-[0_0_20px_rgba(0,240,255,0.15)]">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                <span className="font-display font-bold text-cyber-cyan text-sm uppercase flex items-center space-x-2">
+                  <FileCode className="w-4 h-4 text-cyber-cyan" />
+                  <span>RECONSTRUCTED ENCODED ARTIFACTS</span>
+                </span>
+                <span className="px-2.5 py-0.5 rounded bg-cyan-950 border border-cyber-cyan text-cyber-cyan text-[10px] font-bold">
+                  {challenge.derivedArtifacts.length} RECONSTRUCTED
+                </span>
+              </div>
+              <p className="text-slate-300 text-[11px]">
+                Deterministic reconstruction output extracted from encoded tool results/attachments and escalated for specialist analysis:
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                {challenge.derivedArtifacts.map((art, idx) => (
+                  <div key={idx} className="p-3 bg-obsidian-950 rounded-lg border border-slate-800 space-y-2">
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="font-bold text-cyber-cyan truncate" title={art.filename || art.path}>
+                        {art.filename || 'reconstructed_file'}
+                      </span>
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-950 border border-emerald-800 text-emerald-400 font-bold uppercase">
+                        {art.status || 'RECONSTRUCTED'}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-400 space-y-1">
+                      <div>Path: <code className="text-slate-200 select-all">{art.path || 'derived_artifacts/'}</code></div>
+                      <div>Type: <span className="text-purple-300 font-bold">{art.artifact_type || 'binary'}</span> {art.size_bytes ? `(${art.size_bytes} bytes)` : ''}</div>
+                      {art.worker_id && <div>Reconstructed By: <span className="text-cyan-300 font-bold">{art.worker_id}</span></div>}
+                    </div>
+                    {art.preview && art.preview.startsWith('data:image/') && (
+                      <div className="mt-2 border border-slate-800 rounded p-1 bg-black">
+                        <img src={art.preview} alt={art.filename} className="max-h-36 object-contain mx-auto rounded" />
+                      </div>
+                    )}
+                    {art.preview && !art.preview.startsWith('data:image/') && (
+                      <pre className="mt-2 p-2 bg-obsidian-900 rounded border border-slate-800 text-[10px] text-slate-300 max-h-24 overflow-y-auto whitespace-pre-wrap select-all">
+                        {art.preview.slice(0, 300)}
+                      </pre>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {evidenceList.map((e) => (
             <div key={e.id} className="glass-panel border border-slate-800 rounded-xl p-5 space-y-3">
               <div className="flex justify-between border-b border-slate-800 pb-2">
@@ -887,6 +959,7 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
           ))}
         </div>
       )}
+
 
       {/* TAB 6: FINDINGS */}
       {activeTab === 'findings' && (

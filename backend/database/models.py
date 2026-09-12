@@ -69,7 +69,10 @@ class TargetProfileModel(Base):
     challenge_id = Column(String, ForeignKey("challenges.id"), nullable=False)
     current_address = Column(String, nullable=False) # IP, URL, domain
     hostname = Column(String, nullable=True)
-    expected_services = Column(JSON, default=list) # e.g. ["http", "ssh"]
+    expected_services = Column(JSON, default=list) # e.g. ["http", "ssh"] or [{port, proto, service, version}]
+    technologies = Column(JSON, default=list) # e.g. ["Linux", "HTTP"]
+    address_history = Column(JSON, default=list) # e.g. ["127.0.0.1"]
+    discovery_method = Column(String, default="FORGE Auto Ingest")
     verification_status = Column(String, default="unverified") # verified, changed, stale
     last_verified_at = Column(DateTime, default=datetime.utcnow)
     
