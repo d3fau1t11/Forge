@@ -23,6 +23,7 @@ timeout · cancellation · unrecoverable failure · max turns.
 from __future__ import annotations
 
 import os
+import sys
 import time
 import logging
 from dataclasses import dataclass, field
@@ -38,7 +39,7 @@ from backend.agent_runtime.session import AgentSession, SessionManager, session_
 from backend.agent_runtime.trajectory import TrajectoryStore, trajectory_store
 from backend.agent_runtime.verifier import (
     FlagSource, FlagStatus, FlagVerifier, AnswerStatus, AnswerResolver, VerifierAgent,
-    AnswerCandidate, AnswerSource,
+    AnswerCandidate, AnswerSource, AnswerType,
 )
 
 logger = logging.getLogger("forge.agent_runtime.runtime")
@@ -80,6 +81,18 @@ class RealToolExecutor:
             return ExecResult.from_tool_result(r)
 
         if action.type == ActionType.PYTHON_SCRIPT:
+            import ast
+            try:
+                ast.parse(action.script)
+            except SyntaxError as se:
+                return ExecResult(
+                    command=action.display(),
+                    status="FAILED",
+                    stderr=f"SyntaxError in generated Python script at line {se.lineno}, col {se.offset}: {se.msg}\n  {se.text or ''}",
+                    exit_code=-1,
+                    execution_failure=True,
+                    failure_category="SYNTAX_ERROR",
+                )
             script_path = os.path.join(cwd or ".", "solve.py")
             try:
                 with open(script_path, "w", encoding="utf-8") as f:
@@ -87,10 +100,15 @@ class RealToolExecutor:
             except Exception as e:
                 return ExecResult(status="FAILED", stderr=f"Failed to write solve.py: {e}",
                                   exit_code=-1, execution_failure=True, failure_category="IO")
-            from backend.execution.backends.local import _resolve_python
-            py_bin = _resolve_python() or "python3"
+            # Use sys.executable to guarantee the current Python interpreter is used.
+            # On Windows, shutil.which("python") may point to a zero-byte Store stub.
+            py_bin = sys.executable
+            if not py_bin or not os.path.exists(py_bin):
+                from backend.execution.backends.local import _resolve_python
+                resolved = _resolve_python()
+                py_bin = resolved or "python"
             r = await self.tool_manager.execute_raw_command(
-                f"{py_bin} {script_path}", cwd=cwd, timeout_seconds=timeout_seconds,
+                f'"{py_bin}" "{script_path}"', cwd=cwd, timeout_seconds=timeout_seconds,
                 canonical_target=canonical_target, stdin=(action.stdin or None))
             return ExecResult.from_tool_result(r)
 
@@ -389,23 +407,13 @@ class AgentRuntime:
                     authoritative=False,
                 )
 
-                if verdict.status == AnswerStatus.VERIFIED:
+                if verdict.status == AnswerStatus.VERIFIED or verdict.status == AnswerStatus.RESOLVED:
                     state.set_verified_flag(verdict.candidate)
                     state.record_success(decision.strategy or action.display())
-                    self._record(session, "FLAG_VERIFIED", result=AnswerStatus.VERIFIED.value,
-                                 decision_summary=f"Answer VERIFIED from command output: {verdict.candidate}")
+                    event_type = "FLAG_VERIFIED" if verdict.status == AnswerStatus.VERIFIED else "ANSWER_RESOLVED"
+                    self._record(session, event_type, result=verdict.status.value,
+                                 decision_summary=f"Answer {verdict.status.value} from command output: {verdict.candidate}")
                     self.sessions.complete(session, outcome="success", verified_flag=verdict.candidate)
-                    self._learn(session, "success", all_retrieved_ids)
-                    return self._result(session, "COMPLETED", turns,
-                                        f"Answer {verdict.status.value} from real command output.")
-
-                elif verdict.status == AnswerStatus.RESOLVED:
-                    if verdict.candidate not in state.flag_candidates:
-                        state.flag_candidates.append(verdict.candidate)
-                    state.record_success(decision.strategy or action.display())
-                    self._record(session, "ANSWER_RESOLVED", result=AnswerStatus.RESOLVED.value,
-                                 decision_summary=f"Answer RESOLVED from command output: {verdict.candidate} (confidence={verdict.confidence})")
-                    self.sessions.complete(session, outcome="resolved", verified_flag=None)
                     self._learn(session, "success", all_retrieved_ids)
                     return self._result(session, "COMPLETED", turns,
                                         f"Answer {verdict.status.value} from real command output.")

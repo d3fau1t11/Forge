@@ -20,6 +20,7 @@ python / python3:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import sys
 from typing import Optional

@@ -579,6 +579,15 @@ class VerifierAgent:
             cmd = cand_obj.provenance.get("command", command)
             succ = cand_obj.provenance.get("action_succeeded", action_succeeded)
             worker_id = cand_obj.worker_id
+        elif isinstance(candidate, AnswerVerdict):
+            ver_obj = candidate
+            tctx = dict(task_context or {})
+            ev = {**(ver_obj.evidence or {}), **(evidence or {})}
+            val = ver_obj.candidate
+            src = self.resolver.normalize_source(getattr(ver_obj, "source", source if source != AnswerSource.UNKNOWN else AnswerSource.TOOL_OUTPUT))
+            cmd = command
+            succ = action_succeeded
+            worker_id = ""
         else:
             val = str(candidate)
             src = self.resolver.normalize_source(source)

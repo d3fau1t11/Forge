@@ -36,6 +36,11 @@ _FILE_SAVED_RE = re.compile(
     r"(?:saved to|written to|downloaded to|output written to|saving to|-o)\s+['\"]?([A-Za-z0-9._/\\\-]+)",
     re.IGNORECASE,
 )
+_SOURCE_FILE_RE = re.compile(
+    r'(?:open|fopen|file_get_contents|read_file|include|require|include_once|require_once)\s*\(\s*[\'"]([A-Za-z0-9._/\\\-]+)[\'"]',
+    re.IGNORECASE,
+)
+_SESSION_RE = re.compile(r'\[SESSION:\s*([A-Za-z0-9_\-]+)\]')
 _CRED_RE = re.compile(r"(?:password|passwd|pwd|secret|api[_-]?key)\s*[:=]\s*['\"]?([^\s'\"]{3,80})", re.IGNORECASE)
 _BASIC_AUTH_RE = re.compile(r"\b([A-Za-z0-9_.\-]{2,40}):([^\s:@/]{3,40})@")
 
@@ -97,6 +102,8 @@ class Observation:
     new_services: List[str] = field(default_factory=list)
     new_technologies: List[str] = field(default_factory=list)
     new_files: List[str] = field(default_factory=list)
+    file_provenance: Dict[str, str] = field(default_factory=dict)
+    interactive_sessions: List[str] = field(default_factory=list)
     new_credentials: List[str] = field(default_factory=list)
     new_vulnerabilities: List[str] = field(default_factory=list)
     new_headers: Dict[str, str] = field(default_factory=dict)
@@ -143,9 +150,20 @@ class ObservationEngine:
         # ── Technologies ──
         obs.new_technologies = _detect_technologies(combined)
 
-        # ── Files (explicit creation phrasing only) ──
+        # ── Files (explicit creation phrasing only -> LOCAL_FILE) ──
         for m in _FILE_SAVED_RE.findall(combined):
             obs.new_files.append(m)
+            obs.file_provenance[m] = "LOCAL_FILE"
+
+        # ── Source code file references -> SOURCE_CODE_REFERENCE ──
+        for m in _SOURCE_FILE_RE.findall(combined):
+            obs.new_files.append(m)
+            if m not in obs.file_provenance:
+                obs.file_provenance[m] = "SOURCE_CODE_REFERENCE"
+
+        # ── Interactive Sessions ──
+        for sess in _SESSION_RE.findall(combined):
+            obs.interactive_sessions.append(sess)
 
         # ── Credentials ──
         for m in _CRED_RE.findall(combined):

@@ -41,6 +41,14 @@ class EvidenceType(str, Enum):
     TARGET_MISMATCH = "target_mismatch"  # the provided target is the wrong kind (Phase 4.x §11)
 
 
+class ProvenanceType(str, Enum):
+    LOCAL_FILE = "LOCAL_FILE"
+    REMOTE_FILE = "REMOTE_FILE"
+    REMOTE_PROCESS_STATE = "REMOTE_PROCESS_STATE"
+    SOURCE_CODE_REFERENCE = "SOURCE_CODE_REFERENCE"
+    OBSERVED_OUTPUT = "OBSERVED_OUTPUT"
+
+
 @dataclass
 class Evidence:
     """One structured discovery published on the bus."""
@@ -60,6 +68,7 @@ class Evidence:
     related_endpoint: str = ""
     related_technology: str = ""
     related_vulnerability: str = ""
+    provenance: str = ProvenanceType.OBSERVED_OUTPUT.value
     # Phase 5 §6 — how trustworthy this discovery is. Auto-classified from source /
     # type / confidence / tags when not set explicitly. Not persisted as a column
     # (it is deterministically re-derivable), so no schema migration is required.

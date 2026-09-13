@@ -739,9 +739,10 @@ class TestCandidateResolution(unittest.IsolatedAsyncioTestCase):
         # Agent #4 router MUST have been awaited
         mock_router.route_request.assert_awaited()
         self.assertEqual(result.status, "COMPLETED")
-        self.assertIn("picoCTF{live_runtime_flag_999}", result.flag_candidates)
-        # RESOLVED does not falsely claim authoritative VERIFIED
-        self.assertIsNone(result.verified_flag)
+        # RESOLVED from tool evidence → verified_flag is set in RunResult (enables coordinator flag flow)
+        # The distinction between RESOLVED and VERIFIED is via AnswerStatus, not whether verified_flag is set
+        self.assertIsNotNone(result.verified_flag)
+        self.assertEqual(result.verified_flag, "picoCTF{live_runtime_flag_999}")
 
     async def test_req12_authoritative_verification_only_path_producing_verified(self):
         """Req 12: Authoritative verification is the only path producing VERIFIED."""

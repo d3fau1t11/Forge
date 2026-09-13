@@ -90,6 +90,8 @@ class MissionState:
     # ── Discovered knowledge ────────────────────────────────────────────────
     known_endpoints: List[str] = field(default_factory=list)
     known_files: List[str] = field(default_factory=list)
+    file_provenance: Dict[str, str] = field(default_factory=dict)
+    interactive_sessions: List[str] = field(default_factory=list)
     known_services: List[str] = field(default_factory=list)
     technologies: List[str] = field(default_factory=list)
     credentials: List[str] = field(default_factory=list)
@@ -138,6 +140,11 @@ class MissionState:
         for f in getattr(obs, "new_files", []) or []:
             if _add_unique(self.known_files, f):
                 delta.new_files.append(f)
+        for f, prov in (getattr(obs, "file_provenance", {}) or {}).items():
+            self.file_provenance[f] = prov
+        for sess in getattr(obs, "interactive_sessions", []) or []:
+            if _add_unique(self.interactive_sessions, sess):
+                delta.notes.append(f"session:{sess}")
         for cred in getattr(obs, "new_credentials", []) or []:
             if _add_unique(self.credentials, cred):
                 delta.new_credentials.append(cred)

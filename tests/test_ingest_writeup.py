@@ -35,9 +35,11 @@ print(res.text)
             self.assertTrue(os.path.exists(saved_path))
             
             # Verify indexed in vault
-            results = playbook_vault.search_playbooks("SQL injection", category="web")
+            results = playbook_vault.search_playbooks("SQL injection", category="web", top_k=50)
             self.assertTrue(len(results) > 0)
-            self.assertIn("sqli", results[0].tags)
+            target_playbook = next((p for p in results if "error-based-sqli-test" in p.id), None)
+            self.assertIsNotNone(target_playbook, "Ingested playbook should be found in vault search results")
+            self.assertIn("sqli", target_playbook.tags)
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)

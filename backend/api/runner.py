@@ -49,7 +49,14 @@ class WorkflowRunner:
         coordinated = engine in ("coord", "team", "supervisor", "coordinated", "swarm_coord")
 
         try:
-            loop = asyncio.get_running_loop()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
 
             from backend.database.session import SessionLocal
             from backend.database.models import ChallengeModel

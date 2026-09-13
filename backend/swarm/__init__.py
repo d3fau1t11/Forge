@@ -29,7 +29,7 @@ from backend.swarm.candidates import CandidateGenerator, technique_to_action_typ
 from backend.swarm.progress import (
     MissionBudget, ProgressLedger, StopCondition, evaluate_stop, knowledge_fingerprint,
 )
-from backend.swarm.evidence import Evidence, EvidenceType, EvidenceBus
+from backend.swarm.evidence import Evidence, EvidenceType, ProvenanceType, EvidenceBus
 from backend.swarm.tasks import Task, TaskStatus, TERMINAL_STATUSES
 from backend.swarm.scheduler import TaskScheduler
 from backend.swarm.mission import SharedMissionState
@@ -53,7 +53,7 @@ __all__ = [
     "ActionScorer", "ScoreWeights", "mission_uncertainty", "information_gain_for",
     "CandidateGenerator", "technique_to_action_type",
     "MissionBudget", "ProgressLedger", "StopCondition", "evaluate_stop", "knowledge_fingerprint",
-    "Evidence", "EvidenceType", "EvidenceBus",
+    "Evidence", "EvidenceType", "ProvenanceType", "EvidenceBus",
     "Task", "TaskStatus", "TERMINAL_STATUSES",
     "TaskScheduler",
     "SharedMissionState",

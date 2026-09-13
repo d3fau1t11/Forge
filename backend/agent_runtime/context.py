@@ -227,10 +227,20 @@ class ContextBuilder:
             return f"  {label}: {', '.join(str(x) for x in shown)}{more}"
 
         lines = [f"MISSION STATE (phase={state.phase}, progress={state.progress}%):"]
+        file_prov = getattr(state, "file_provenance", {}) or {}
+        all_files = list(getattr(state, "known_files", []) or [])
+        local_files = [f for f in all_files if file_prov.get(f) == "LOCAL_FILE"]
+        remote_or_src_files = [f for f in all_files if file_prov.get(f) in ("SOURCE_CODE_REFERENCE", "REMOTE_FILE", "REMOTE_PROCESS_STATE")]
+        other_files = [f for f in all_files if f not in local_files and f not in remote_or_src_files]
+
         for label, items in [
             ("Endpoints", state.known_endpoints), ("Services", state.known_services),
             ("Technologies", state.technologies), ("Vulnerabilities", state.vulnerabilities),
-            ("Credentials", state.credentials), ("Files", state.known_files),
+            ("Credentials", state.credentials),
+            ("Local files (workspace)", local_files),
+            ("Remote / source-referenced files (NOT in local workspace)", remote_or_src_files),
+            ("Files", other_files),
+            ("Active interactive sessions", getattr(state, "interactive_sessions", [])),
             ("Flag candidates", state.flag_candidates),
         ]:
             row = _fmt(label, items)
