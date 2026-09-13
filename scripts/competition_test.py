@@ -210,18 +210,40 @@ async def run_competition_simulation():
         workflow_runner.start_run(run.id, ch.id, "http://127.0.0.1:8888/", engine_type="coord")
         results["WorkflowRunner"] = "PASS" if run.id in workflow_runner.active_runs else "FAIL"
 
-        # Await/observe the actual production task started by WorkflowRunner (no duplicate loop)
+        # Await the actual production task and verify its outcome (not just lifecycle state)
         runner_task = workflow_runner.tasks.get(run.id)
-        if runner_task:
+        coord_result = None
+        coord_verdict = "NO_TASK"
+        if runner_task is not None:
             try:
-                await asyncio.wait_for(asyncio.shield(runner_task), timeout=3.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
+                coord_result = await asyncio.wait_for(asyncio.shield(runner_task), timeout=10.0)
+                coord_verdict = "COMPLETED"
+            except asyncio.TimeoutError:
+                coord_verdict = "TIMEOUT"
+            except asyncio.CancelledError:
+                coord_verdict = "CANCELLED"
+            except Exception as exc:
+                coord_verdict = f"EXCEPTION:{type(exc).__name__}"
 
-        # Verify that the selected production path reached modern coordinator machinery
-        coord_active = run.id in workflow_runner.active_runs
-        results["AgentRuntime"] = "PASS" if (coord_active and runner_task is not None) else "FAIL"
-        results["Orchestrator"] = "PASS" if coord_active else "FAIL"
+        # Verify that the coordinator actually executed
+        if coord_verdict == "COMPLETED" and coord_result is not None:
+            # Task finished — MissionResult.status is one of: COMPLETED, PAUSED, FAILED, CANCELLED
+            mission_status = getattr(coord_result, "status", None)
+            runtime_ok = mission_status in ("COMPLETED", "PAUSED", "FAILED", "CANCELLED")
+        elif coord_verdict == "TIMEOUT":
+            # Task still running — verify the coordinator's run() actually started by
+            # checking for COORD_PLAN trajectory events it records on entry (line 221 of
+            # coordinator.py). This is execution proof, not mere task-creation proof.
+            coord_events = (db.query(TrajectoryEventModel)
+                            .filter(TrajectoryEventModel.run_id == run.id,
+                                    TrajectoryEventModel.event_type == "COORD_PLAN")
+                            .count())
+            runtime_ok = coord_events > 0
+        else:
+            runtime_ok = False
+
+        results["AgentRuntime"] = "PASS" if runtime_ok else f"FAIL (task={coord_verdict})"
+        results["Orchestrator"] = "PASS" if runtime_ok else f"FAIL (task={coord_verdict})"
         metrics["model_calls"] += 1
         metrics["tool_calls"] += 1
 
