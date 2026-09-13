@@ -47,7 +47,7 @@ if line1 == "CHALLENGER_ONE":
     sys.stdout.flush()
     line2 = sys.stdin.readline().strip()
     if line2 == "CODE_42":
-        sys.stdout.write("STAGE_TWO_CLEARED\\nResult: TEST_FLAG{interactive_dialogue_success}\\n")
+        sys.stdout.write("STAGE_TWO_CLEARED\\nResult: FLAG{interactive_dialogue_success}\\n")
         sys.stdout.flush()
     else:
         sys.stdout.write("FAILED_STAGE_TWO\\n")
@@ -117,7 +117,8 @@ class TestInteractiveAgentIntegration(unittest.TestCase):
             )
             self.assertEqual(snr_res.status, "SUCCESS")
             self.assertIn("STAGE_TWO_CLEARED", snr_res.stdout)
-            self.assertIn("TEST_FLAG{interactive_dialogue_success}", snr_res.stdout)
+            self.assertIn("FLAG{interactive_dialogue_success}", snr_res.stdout)
+
 
             # Close the session
             close_res: ToolExecutionResult = await tool_manager.execute_raw_command(
@@ -235,14 +236,144 @@ class TestInteractiveAgentIntegration(unittest.TestCase):
     def test_one_shot_commands_unaffected(self):
         """Verify standard one-shot commands still execute normally through ExecutionService."""
         async def scenario():
-            res = await tool_manager.execute_raw_command(f'"{PY}" -c "print(12345 * 2)"')
+            res = await tool_manager.execute_raw_command(f'{PY} -c "print(12345 * 2)"')
             self.assertEqual(res.status, "SUCCESS")
             self.assertIn("24690", res.stdout.strip())
             self.assertEqual(res.capability, "custom_command")
         _run(scenario())
 
     # ---------------------------------------------------------------------- #
-    # 6. Decision parser recognizes interactive commands
+    # 6. Autonomous Interactive-Pivot Multi-Turn Dialogue Integration
+    # ---------------------------------------------------------------------- #
+
+    def test_autonomous_interactive_dialogue_pivot_e2e(self):
+        """Verify autonomous decision/action layer selects persistent interaction,
+        retains the session ID across turns, completes sequential dialogue, and cleans up.
+        """
+        async def scenario():
+            from backend.agent_runtime import AgentRuntime, session_manager
+            from backend.agent_runtime.decision import ProviderCompletion
+
+            # Track session key across turns in scripted model gateway
+            extracted_session_key = []
+
+            class ScriptedDialogueProvider:
+                def __init__(self, script_path):
+                    self.script_path = script_path
+                    self.turn = 0
+
+                async def complete(self, *, prompt, system_instruction="", capability="general_reasoning",
+                                   urgency="normal", reasoning_depth="fast"):
+                    # Turn 0: Model observes interactive target requirement and chooses interactive_open
+                    if self.turn == 0:
+                        self.turn += 1
+                        return ProviderCompletion(
+                            content=f'interactive_open "{PY}" "{self.script_path}"',
+                            provider_name="test_scripted_gw",
+                            model_name="test_dialogue_model"
+                        )
+
+                    # Turn 1: Model sees initial prompt, extracts session key, sends Stage 1 input
+                    if self.turn == 1:
+                        self.turn += 1
+                        # Extract session key from prompt / state block.
+                        # ContextBuilder renders "Active interactive sessions: <key>" in
+                        # the state block; also check raw "[SESSION: <key>]" from stdout
+                        # in case the trajectory includes it.
+                        import re as _re
+                        _sess_m = _re.search(r'\[SESSION:\s*([A-Za-z0-9_\-]+)\]', prompt)
+                        if not _sess_m:
+                            _sess_m = _re.search(r'interactive sessions?:\s*([A-Za-z0-9_\-]+)', prompt, _re.IGNORECASE)
+                        if _sess_m:
+                            extracted_session_key.append(_sess_m.group(1))
+                        key = extracted_session_key[-1] if extracted_session_key else "sess-fail"
+                        return ProviderCompletion(
+                            content=f"interactive_send {key} CHALLENGER_ONE",
+                            provider_name="test_scripted_gw",
+                            model_name="test_dialogue_model"
+                        )
+
+                    # Turn 2: Read response after Stage 1
+                    if self.turn == 2:
+                        self.turn += 1
+                        key = extracted_session_key[-1] if extracted_session_key else "sess-fail"
+                        return ProviderCompletion(
+                            content=f"interactive_read {key}",
+                            provider_name="test_scripted_gw",
+                            model_name="test_dialogue_model"
+                        )
+
+                    # Turn 3: Send Stage 2 secret code to the SAME session
+                    if self.turn == 3:
+                        self.turn += 1
+                        key = extracted_session_key[-1]
+                        return ProviderCompletion(
+                            content=f"interactive_send {key} CODE_42",
+                            provider_name="test_scripted_gw",
+                            model_name="test_dialogue_model"
+                        )
+
+                    # Turn 4: Read final flag from session
+                    if self.turn == 4:
+                        self.turn += 1
+                        key = extracted_session_key[-1]
+                        return ProviderCompletion(
+                            content=f"interactive_read {key}",
+                            provider_name="test_scripted_gw",
+                            model_name="test_dialogue_model"
+                        )
+
+                    # Turn 5: Close interactive session cleanly
+                    if self.turn == 5:
+                        self.turn += 1
+                        key = extracted_session_key[-1]
+                        return ProviderCompletion(
+                            content=f"interactive_close {key}",
+                            provider_name="test_scripted_gw",
+                            model_name="test_dialogue_model"
+                        )
+
+                    return ProviderCompletion(
+                        content="Done.",
+                        provider_name="test_scripted_gw",
+                        model_name="test_dialogue_model"
+                    )
+
+            provider = ScriptedDialogueProvider(self.script_path)
+            tool_executor = RealToolExecutor(tool_manager=tool_manager)
+            runtime = AgentRuntime(
+                tool_executor=tool_executor,
+                provider_gateway=provider,
+                learn_on_completion=False,
+            )
+
+            sess = session_manager.create(
+                challenge_id="interactive_dialogue_chal",
+                objective="Interact with dialogue challenge service and extract flag",
+                target_scope="local_interactive",
+                agent_id="interactive_specialist",
+                engine="runtime"
+            )
+
+            result = await runtime.run(session=sess, max_turns=6)
+
+            # 1. Verify multi-turn execution completed
+            self.assertIn(result.status, ("COMPLETED", "MAX_TURNS"))
+            self.assertGreaterEqual(len(extracted_session_key), 1)
+            sess_key = extracted_session_key[0]
+
+            # 2. Verify session was retained across turns and final flag observed
+            # RunResult carries flag_candidates directly (no .session attribute).
+            self.assertIn("FLAG{interactive_dialogue_success}", result.flag_candidates)
+
+
+            # 3. Verify session was cleanly closed and no orphan process remains
+            self.assertIsNone(interactive_manager.get(sess_key))
+
+        _run(scenario())
+
+    # ---------------------------------------------------------------------- #
+    # 7. Decision parser recognizes interactive commands
     # ---------------------------------------------------------------------- #
 
     def test_decision_parser_recognizes_interactive_commands(self):
@@ -268,7 +399,7 @@ class TestInteractiveAgentIntegration(unittest.TestCase):
         self.assertEqual(action.command, "interactive_send_and_read abc-123 my_response")
 
     # ---------------------------------------------------------------------- #
-    # 7. Invalid/stale session handling
+    # 8. Invalid/stale session handling
     # ---------------------------------------------------------------------- #
 
     def test_invalid_session_returns_clean_failure(self):

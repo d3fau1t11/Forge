@@ -44,8 +44,10 @@ class RepetitionKind(str, Enum):
 
 
 _HTTP_TOOLS = {"curl", "wget", "http", "https", "httpie"}
+_STATEFUL_STREAM_TOOLS = {"interactive_open", "interactive_read", "interactive_send", "interactive_send_and_read", "interactive_close"}
 _WS = re.compile(r"\s+")
 _METHOD_RE = re.compile(r"-X\s+([A-Za-z]+)|--request\s+([A-Za-z]+)", re.IGNORECASE)
+
 
 
 @dataclass
@@ -147,6 +149,10 @@ class RepetitionDetector:
     # ------------------------------------------------------------------ #
 
     def classify(self, action_text: str) -> RepetitionKind:
+        tokens = (action_text or "").strip().split()
+        if tokens and tokens[0].lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1] in _STATEFUL_STREAM_TOOLS:
+            return RepetitionKind.NONE
+
         norm = self.normalize(action_text)
         if not norm:
             return RepetitionKind.NONE
@@ -173,6 +179,8 @@ class RepetitionDetector:
         norm = self.normalize(action_text)
         sem = self.semantic_signature(action_text)
         hm = self.host_method_signature(action_text)
+        tokens = (action_text or "").strip().split()
+        is_stateful = bool(tokens and tokens[0].lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1] in _STATEFUL_STREAM_TOOLS)
 
         report = RepetitionReport()
 
@@ -190,7 +198,7 @@ class RepetitionDetector:
         else:
             self.no_progress_streak += 1
 
-        already_seen = any(e.normalized == norm for e in self._history)
+        already_seen = not is_stateful and any(e.normalized == norm for e in self._history)
         if already_seen:
             self.repeat_streak += 1
             if report.kind == RepetitionKind.NONE:
@@ -198,6 +206,7 @@ class RepetitionDetector:
                 report.detail = "Exact action repeated."
         else:
             self.repeat_streak = 0
+
 
         self._history.append(_Entry(norm, sem, hm, failed, failure_category, novel))
 

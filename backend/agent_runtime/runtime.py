@@ -190,6 +190,30 @@ class AgentRuntime:
         checkpoint_every: int = 5,
     ) -> RunResult:
         """Execute the mission loop for *session* until a terminal condition."""
+        try:
+            return await self._run_loop(
+                session,
+                max_turns=max_turns,
+                max_seconds=max_seconds,
+                cwd=cwd,
+                cancel_check=cancel_check,
+                timeout_seconds_per_command=timeout_seconds_per_command,
+                checkpoint_every=checkpoint_every,
+            )
+        finally:
+            await self._cleanup_interactive_sessions(session.state)
+
+    async def _run_loop(
+        self,
+        session: AgentSession,
+        *,
+        max_turns: int = 40,
+        max_seconds: Optional[float] = None,
+        cwd: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        timeout_seconds_per_command: int = 120,
+        checkpoint_every: int = 5,
+    ) -> RunResult:
         state = session.state
         recovery = RecoveryEngine()
         repetition = RepetitionDetector()
@@ -206,13 +230,12 @@ class AgentRuntime:
 
         self.sessions.save(session, status="RUNNING")
 
-        # (Step 13) PLAN event — marks the mission objective at the start of the loop,
-        # matching the documented flow (CREATE SESSION → PLAN → agent requests command).
         self._record(session, "PLAN", strategy=state.phase,
                      decision_summary=f"Objective: {state.current_objective}")
 
         while True:
-            # ── Termination: cancellation ──
+
+
             if cancel_check and cancel_check():
                 self.sessions.pause(session)
                 return self._result(session, "CANCELLED", turns, "Cancelled by operator/kill-switch.")
@@ -407,8 +430,10 @@ class AgentRuntime:
                     authoritative=False,
                 )
 
-                if verdict.status == AnswerStatus.VERIFIED or verdict.status == AnswerStatus.RESOLVED:
+                if verdict.status in (AnswerStatus.VERIFIED, AnswerStatus.RESOLVED):
                     state.set_verified_flag(verdict.candidate)
+                    if verdict.candidate not in state.flag_candidates:
+                        state.flag_candidates.append(verdict.candidate)
                     state.record_success(decision.strategy or action.display())
                     event_type = "FLAG_VERIFIED" if verdict.status == AnswerStatus.VERIFIED else "ANSWER_RESOLVED"
                     self._record(session, event_type, result=verdict.status.value,
@@ -417,6 +442,7 @@ class AgentRuntime:
                     self._learn(session, "success", all_retrieved_ids)
                     return self._result(session, "COMPLETED", turns,
                                         f"Answer {verdict.status.value} from real command output.")
+
 
                 elif verdict.status == AnswerStatus.CANDIDATE:
                     if verdict.candidate not in state.flag_candidates:
@@ -485,6 +511,19 @@ class AgentRuntime:
                 self.sessions.checkpoint(session, last_action=action.display()[:120])
 
     # ------------------------------------------------------------------ #
+
+
+    async def _cleanup_interactive_sessions(self, state: Any) -> None:
+        try:
+            from backend.execution.interactive import interactive_manager
+            for sk in list(getattr(state, "interactive_sessions", []) or []):
+                try:
+                    await interactive_manager.close(sk, reason="session_ended")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
     def _record(self, session: AgentSession, event_type: str, **kw) -> None:
         self.trajectory.record(

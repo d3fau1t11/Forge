@@ -165,7 +165,7 @@ class WorkflowRunner:
 
     def activate_kill_switch(self, run_id: Optional[str] = None):
         """Emergency Kill Switch - immediately halts autonomous operations."""
-        if run_id and run_id in self.kill_switches:
+        if run_id:
             self.kill_switches[run_id] = True
             if run_id in self.active_runs:
                 self.active_runs[run_id]["status"] = "CANCELLED"
@@ -182,5 +182,21 @@ class WorkflowRunner:
                 if rid in self.tasks and not self.tasks[rid].done():
                     self.tasks[rid].cancel()
             logger.warning("UNIVERSAL KILL SWITCH ACTIVATED - ALL RUNS HALTED.")
+
+    def deactivate_kill_switch(self, run_id: Optional[str] = None):
+        """Deactivate kill switch for a specific run or clear all."""
+        if run_id:
+            self.kill_switches[run_id] = False
+        else:
+            self.kill_switches.clear()
+
+    def reset(self):
+        """Reset runner state for clean test isolation."""
+        self.active_runs.clear()
+        self.kill_switches.clear()
+        for task in list(self.tasks.values()):
+            if not task.done():
+                task.cancel()
+        self.tasks.clear()
 
 workflow_runner = WorkflowRunner()

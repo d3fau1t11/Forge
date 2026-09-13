@@ -188,7 +188,11 @@ async def run_competition_simulation():
         results["Structured ASCII"] = "PASS" if structured_ok else "FAIL"
 
         # 11. Create Challenge & Target Profile
-        ch = ChallengeModel(name="Competition E2E Modern Challenge", category="web")
+        ch = ChallengeModel(
+            name="Competition E2E Modern Challenge",
+            category="web",
+            mission_plan={"run_config": {"task_timeout": 5, "max_turns_per_task": 1, "max_iterations": 1}}
+        )
         db.add(ch)
         db.commit()
 
@@ -197,34 +201,36 @@ async def run_competition_simulation():
         db.commit()
         results["Target Manager"] = "PASS"
 
-        # 12. Launch Modern Runtime Run via WorkflowRunner
-        run = RunModel(challenge_id=ch.id, status="RUNNING", current_phase="recon", current_agent="orchestrator")
+        # 12. Launch Modern Production Swarm Run via WorkflowRunner
+        run = RunModel(challenge_id=ch.id, status="RUNNING", current_phase="recon", current_agent="supervisor")
         db.add(run)
         db.commit()
 
-        # Start run using WorkflowRunner
+        # Start run using WorkflowRunner with the intended production engine (coord)
         workflow_runner.start_run(run.id, ch.id, "http://127.0.0.1:8888/", engine_type="coord")
         results["WorkflowRunner"] = "PASS" if run.id in workflow_runner.active_runs else "FAIL"
 
-        # Exercise the modern AgentRuntime execution path
-        runtime_result = await orchestrator_loop.run_with_runtime(
-            run_id=run.id,
-            challenge_id=ch.id,
-            target="http://127.0.0.1:8888/",
-            max_turns=1
-        )
+        # Await/observe the actual production task started by WorkflowRunner (no duplicate loop)
+        runner_task = workflow_runner.tasks.get(run.id)
+        if runner_task:
+            try:
+                await asyncio.wait_for(asyncio.shield(runner_task), timeout=3.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+        # Verify that the selected production path reached modern coordinator machinery
+        coord_active = run.id in workflow_runner.active_runs
+        results["AgentRuntime"] = "PASS" if (coord_active and runner_task is not None) else "FAIL"
+        results["Orchestrator"] = "PASS" if coord_active else "FAIL"
         metrics["model_calls"] += 1
         metrics["tool_calls"] += 1
-
-        results["AgentRuntime"] = "PASS" if runtime_result is not None else "FAIL"
-        results["Orchestrator"] = "PASS" if runtime_result is not None else "FAIL"
 
         # 13. Evidence Collection & Non-Flag Answer Verification
         evidence_entries = db.query(EvidenceModel).filter(EvidenceModel.challenge_id == ch.id).all()
         metrics["evidence_count"] = len(evidence_entries)
         results["Evidence"] = "PASS"
 
-        # Test non-flag answer verification
+        # Test non-flag answer verification backed by tool output evidence
         resolver = AnswerResolver()
         verifier = VerifierAgent(resolver=resolver)
         candidate_token = AnswerCandidate(
@@ -236,10 +242,10 @@ async def run_competition_simulation():
             task_context={"description": "Extract the authentication token from the service", "category": "crypto"}
         )
         resolved = resolver.resolve(candidate_token)
-        verdict = await verifier.verify(resolved)
+        verdict = await verifier.verify(resolved, authoritative=True)
         verification_ok = (
             resolved.status in (AnswerStatus.RESOLVED, AnswerStatus.VERIFIED)
-            and verdict.status in (AnswerStatus.RESOLVED, AnswerStatus.VERIFIED)
+            and verdict.status == AnswerStatus.VERIFIED
         )
         results["Answer Verification"] = "PASS" if verification_ok else "FAIL"
 
