@@ -28,7 +28,7 @@ class TestFoundation(unittest.TestCase):
                 capability="directory_enumeration"
             )
         response = asyncio.run(run_async())
-        self.assertIn(response.provider_name, ["groq", "cloudflare", "openrouter", "gemini", "nvidia", "agentrouter_claude_code", "agentrouter_codex", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "rapidapi_gpt5_nano", "mistral", "mistral_codestral", "xkiro", "xkiro_coder", "xkiro_planner", "none"])
+        self.assertIn(response.provider_name, ["groq", "cloudflare", "openrouter", "gemini", "nvidia", "agentrouter_claude_code", "agentrouter_codex", "rapidapi_gpt54_mini", "rapidapi_deepseek_v32", "rapidapi_gpt5_nano", "mistral", "mistral_codestral", "xkiro", "xkiro_coder", "xkiro_planner", "xkiro_mistral", "none"])
         self.assertTrue(len(response.content) > 0)
 
     def test_findings_schema_and_challenge_delete(self):

@@ -123,16 +123,33 @@ class ExperienceExtractor:
                 corpus_parts.append(out)
         evidence_text = "\n".join(p for p in corpus_parts if p)
 
-        clf = classify_technique(evidence_text, category)
+        # ── Split the trace into the winning chain vs failed attempts (§5) ──
+        chain, attempts, failed_techniques = self._split_trace(exec_history, flag, g)
+
+        # Build raw_commands using only the FIRST LINE of each command string.
+        # Multi-line commands (heredocs, inline Python cat-writes) embed file content
+        # in subsequent lines; those lines may contain technique-rule keywords (e.g.
+        # '<script>' in a print() call) that are NOT attack actions.
+        # The shell verb + flags always appear on line 0 — that is the reliable signal.
+        raw_commands = [
+            str(step.get("command", "")).strip().splitlines()[0].strip()
+            for step in exec_history
+            if str(step.get("command", "")).strip()
+        ]
+        raw_commands = [c for c in raw_commands if c]  # drop any blanks after split
+
+        clf = classify_technique(
+            evidence_text,
+            category,
+            commands=raw_commands,
+            winning_chain=chain,
+        )
         technique = clf["technique"]
         tags = clf["tags"]
         success_indicators = list(clf["success_indicators"])
 
         technologies = self._detect_technologies(evidence_text)
         vulnerabilities = [technique] if outcome == "success" else []
-
-        # ── Split the trace into the winning chain vs failed attempts (§5) ──
-        chain, attempts, failed_techniques = self._split_trace(exec_history, flag, g)
 
         commands_used = []
         for step in exec_history:

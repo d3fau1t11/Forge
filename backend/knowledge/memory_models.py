@@ -240,33 +240,91 @@ _CATEGORY_TAG_MAP: Dict[str, List[str]] = {
 }
 
 
-def classify_technique(evidence_text: str, category: str = "") -> Dict[str, Any]:
+def classify_technique(
+    evidence_text: str = "",
+    category: str = "",
+    *,
+    commands: Optional[List[str]] = None,
+    winning_chain: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Deterministically map observed evidence to a generalized technique + tags.
 
-    Uses scored ranking: count matching needles per rule, boost by category agreement.
+    Uses scored ranking:
+    1. Winning exploit chain (decisive commands that produced the flag) receives highest priority.
+    2. Agent commands (active actions) receive 3x weighting over passive output/text.
+    3. Distinct needle hits across evidence text provide base score.
+    4. Boost by category agreement (+5), penalize category disagreement (-2).
+    5. Tie-breaking prioritizes winning chain presence > command presence > total needle hits.
+
     Falls back to a category-scoped generic label when nothing specific matches.
     """
     low = (evidence_text or "").lower()
     cat = (category or "").lower().strip()
     cat_tags = set(_CATEGORY_TAG_MAP.get(cat, []))
 
-    best_score = 0
+    # For command-tier and winning-chain scoring, take only the first line of each
+    # command entry (stripping multi-line heredocs/inline script bodies so that file
+    # contents/comments with keywords do not masquerade as active command verbs).
+    cmds_low = [
+        (c or "").lower().splitlines()[0].strip()
+        for c in (commands or [])
+        if c and (c or "").strip()
+    ]
+    cmds_low = [c for c in cmds_low if c]
+    win_low = [
+        (c or "").lower().splitlines()[0].strip()
+        for c in (winning_chain or [])
+        if c and (c or "").strip()
+    ]
+    win_low = [w for w in win_low if w]
+
+    best_score_tuple = (-float("inf"), -float("inf"), -float("inf"), -float("inf"))
     best_rule = None
+
     for needles, label, tags, sigs, indicators in _TECHNIQUE_RULES:
-        hits = sum(1 for n in needles if n in low)
-        if hits == 0:
+        # Check needle matches in different tiers
+        text_hits = sum(1 for n in needles if n in low)
+        cmd_needle_hits = sum(1 for n in needles if any(n in c for c in cmds_low))
+        win_needle_hits = sum(1 for n in needles if any(n in w for w in win_low))
+
+        # Total distinct needle hits across all sources
+        total_needle_hits = sum(
+            1 for n in needles
+            if (n in low or any(n in c for c in cmds_low) or any(n in w for w in win_low))
+        )
+        if total_needle_hits == 0:
             continue
-        score = hits
-        # Category-agreement boost: if any of this rule's tags match the challenge
-        # category's known tags, the rule is strongly preferred.
+
+        # Count how many individual commands matched any needle of this rule
+        win_cmd_matches = sum(1 for w in win_low if any(n in w for n in needles))
+        cmd_matches = sum(1 for c in cmds_low if any(n in c for n in needles))
+
+        # 1. Winning chain score: decisive commands that actually solved the challenge
+        winning_score = (win_needle_hits * 10.0) + (min(win_cmd_matches, 6) * 3.0)
+
+        # 2. Command score: agent-issued actions weighted 3x over passive output
+        command_score = (cmd_needle_hits * 3.0) + (min(cmd_matches, 10) * 1.0)
+
+        # 3. Base evidence score: passive text, output, descriptions
+        base_score = float(total_needle_hits)
+
+        raw_score = winning_score + command_score + base_score
+
+        # 4. Category-agreement boost / disagreement penalty
+        category_modifier = 0.0
         if cat_tags and any(t in cat_tags for t in tags):
-            score += 5
-        # Category-disagreement penalty: if a category IS declared and this rule
-        # has NO overlap, discount it so noise hits don't outrank a matching rule.
+            category_modifier = 5.0
         elif cat_tags:
-            score -= 2
-        if score > best_score:
-            best_score = score
+            category_modifier = -2.0
+
+        total_score = raw_score + category_modifier
+
+        # Score tuple for ranking and decisive tie-breaking:
+        # (total_score, winning_score, command_score, total_needle_hits)
+        score_tuple = (total_score, winning_score, command_score, total_needle_hits)
+
+        if score_tuple > best_score_tuple:
+            best_score_tuple = score_tuple
             best_rule = (label, tags, sigs, indicators)
 
     if best_rule is not None:

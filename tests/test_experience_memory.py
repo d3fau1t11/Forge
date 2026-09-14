@@ -306,6 +306,295 @@ class TestBug5Classification(MemoryTestBase):
         rec_xxe = self.extractor.extract_from_board(board_xxe, flag=CAPTURED_FLAG, outcome="success")
         self.assertEqual(rec_xxe.technique, "XML External Entity (XXE)")
 
+    def test_hashgate_repro_credential_bruteforce_not_xss(self):
+        """Regression test for Hashgate repro:
+        A web challenge solved via credential brute-forcing must be classified as
+        'Credential Brute-Force / Weak Auth', not 'Cross-Site Scripting (XSS)', even when
+        incidental <script> substrings appear in recon grep or HTML output.
+        """
+        board = _solved_board(
+            challenge_name="Hashgate",
+            category="WEB",
+            description="A secure portal requiring authentication credentials.",
+            discovered_endpoints={"/", "/login", "/dashboard"},
+            extracted_headers={"Server": "nginx/1.18.0"},
+            execution_history=[
+                # Incidental <script> fragment appearing only in recon grep/curl
+                {"agent": "a1", "command": "curl -s http://target/ | grep -v '<script>'",
+                 "output": "<html><head><script src='main.js'></script></head><body><form action='/login'>...</form></body></html>",
+                 "note": "recon"},
+                # Decisive credential brute-force commands
+                {"agent": "a2", "command": "hydra -l admin -P /usr/share/wordlists/rockyou.txt http://target/login http-post-form",
+                 "output": "1 valid password found: admin:hunter2", "note": "hydra brute-force"},
+                {"agent": "a2", "command": "python3 -c 'import requests; print(\"brute-force credential check\")'",
+                 "output": "Valid credentials found: admin:hunter2", "note": "credential verification"},
+                {"agent": "a2", "command": "curl -s -X POST http://target/login -d 'user=admin&pass=hunter2'",
+                 "output": f"200 OK Welcome admin! Dashboard: {CAPTURED_FLAG}", "note": "flag retrieved with credentials"},
+            ]
+        )
+        rec = self.extractor.extract_from_board(board, flag=CAPTURED_FLAG, outcome="success")
+        self.assertEqual(rec.technique, "Credential Brute-Force / Weak Auth")
+        self.assertIn("auth", rec.tags)
+        self.assertIn("bruteforce", rec.tags)
+        self.assertNotIn("xss", rec.tags)
+
+    def test_classify_technique_prefers_commands_over_passive_comments(self):
+        """When evidence text has noise/comments for one technique but commands for another,
+        classify_technique must prefer the rule whose needles matched in commands/winning chain.
+        """
+        from backend.knowledge.memory_models import classify_technique
+        evidence = (
+            "<!-- Potential vectors: <script>alert(1)</script> document.cookie onerror= -->\n"
+            "hydra -l admin -P /tmp/wordlist.txt http://target/login\n"
+            "curl -d 'user=admin&pass=pass' http://target/login\n"
+        )
+        clf = classify_technique(
+            evidence,
+            category="web",
+            commands=[
+                "hydra -l admin -P /tmp/wordlist.txt http://target/login",
+                "curl -d 'user=admin&pass=pass' http://target/login",
+            ],
+            winning_chain=[
+                "hydra -l admin -P /tmp/wordlist.txt http://target/login",
+                "curl -d 'user=admin&pass=pass' http://target/login",
+            ]
+        )
+        self.assertEqual(clf["technique"], "Credential Brute-Force / Weak Auth")
+
+    # ── Concern 1: stdout/command key isolation ──────────────────────────────
+
+    def test_commands_list_never_contains_stdout(self):
+        """Concern 1: raw_commands must be sourced ONLY from step['command'], never
+        step['output'].  Even if stdout echoes a <script> tag (e.g. a curl
+        response or a script print), it must not appear in the commands list
+        passed to classify_technique — so the XSS rule can never be boosted by
+        its own output.
+
+        We verify this by confirming the 'commands' arg to classify_technique
+        contains none of the output strings from exec_history.
+        """
+        # Patch via the module where the name is looked up at call time
+        from unittest.mock import patch
+        import backend.knowledge.experience_extractor as ee_module
+        import backend.knowledge.memory_models as mm
+
+        poisoned_output = "<script>document.cookie</script> onerror=alert(1)"
+        exec_history = [
+            {"agent": "a1",
+             "command": "hydra -l admin -P /tmp/rock.txt http://target/login",
+             "output": poisoned_output,  # stdout contains XSS keywords
+             "note": "hydra run"},
+            {"agent": "a1",
+             "command": "curl -X POST http://target/login -d 'user=admin&pass=abc123'",
+             "output": f"200 OK {CAPTURED_FLAG}",
+             "note": ""},
+            # Heredoc write — body contains <script> as a string literal, not an attack
+            {"agent": "a1",
+             "command": (
+                 "cat > /tmp/check.py << 'EOF'\n"
+                 "print('Page has <script> tags:', True)\n"
+                 "EOF"
+             ),
+             "output": "",
+             "note": "wrote probe script"},
+        ]
+
+        captured_commands: dict = {}
+
+        original_clf = mm.classify_technique
+        def _spy(evidence_text="", category="", *, commands=None, winning_chain=None):
+            captured_commands["commands"] = list(commands or [])
+            captured_commands["winning_chain"] = list(winning_chain or [])
+            return original_clf(evidence_text, category, commands=commands, winning_chain=winning_chain)
+
+        import types as _t
+        board = _t.SimpleNamespace(
+            run_id="r1", challenge_id="c1", challenge_name="Hashgate",
+            category="WEB", difficulty="EASY",
+            description="Login portal",
+            target_scope="http://target",
+            discovered_endpoints={"/", "/login"},
+            extracted_headers={},
+            observed_cookies={},
+            deobfuscated_secrets=[],
+            candidate_tokens=set(),
+            candidate_usernames=set(),
+            artifact_classification=None,
+            execution_history=exec_history,
+        )
+
+        # patch.object on ee_module intercepts the call because classify_technique
+        # is looked up as ee_module.classify_technique at runtime.
+        with patch.object(ee_module, "classify_technique", side_effect=_spy):
+            rec = ee_module.ExperienceExtractor().extract_from_board(board, flag=CAPTURED_FLAG, outcome="success")
+
+        # (a) Structural: stdout strings must NEVER appear in the commands list
+        for cmd in captured_commands.get("commands", []):
+            self.assertNotIn("<script>document.cookie", cmd,
+                "stdout containing <script>document.cookie must NOT appear in the commands list")
+            self.assertNotIn("onerror=", cmd,
+                "stdout containing onerror= must NOT appear in the commands list")
+
+        # (b) Heredoc first-line stripping: the heredoc command's first line is
+        # 'cat > /tmp/check.py << ...' — the body lines with '<script>' must be absent
+        heredoc_entry = [c for c in captured_commands.get("commands", []) if c.startswith("cat >")]
+        self.assertEqual(len(heredoc_entry), 1, "heredoc command should appear once (first line only)")
+        self.assertNotIn("<script>", heredoc_entry[0],
+            "heredoc body containing <script> must not appear in the first-line command token")
+
+        # (c) Genuine shell commands must be present
+        cmds = captured_commands.get("commands", [])
+        self.assertTrue(any("hydra" in c for c in cmds), "hydra command should be in commands list")
+        self.assertTrue(any("curl" in c for c in cmds), "curl command should be in commands list")
+
+        # (d) End-to-end: only stdout contains XSS + heredoc body: must NOT classify as XSS
+        self.assertNotEqual(rec.technique, "Cross-Site Scripting (XSS)",
+            "XSS keywords only in stdout/heredoc body must not produce an XSS classification")
+
+    # ── Concern 2: Messy real-world Hashgate replay ──────────────────────────
+
+    def test_hashgate_messy_realworld_replay(self):
+        """Concern 2: messy Hashgate-style log with --- HIDDEN CLUES --- sections,
+        Python tracebacks, agent-generated script source that prints <script> tags,
+        and incidental XSS keywords in comments/output.  The decisive exploit chain
+        is purely credential brute-force; no XSS payload was ever attempted.
+        """
+        flag = CAPTURED_FLAG
+        board_exec = [
+            # Step 0: initial recon — stdout contains <script> from HTML
+            {"agent": "a1",
+             "command": "curl -s http://target.ctf/ -L",
+             "output": (
+                 "HTTP/1.1 200 OK\nServer: nginx\n"
+                 "<html><head><script src='/static/app.js'></script></head>"
+                 "<body><h1>Hashgate Portal</h1>"
+                 "<form action='/login' method='POST'>...</form></body></html>"
+             ),
+             "note": "recon"},
+            # Step 1: agent writes a helper script — script SOURCE contains <script> in a print
+            {"agent": "a1",
+             "command": (
+                 "cat > /tmp/probe.py << 'EOF'\n"
+                 "import requests\n"
+                 "# probe for XSS potential (note: not the attack vector)\n"
+                 "r = requests.get('http://target.ctf/')\n"
+                 "print('Page has <script> tags:', '<script>' in r.text)\n"
+                 "EOF"
+             ),
+             "output": "",
+             "note": "wrote probe script"},
+            # Step 2: run probe — stdout says xss not applicable
+            {"agent": "a1",
+             "command": "python3 /tmp/probe.py",
+             "output": "Page has <script> tags: True\n--- HIDDEN CLUES ---\nLogin form requires valid credentials\n",
+             "note": "probe output"},
+            # Step 3: agent hits a traceback trying an XSS probe (not a real attack)
+            {"agent": "a1",
+             "command": "curl -s 'http://target.ctf/login?name=<script>alert(document.cookie)</script>'",
+             "output": (
+                 "Traceback (most recent call last):\n"
+                 "  File 'probe.py', line 10, in <module>\n"
+                 "    raise ValueError('XSS probe returned 403')\n"
+                 "ValueError: XSS probe returned 403 Forbidden\n"
+             ),
+             "note": "xss probe — rejected"},
+            # Steps 4-7: the actual exploit chain — brute-force
+            {"agent": "a2",
+             "command": "hydra -l admin -P /usr/share/wordlists/rockyou.txt http-post-form://target.ctf/login:user=^USER^&pass=^PASS^:Invalid",
+             "output": "[80][http-post-form] host: target.ctf   login: admin   password: hashcat1\n1 valid password found",
+             "note": "hydra brute-force — password found"},
+            {"agent": "a2",
+             "command": "curl -s -c /tmp/cookies.txt -X POST http://target.ctf/login -d 'user=admin&pass=hashcat1'",
+             "output": "302 Found\nSet-Cookie: session=eyJhbGciOiJub25lIn0.abc.def\nLocation: /dashboard",
+             "note": "credential — login"},
+            {"agent": "a2",
+             "command": "curl -s -b /tmp/cookies.txt http://target.ctf/dashboard",
+             "output": f"200 OK\nWelcome, admin!\nYour flag: {flag}",
+             "note": "Valid credentials found — flag retrieved"},
+        ]
+
+        import types as _t
+        board = _t.SimpleNamespace(
+            run_id="r-hashgate", challenge_id="c-hashgate",
+            challenge_name="Hashgate", category="WEB", difficulty="MEDIUM",
+            description="Secure portal. Hash-based auth. Investigate credential policies.",
+            target_scope="http://target.ctf",
+            discovered_endpoints={"/", "/login", "/dashboard"},
+            extracted_headers={"Server": "nginx", "X-Powered-By": "Express"},
+            observed_cookies={"session": "eyJhbGciOiJub25lIn0.abc.def"},
+            deobfuscated_secrets=[],
+            candidate_tokens=set(),
+            candidate_usernames={"admin"},
+            artifact_classification=None,
+            execution_history=board_exec,
+        )
+        from backend.knowledge.experience_extractor import ExperienceExtractor
+        rec = ExperienceExtractor().extract_from_board(board, flag=flag, outcome="success")
+
+        self.assertEqual(rec.technique, "Credential Brute-Force / Weak Auth",
+            f"Messy Hashgate replay classified as {rec.technique!r} — expected brute-force")
+        self.assertIn("auth", rec.tags)
+        self.assertIn("bruteforce", rec.tags)
+        self.assertNotIn("xss", rec.tags,
+            "XSS tag must not appear — the XSS probe was a failed/rejected step, not the exploit")
+
+    # ── Concern 3: Existing correct classifications still land right ──────────
+
+    def test_ssti_classification_unaffected_by_new_scoring(self):
+        """Concern 3: The new multi-tier scoring must not regress a clean SSTI run.
+        The standard _solved_board fixture has Jinja2 SSTI as the actual exploit chain
+        ({{7*7}} in commands, flag in render output) — verify technique is still SSTI.
+        """
+        from backend.knowledge.memory_models import classify_technique
+
+        # Construct evidence + structured args exactly as the extractor would for the SSTI fixture
+        ssti_commands = [
+            f"curl -s '{TARGET_URL}/render?name={{{{7*7}}}}'",
+            f"curl -s '{TARGET_URL}/render?name={{{{config}}}}'",
+        ]
+        ssti_winning_chain = [
+            f"curl -s '{TARGET_URL}/render?name={{{{7*7}}}}'",
+            f"curl -s '{TARGET_URL}/render?name={{{{config}}}}'",
+        ]
+        evidence = "\n".join(ssti_commands * 3 + [
+            "Server: Werkzeug/2.0 Python/3.9",
+            "Hello, 49",
+            "jinja render_template_string reflected",
+        ])
+
+        clf = classify_technique(
+            evidence,
+            category="web",
+            commands=ssti_commands,
+            winning_chain=ssti_winning_chain,
+        )
+        self.assertEqual(clf["technique"], "Server-Side Template Injection (SSTI)",
+            f"SSTI run classified as {clf['technique']!r} — regression in new scoring")
+        self.assertIn("ssti", clf["tags"])
+
+    def test_sqli_classification_unaffected_by_new_scoring(self):
+        """Concern 3 continued: SQL injection runs must still land as SQLi."""
+        from backend.knowledge.memory_models import classify_technique
+
+        sqli_commands = [
+            "sqlmap -u 'http://target/search?q=1' --dbs",
+            "curl -s \"http://target/search?q=1' UNION SELECT null,flag FROM secrets--\"",
+        ]
+        evidence = "\n".join(sqli_commands * 3 + [
+            "SQL syntax error near UNION SELECT",
+            "information_schema.tables",
+        ])
+        clf = classify_technique(
+            evidence,
+            category="web",
+            commands=sqli_commands,
+            winning_chain=sqli_commands,
+        )
+        self.assertEqual(clf["technique"], "SQL Injection",
+            f"SQLi run classified as {clf['technique']!r} — regression in new scoring")
+        self.assertIn("sqli", clf["tags"])
+
 
 if __name__ == "__main__":
     unittest.main()
