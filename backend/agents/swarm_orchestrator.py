@@ -1816,6 +1816,8 @@ class SwarmOrchestrator:
                                         selected_model="auto (capability chain)", current_task="Booting agent")
         consecutive_errors = 0
         MAX_CONSECUTIVE_ERRORS = 5
+        consecutive_duplicates = 0
+        MAX_CONSECUTIVE_DUPLICATES = 3
 
         while not board.flag_captured and not board.is_stopped:
             # Hard-pause at a checkpoint: idle until the operator response resumes us.
@@ -2005,6 +2007,14 @@ class SwarmOrchestrator:
                 if cmd in board.executed_commands_dedup:
                     board.record_agent_step(agent_id, command=cmd, note="skipped (already executed by the swarm)")
                     _append_to_challenge_log(board.challenge_id, agent_id, f"[DUPLICATE SKIPPED] {cmd[:150]}")
+                    consecutive_duplicates += 1
+                    if consecutive_duplicates >= MAX_CONSECUTIVE_DUPLICATES:
+                        _append_to_challenge_log(
+                            board.challenge_id, agent_id,
+                            f"[DUPLICATE LOOP] {consecutive_duplicates} identical duplicates in a row — forcing pivot."
+                        )
+                        asyncio.create_task(_force_pivot_if_needed(board, agent_id, strategy_label))
+                        consecutive_duplicates = 0
                     await asyncio.sleep(0.5)
                     continue
 
@@ -2050,6 +2060,7 @@ class SwarmOrchestrator:
                     continue
 
                 board.executed_commands_dedup.add(cmd)
+                consecutive_duplicates = 0
                 _append_to_challenge_log(board.challenge_id, agent_id, f"Executing: {cmd[:200]}")
                 res = await tool_manager.execute_tool("bash", {"command": cmd}, timeout=25,
                                                       working_directory=workdir, canonical_target=board.target_scope)
