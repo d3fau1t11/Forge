@@ -1931,6 +1931,7 @@ class SwarmOrchestrator:
                     except SyntaxError as se:
                         err_msg = f"SyntaxError in generated Python script (line {se.lineno}, col {se.offset}): {se.msg}"
                         board.record_agent_step(agent_id, note=err_msg)
+                        _append_to_challenge_log(board.challenge_id, agent_id, err_msg)
                         board.agent_iterations[agent_id] = iters + 1
                         await board.update_worker_state(agent_id, status="RUNNING", current_task=f"Repairing syntax error: {se.msg}")
                         continue
@@ -1944,7 +1945,9 @@ class SwarmOrchestrator:
                         with open(solver_path, "w", encoding="utf-8") as fh:
                             fh.write(script)
                     except OSError as werr:
-                        board.record_agent_step(agent_id, note=f"Could not write solver: {werr}")
+                        werr_msg = f"Could not write solver: {werr}"
+                        board.record_agent_step(agent_id, note=werr_msg)
+                        _append_to_challenge_log(board.challenge_id, agent_id, werr_msg)
                         board.agent_iterations[agent_id] = iters + 1
                         continue
                     # Quote the path — the workspace path can contain spaces (e.g.
@@ -1954,6 +1957,7 @@ class SwarmOrchestrator:
                     cmd = self._extract_command(content)
                     if not cmd:
                         board.record_agent_step(agent_id, note="No executable command produced this turn")
+                        _append_to_challenge_log(board.challenge_id, agent_id, "[NO PROGRESS] No executable command produced this turn")
                         board.agent_iterations[agent_id] = iters + 1
                         await board.update_worker_state(agent_id, status="RUNNING",
                                                         current_task="No command produced; re-planning")
@@ -2000,6 +2004,7 @@ class SwarmOrchestrator:
 
                 if cmd in board.executed_commands_dedup:
                     board.record_agent_step(agent_id, command=cmd, note="skipped (already executed by the swarm)")
+                    _append_to_challenge_log(board.challenge_id, agent_id, f"[DUPLICATE SKIPPED] {cmd[:150]}")
                     await asyncio.sleep(0.5)
                     continue
 
