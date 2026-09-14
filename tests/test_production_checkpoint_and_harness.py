@@ -199,41 +199,114 @@ class TestProductionCheckpointAndHarness(unittest.TestCase):
 
         _run(scenario())
 
-    # ── Test 4: Competition Harness & WorkflowRunner Production Engine Alignment ──
+    # ── Test 4: Competition Harness & WorkflowRunner Production Engine Execution Path ──
     def test_workflow_runner_and_harness_use_production_engine(self):
         """Verify that WorkflowRunner.start_run with default engine_type (None)
-        resolves to 'swarm' (SwarmOrchestrator), exactly matching the UI start path."""
+        actually executes swarm_orchestrator.run_swarm(), proving the full runtime
+        execution path from UI start to swarm orchestrator."""
         async def scenario():
+            import uuid
+            from unittest.mock import patch
+
+            uid = uuid.uuid4().hex[:8]
+            ch_id = f"ch_engine_{uid}"
+            run_id = f"run_engine_{uid}"
+
             db = SessionLocal()
             try:
-                ch = ChallengeModel(name="Production Engine Verification", category="WEB")
+                ch = ChallengeModel(id=ch_id, name="Production Engine Verification", category="WEB")
                 db.add(ch)
                 db.commit()
 
-                run = RunModel(challenge_id=ch.id, status="RUNNING", current_phase="recon", current_agent="swarm")
+                run = RunModel(id=run_id, challenge_id=ch_id, status="RUNNING", current_phase="recon", current_agent="swarm")
                 db.add(run)
                 db.commit()
 
-                # Start run with engine_type=None (default UI path)
-                workflow_runner.start_run(run.id, ch.id, "http://127.0.0.1:8888/", engine_type=None)
-
-                self.assertIn(run.id, workflow_runner.active_runs)
-                task = workflow_runner.tasks.get(run.id)
-                self.assertIsNotNone(task)
-
-                # Allow the event loop to start run_swarm
-                await asyncio.sleep(0.2)
-
-                # Check that swarm_orchestrator registered the swarm board
+                # Spy on swarm_orchestrator.run_swarm to prove it is called by start_run
                 from backend.agents.swarm_orchestrator import swarm_orchestrator
-                active_board = swarm_orchestrator.active_swarms.get(run.id)
-                self.assertIsNotNone(active_board)
-                self.assertEqual(active_board.challenge_id, ch.id)
+                original_run_swarm = swarm_orchestrator.run_swarm
+                called_args = []
 
-                # Cancel run to clean up
-                workflow_runner.activate_kill_switch(run.id)
+                async def spied_run_swarm(*args, **kwargs):
+                    called_args.append((args, kwargs))
+                    # Also invoke real run_swarm to verify actual runtime initialization
+                    return await original_run_swarm(*args, **kwargs)
+
+                with patch.object(swarm_orchestrator, "run_swarm", side_effect=spied_run_swarm):
+                    # Start run with engine_type=None (exact default UI start path)
+                    workflow_runner.start_run(run.id, ch.id, "http://127.0.0.1:8888/", engine_type=None)
+
+                    self.assertIn(run.id, workflow_runner.active_runs)
+                    task = workflow_runner.tasks.get(run.id)
+                    self.assertIsNotNone(task)
+
+                    # Allow the event loop to execute run_swarm entry
+                    await asyncio.sleep(0.2)
+
+                    # Verify that run_swarm was ACTUALLY executed with run_id and challenge_id
+                    self.assertEqual(len(called_args), 1)
+                    _, kwargs = called_args[0]
+                    self.assertEqual(kwargs.get("run_id"), run_id)
+                    self.assertEqual(kwargs.get("challenge_id"), ch_id)
+
+                    # Verify that the active blackboard was instantiated by run_swarm
+                    active_board = swarm_orchestrator.active_swarms.get(run_id)
+                    self.assertIsNotNone(active_board)
+                    self.assertEqual(active_board.challenge_id, ch_id)
+
+                    # Cancel run to clean up
+                    workflow_runner.activate_kill_switch(run_id)
             finally:
                 db.close()
+
+        _run(scenario())
+
+    # ── Test 5: Flag Capture During Checkpoint Wait Aborts Wait Immediately ──
+    def test_flag_captured_during_checkpoint_wait_aborts_immediately(self):
+        """Verify that when a flag is captured while a checkpoint is waiting,
+        flag_event immediately wakes the wait without waiting for timeout."""
+        async def scenario():
+            import uuid
+            uid = uuid.uuid4().hex[:8]
+            ch_id = f"ch_flag_{uid}"
+            run_id = f"run_flag_{uid}"
+            board = SwarmBlackboard(ch_id, run_id, "http://127.0.0.1:8888")
+            board.agent_ids = ["agent_1"]
+            board.agent_started_ts = {"agent_1": time.time()}
+
+            db = SessionLocal()
+            ch = ChallengeModel(id=ch_id, name="Flag Interrupt Test", category="WEB")
+            run = RunModel(id=run_id, challenge_id=ch_id, status="RUNNING")
+            db.add(ch)
+            db.add(run)
+            db.commit()
+            db.close()
+
+            orig_timeout = getattr(settings, "CHECKPOINT_TIMEOUT_SECONDS", 30)
+            settings.CHECKPOINT_TIMEOUT_SECONDS = 30.0  # long timeout
+
+            orch = SwarmOrchestrator()
+            orch.active_swarms[board.run_id] = board
+
+            async def capture_flag_delayed():
+                await asyncio.sleep(2.3)  # wait for quiesce
+                await board.record_flag("picoCTF{interrupt_checkpoint_123}", "worker_1")
+
+            try:
+                flag_task = asyncio.create_task(capture_flag_delayed())
+                start_t = time.time()
+                await orch._run_checkpoint_cycle(board, ".")
+                await flag_task
+                elapsed = time.time() - start_t
+
+                # Should wake immediately when flag is recorded (~2.3s, not 30s timeout)
+                self.assertLess(elapsed, 5.0)
+                self.assertTrue(board.flag_captured)
+                self.assertFalse(board.checkpoint_pause)
+                self.assertFalse(board.checkpoint_active)
+            finally:
+                settings.CHECKPOINT_TIMEOUT_SECONDS = orig_timeout
+                orch.active_swarms.pop(board.run_id, None)
 
         _run(scenario())
 

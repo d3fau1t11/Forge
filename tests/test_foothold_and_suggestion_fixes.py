@@ -18,7 +18,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///./test_forge.db")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from backend.agent_runtime.action import ExecResult
-from backend.agent_runtime.observation import Observation, ObservationEngine
+from backend.agent_runtime.observation import Observation, ObservationEngine, _FILE_UPLOADED_RE
 from backend.agents.checkpoint_pipeline import (
     ParsedSuggestions,
     SuggestionDecision,
@@ -145,6 +145,25 @@ class TestSuccessfulEvidenceBecomesActionableState(unittest.TestCase):
         obs = self.obs_engine.observe(exec_res)
         self.assertIn("dump.bin", obs.new_files)
         self.assertEqual(obs.file_provenance.get("dump.bin"), "LOCAL_FILE")
+
+    def test_file_uploaded_regex_cases(self):
+        # Verification check for fix: "uploaded" followed by "Path:"
+        inp1 = "The file malicious.php has been uploaded Path: uploads/malicious.php"
+        self.assertEqual(_FILE_UPLOADED_RE.findall(inp1), ["uploads/malicious.php"])
+
+        # Confirm existing behaviors still pass unchanged
+        inp2 = "File uploaded successfully to uploads/shell.php (200 OK)"
+        self.assertEqual(_FILE_UPLOADED_RE.findall(inp2), ["uploads/shell.php"])
+
+        inp3 = "Upload complete. Destination: uploads/x.png"
+        self.assertEqual(_FILE_UPLOADED_RE.findall(inp3), ["uploads/x.png"])
+
+        inp4 = "Saved at uploads/y.jpg"
+        self.assertEqual(_FILE_UPLOADED_RE.findall(inp4), ["uploads/y.jpg"])
+
+        # Confirm negative case correctly returns nothing
+        inp5 = "The path is unrelated, nothing uploaded here"
+        self.assertEqual(_FILE_UPLOADED_RE.findall(inp5), [])
 
 
 # ---------------------------------------------------------------------------

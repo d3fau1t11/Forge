@@ -2271,8 +2271,8 @@ class SwarmOrchestrator:
                                  f"Report emitted for cycle {board.cycle_n}; awaiting operator paste")
 
         # Bounded wait for operator's pasted external-model response.
-        # Respects CHECKPOINT_TIMEOUT_SECONDS and instance wind-down buffer so
-        # unattended runs never deadlock.
+        # Concurrently monitors operator response, flag capture, and cancellation/pause
+        # while respecting CHECKPOINT_TIMEOUT_SECONDS and instance wind-down buffer.
         timeout = float(getattr(settings, "CHECKPOINT_TIMEOUT_SECONDS", 30))
         buffer = float(getattr(settings, "INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
         if board.instance_expiry_ts:
@@ -2285,14 +2285,29 @@ class SwarmOrchestrator:
                 board.checkpoint_active = False
                 return
 
+        resp_wait = asyncio.create_task(board.checkpoint_response_event.wait())
+        flag_wait = asyncio.create_task(board.flag_event.wait())
         timed_out = False
         try:
             if timeout > 0:
-                await asyncio.wait_for(board.checkpoint_response_event.wait(), timeout=timeout)
+                done, pending = await asyncio.wait(
+                    [resp_wait, flag_wait],
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    timed_out = True
             else:
                 timed_out = True
-        except asyncio.TimeoutError:
+        except asyncio.CancelledError:
+            board.checkpoint_pause = False
+            board.checkpoint_active = False
+            raise
+        except Exception:
             timed_out = True
+        finally:
+            resp_wait.cancel()
+            flag_wait.cancel()
 
         if board.is_stopped or board.flag_captured:
             board.checkpoint_pause = False
