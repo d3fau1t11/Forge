@@ -81,6 +81,7 @@ class ActionScorer:
         attempted_signatures: Optional[Iterable[str]] = None,
         available_capabilities: Optional[Iterable[str]] = None,
         blocked_capabilities: Optional[Iterable[str]] = None,
+        exhausted_strategies: Optional[Iterable[str]] = None,
         uncertainty: float = 1.0,
     ) -> CandidateAction:
         """Compute and attach ``score`` + ``score_breakdown`` to *action*.
@@ -93,6 +94,7 @@ class ActionScorer:
         attempted = set(attempted_signatures or [])
         available = set(c.lower() for c in (available_capabilities or []))
         blocked = set(c.lower() for c in (blocked_capabilities or []))
+        exhausted = set(s.lower() for s in (exhausted_strategies or []))
 
         ig = _gain_float(action.information_gain)
         ev = _clamp(action.evidence_support)
@@ -106,6 +108,14 @@ class ActionScorer:
         is_dup = bool(action.signature and action.signature in attempted)
         dup_pen = w.duplicate_penalty if is_dup else 0.0
         if is_dup:
+            nov = 0.0
+
+        # Strategy exhaustion penalty: a candidate using an exhausted strategy
+        # is penalised unless fresh concrete evidence explicitly justifies it.
+        strat_key = (getattr(action, "strategy", "") or action.action_type or "").lower()
+        is_exhausted = bool(strat_key and strat_key in exhausted and action.source != "evidence" and ev < 0.7)
+        if is_exhausted:
+            dup_pen += w.duplicate_penalty
             nov = 0.0
 
         # Dependency availability (§10): a candidate needing a capability known to be
@@ -147,15 +157,18 @@ class ActionScorer:
         attempted_signatures: Optional[Iterable[str]] = None,
         available_capabilities: Optional[Iterable[str]] = None,
         blocked_capabilities: Optional[Iterable[str]] = None,
+        exhausted_strategies: Optional[Iterable[str]] = None,
         uncertainty: float = 1.0,
     ) -> List[CandidateAction]:
         """Score every candidate and return them sorted best-first (stable)."""
         attempted = set(attempted_signatures or [])
         available = set(available_capabilities or [])
         blocked = set(blocked_capabilities or [])
+        exhausted = set(exhausted_strategies or [])
         for a in actions:
             self.score(a, attempted_signatures=attempted, available_capabilities=available,
-                       blocked_capabilities=blocked, uncertainty=uncertainty)
+                       blocked_capabilities=blocked, exhausted_strategies=exhausted,
+                       uncertainty=uncertainty)
         # Sort by score desc; ties keep insertion order (Python sort is stable).
         return sorted(actions, key=lambda a: a.score, reverse=True)
 

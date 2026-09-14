@@ -173,11 +173,19 @@ class Supervisor:
                     AgentRole.WEB,
                     f"Authenticate using discovered credentials ({cred}) and access protected resources.",
                     mission_state, priority=80))
-        elif etype == "artifact":
-            proposals.append(self._make_task(
-                AgentRole.FORENSICS,
-                f"Analyze the discovered artifact '{getattr(ev, 'title', '') or getattr(ev, 'artifact_id', '')}'.",
-                mission_state, priority=65))
+        elif etype in ("artifact", "file"):
+            title_str = getattr(ev, 'title', '') or getattr(ev, 'artifact_id', '') or getattr(ev, 'description', '')
+            cat = (getattr(mission_state, "category", "") or "").lower()
+            if cat == "web" or any(k in title_str.lower() for k in (".php", ".phtml", ".jsp", ".asp", ".aspx", "uploads/", "/uploads")):
+                proposals.append(self._make_task(
+                    AgentRole.WEB,
+                    f"Access and exploit the discovered web artifact/path '{title_str}'. Extract the flag.",
+                    mission_state, priority=80))
+            else:
+                proposals.append(self._make_task(
+                    AgentRole.FORENSICS,
+                    f"Analyze the discovered artifact '{title_str}'.",
+                    mission_state, priority=65))
         return proposals
 
     # ------------------------------------------------------------------ #
@@ -268,6 +276,7 @@ class Supervisor:
         attempted_signatures: Optional[List[str]] = None,
         available_capabilities: Optional[List[str]] = None,
         blocked_capabilities: Optional[List[str]] = None,
+        exhausted_strategies: Optional[List[str]] = None,
         budget_pressure: float = 0.0,
         use_memory: bool = True,
     ) -> ReasoningDecision:
@@ -287,15 +296,19 @@ class Supervisor:
         #   * one needing a capability already proven unavailable (do not re-propose it —
         #     the Binary Digits/OCR case: recognise it once, then stop repeating), and
         #   * one whose action was already attempted/failed, UNLESS fresh evidence
-        #     justifies a retry (a capability-blocked action is never "justified").
+        #     justifies a retry (a capability-blocked action is never "justified"), and
+        #   * one whose strategy class is exhausted across the swarm unless fresh evidence justifies it.
         attempted = set(attempted_signatures or [])
         failed = set(getattr(mission_state, "action_signatures", []) or [])
         blocked = {c.lower() for c in (blocked_capabilities or [])}
+        exhausted = {s.lower() for s in (exhausted_strategies or getattr(mission_state, "exhausted_strategies", []) or [])}
+
         prefiltered = []
         for c in candidates:
             if c.capability and c.capability.lower() in blocked:
                 continue
-            already = c.signature in attempted or c.signature in failed
+            strat_key = (getattr(c, "strategy", "") or c.action_type or "").lower()
+            already = c.signature in attempted or c.signature in failed or (strat_key and strat_key in exhausted)
             evidence_backed = c.source in ("evidence",) or c.evidence_support >= 0.7
             if already and not evidence_backed:
                 continue
@@ -308,6 +321,7 @@ class Supervisor:
             attempted_signatures=attempted | failed,
             available_capabilities=available_capabilities,
             blocked_capabilities=blocked_capabilities,
+            exhausted_strategies=exhausted,
             uncertainty=uncertainty,
         )
 

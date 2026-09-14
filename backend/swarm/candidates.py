@@ -142,6 +142,13 @@ class CandidateGenerator:
                                    rationale="HTTP surface is unknown; enumeration reveals where to look.",
                                    evidence_support=0.4, success_probability=0.6))
 
+        # Discovered endpoints present -> generate web_exploit actions for them
+        for ep in endpoints[:3]:
+            cands.append(self._mk("web_exploit", ms,
+                                   objective=f"Inspect and interact with the discovered endpoint/path '{ep}' to advance exploitation or extract the flag.",
+                                   rationale=f"Endpoint '{ep}' is known — probe or exploit it.",
+                                   evidence_support=0.75, success_probability=0.6, target=ep))
+
         # A vulnerability is known but not yet exploited → exploit it (exploitation).
         for v in vulns[:3]:
             cands.append(self._mk("vuln_exploit", ms,
@@ -156,13 +163,26 @@ class CandidateGenerator:
                                    rationale="Credentials are known but not yet used.",
                                    evidence_support=0.8, success_probability=0.6, target=target))
 
-        # Artifacts present → analyse/decode them (forensics/crypto surface).
-        for a in artifacts[:3]:
-            atype = "decode" if category == "crypto" else "artifact_analysis"
-            cands.append(self._mk(atype, ms,
-                                   objective=f"Analyze the artifact '{a}' for embedded data, encodings, or a hidden flag.",
-                                   rationale="An unanalysed artifact is a concrete lead.",
-                                   evidence_support=0.7, success_probability=0.55, target=a))
+        # Artifacts/files present → analyse/decode/exploit them (forensics/crypto/web surface).
+        all_artifacts = list(getattr(ms, "artifacts", []) or [])
+        for f in _get(ms, "files", "known_files"):
+            if f not in all_artifacts:
+                all_artifacts.append(f)
+
+        for a in all_artifacts[:3]:
+            low = a.lower()
+            if category == "web" or any(k in low for k in (".php", ".phtml", ".jsp", ".asp", ".aspx", "uploads/", "/uploads", ".html", ".js")):
+                atype = "web_exploit"
+                cands.append(self._mk(atype, ms,
+                                       objective=f"Access and inspect/exploit the discovered artifact/path '{a}' for output or flag extraction.",
+                                       rationale=f"A discovered artifact/path ({a}) is available to exploit.",
+                                       evidence_support=0.8, success_probability=0.65, target=a))
+            else:
+                atype = "decode" if category == "crypto" else "artifact_analysis"
+                cands.append(self._mk(atype, ms,
+                                       objective=f"Analyze the artifact '{a}' for embedded data, encodings, or a hidden flag.",
+                                       rationale="An unanalysed artifact is a concrete lead.",
+                                       evidence_support=0.7, success_probability=0.55, target=a))
 
         # Category-driven seed when nothing else applies (keeps a bare mission moving).
         if not cands:
@@ -197,9 +217,10 @@ class CandidateGenerator:
         title = (getattr(ev, "title", "") or getattr(ev, "description", "") or "").strip()
         cands: List[CandidateAction] = []
         target = getattr(ms, "target", "") or ""
+        category = (getattr(ms, "category", "") or "").lower()
 
-        if etype == "artifact":
-            label = getattr(ev, "artifact_id", None) or title
+        if etype in ("artifact", "file"):
+            label = getattr(ev, "artifact_id", None) or getattr(ev, "title", "") or getattr(ev, "description", "") or title
             low = label.lower()
             if any(k in low for k in (".elf", "elf ", "binary", "executable")):
                 for atype in ("artifact_analysis", "binary_analysis"):
@@ -222,6 +243,11 @@ class CandidateGenerator:
                                           rationale=("The image likely contains hidden text; OCR is the required "
                                                      "next capability to read it."),
                                           evidence_support=0.75, success_probability=0.5, target=label))
+            elif category == "web" or any(k in low for k in (".php", ".phtml", ".jsp", ".asp", ".aspx", "uploads/", "/uploads", ".html", ".js", "script")):
+                cands.append(self._mk("web_exploit", ms,
+                                      objective=f"Access and execute/inspect the discovered web path/artifact '{label}' to trigger execution or extract the flag.",
+                                      rationale=f"A new web artifact/path '{label}' was confirmed — inspect/request it.",
+                                      evidence_support=0.85, success_probability=0.65, target=label))
             else:
                 cands.append(self._mk("artifact_analysis", ms,
                                       objective=f"Analyze the discovered artifact '{label}'.",

@@ -204,9 +204,16 @@ def build_user_prompt(ctx: AgentContext) -> str:
         )
 
     # Injected directive section (from HITL checkpoint suggestion routing)
+    # These directives have been evaluated against the current mission state;
+    # fabricated flags, vague requests, and exhausted strategies have been
+    # filtered out before reaching this point.  The agent should still reason
+    # about the guidance — it is advisory, not a bypass of tool controls.
     if ctx.injected_directive and ctx.injected_directive.strip():
         injected_directive_section = (
-            "=== OPERATOR DIRECTIVE (HIGH PRIORITY — address this before continuing) ===\n"
+            "=== OPERATOR DIRECTIVE (EVALUATED GUIDANCE — from checkpoint review) ===\n"
+            "The following guidance was evaluated against the current mission state and\n"
+            "confirmed actionable. Address it as part of your next action, but continue\n"
+            "to reason from real evidence — do NOT treat this as a bypass of tool controls.\n"
             + ctx.injected_directive.strip()
         )
     else:

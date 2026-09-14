@@ -28,7 +28,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Dict, List, Optional
+from enum import Enum
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger("forge.checkpoint")
 
@@ -80,6 +81,193 @@ class ParsedSuggestions:
     fallback: bool = False                              # True → apply fallback_text to all agents
     unknown_labels: List[str] = field(default_factory=list)    # labels not in known agent set
     note: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Suggestion evaluation gate (Problem 2)
+# ---------------------------------------------------------------------------
+
+class SuggestionDecision(str, Enum):
+    """Outcome of evaluating a single operator/external-model suggestion."""
+    ACCEPT = "ACCEPT"       # Actionable and consistent with evidence
+    MODIFY = "MODIFY"       # Directionally useful but needs qualification
+    REJECT = "REJECT"       # Vague, contradicted, or repeats exhausted strategy
+
+
+@dataclass
+class SuggestionEvaluation:
+    """Result of deterministic evaluation of one suggestion directive."""
+    decision: SuggestionDecision
+    reason: str                         # Human-readable one-liner explaining the decision
+    evidence: List[str] = field(default_factory=list)  # State facts that support the decision
+    original_suggestion: str = ""       # Verbatim input text
+    suggested_action: str = ""          # Normalized actionable text (empty if REJECT)
+
+
+# Patterns that signal a vague / non-actionable suggestion.
+_VAGUE_RE = re.compile(
+    r"^(?:try (?:something |a )(?:else|different|new|other)|do better|keep trying|just"
+    r"|you should|have you tried|maybe try|focus more|be more creative|think harder"
+    r"|work on it|investigate further|look (?:harder|more carefully)|explore more"
+    r"|try again|i don.t know|no idea|unclear|not sure|good luck|try harder"
+    r"|[a-z ]{0,30})$",
+    re.IGNORECASE,
+)
+
+# Patterns that look like a direct flag assertion from the operator.
+_FLAG_ASSERTION_RE = re.compile(
+    r"(?:flag\s+is|answer\s+is|the\s+flag\s+is|submit|flag\s*[:=])\s*"
+    r"(?P<flag>[A-Za-z0-9_{}\-!@#$%^&*()]{4,120})",
+    re.IGNORECASE,
+)
+
+
+def evaluate_suggestion(
+    suggestion: str,
+    *,
+    exhausted_strategies: Optional[Sequence[str]] = None,
+    failed_techniques: Optional[Sequence[str]] = None,
+    known_endpoints: Optional[Sequence[str]] = None,
+    known_files: Optional[Sequence[str]] = None,
+    flag_candidates: Optional[Sequence[str]] = None,
+    mission_state: Optional[object] = None,
+) -> SuggestionEvaluation:
+    """Deterministically evaluate one suggestion directive against the current mission state.
+
+    Checks (in order):
+    1. Empty / vague text → REJECT.
+    2. Unverified flag assertion → MODIFY (redirect to verify from real output).
+    3. Repeats an exhausted strategy or dead-end technique → REJECT or MODIFY if novel.
+    4. Consistency with evidence (endpoints, files, credentials) → ACCEPT with evidence.
+    5. Default → ACCEPT with a note that it is unverified-but-actionable.
+    """
+    text = (suggestion or "").strip()
+
+    # -- Pull additional fields from mission_state if provided ----------------
+    ms = mission_state
+    exh = set(s.lower() for s in (exhausted_strategies or getattr(ms, "exhausted_strategies", []) or []))
+    fail = set(t.lower() for t in (failed_techniques or getattr(ms, "failed_techniques", []) or []))
+    endpoints = list(known_endpoints or getattr(ms, "endpoints", []) or getattr(ms, "known_endpoints", []) or [])
+    files = list(known_files or getattr(ms, "known_files", []) or [])
+    artifacts = list(getattr(ms, "artifacts", []) if ms else [])
+    flags = list(flag_candidates or getattr(ms, "flag_candidates", []) or [])
+
+    # 1. Empty / vague --------------------------------------------------------
+    if not text:
+        return SuggestionEvaluation(
+            decision=SuggestionDecision.REJECT,
+            reason="Empty suggestion — nothing actionable.",
+            original_suggestion=suggestion or "",
+        )
+    if len(text) < 10 or _VAGUE_RE.match(text.rstrip(".")):
+        return SuggestionEvaluation(
+            decision=SuggestionDecision.REJECT,
+            reason=f"Vague suggestion ('{text[:60]}') — does not specify a concrete next action.",
+            original_suggestion=text,
+        )
+
+    # 2. Unverified flag assertion --------------------------------------------
+    flag_m = _FLAG_ASSERTION_RE.search(text)
+    if flag_m:
+        asserted = flag_m.group("flag")
+        if asserted not in flags:  # flag not already in verified/candidate list
+            modified = (
+                f"[OPERATOR ASSERTED FLAG — VERIFY BEFORE SUBMITTING] "
+                f"Operator suggested the flag may be '{asserted}'. "
+                f"Do NOT submit this as the flag unless you can verify it from real tool output. "
+                f"Re-run the appropriate command and confirm the flag value from its actual output."
+            )
+            return SuggestionEvaluation(
+                decision=SuggestionDecision.MODIFY,
+                reason=f"Suggestion asserts an unverified flag ('{asserted}'); redirected to verification step.",
+                original_suggestion=text,
+                suggested_action=modified,
+            )
+
+    # 3. Exhausted strategy / dead-end check ----------------------------------
+    low = text.lower()
+    matched_exh = [s for s in exh if s and s in low]
+    matched_fail = [f for f in fail if f and f in low]
+    if matched_exh or matched_fail:
+        # Check if there is a NOVEL element beyond the exhausted strategy (e.g. a new path/param).
+        has_novel_target = bool(re.search(r"[/\\?=&]{1}[A-Za-z0-9._\-]{2,}", text))
+        if has_novel_target and not matched_exh:
+            # Only dead-end techniques but a different target — MODIFY to qualify the target.
+            modified = (
+                f"[MODIFIED — FOCUS ON NEW TARGET ONLY] {text} "
+                f"(Note: the general approach '{', '.join(matched_fail)}' previously failed; "
+                f"apply this suggestion only to the new specific target/path.)"
+            )
+            ev = [f"previously failed: {', '.join(matched_fail)}"] if matched_fail else []
+            return SuggestionEvaluation(
+                decision=SuggestionDecision.MODIFY,
+                reason=f"Technique '{', '.join(matched_fail or matched_exh)}' previously failed; qualified to new target.",
+                evidence=ev,
+                original_suggestion=text,
+                suggested_action=modified,
+            )
+        exh_str = ', '.join(sorted(matched_exh or matched_fail))
+        return SuggestionEvaluation(
+            decision=SuggestionDecision.REJECT,
+            reason=f"Suggestion repeats exhausted/failed strategy ('{exh_str}'); no novel target identified.",
+            original_suggestion=text,
+        )
+
+    # 4. Evidence consistency check (support) ---------------------------------
+    ev_support: List[str] = []
+    all_known = list(endpoints) + list(files) + list(artifacts)
+    for known in all_known:
+        known_low = known.lower()
+        if known_low and known_low in low:
+            ev_support.append(f"known item '{known}' mentioned")
+    if ev_support:
+        return SuggestionEvaluation(
+            decision=SuggestionDecision.ACCEPT,
+            reason="Suggestion targets a known artifact/endpoint from the current evidence base.",
+            evidence=ev_support[:3],
+            original_suggestion=text,
+            suggested_action=text,
+        )
+
+    # 5. Default — actionable but not yet confirmed by evidence ---------------
+    return SuggestionEvaluation(
+        decision=SuggestionDecision.ACCEPT,
+        reason="Suggestion is actionable and does not contradict known state; accepted for agent guidance.",
+        original_suggestion=text,
+        suggested_action=text,
+    )
+
+
+def evaluate_suggestions(
+    parsed: "ParsedSuggestions",
+    *,
+    mission_state: Optional[object] = None,
+    exhausted_strategies: Optional[Sequence[str]] = None,
+    failed_techniques: Optional[Sequence[str]] = None,
+    known_endpoints: Optional[Sequence[str]] = None,
+    known_files: Optional[Sequence[str]] = None,
+    flag_candidates: Optional[Sequence[str]] = None,
+) -> Dict[str, SuggestionEvaluation]:
+    """Evaluate all parsed directives. Returns mapping of agent_id -> SuggestionEvaluation."""
+    results: Dict[str, SuggestionEvaluation] = {}
+    all_directives: Dict[str, str] = {}
+    if parsed.parsed:
+        all_directives = parsed.directives
+    elif parsed.fallback and parsed.fallback_text:
+        # Use the fallback text as a special "all" key so callers can handle it.
+        all_directives = {"__fallback__": parsed.fallback_text}
+
+    for agent_id, directive in all_directives.items():
+        results[agent_id] = evaluate_suggestion(
+            directive,
+            mission_state=mission_state,
+            exhausted_strategies=exhausted_strategies,
+            failed_techniques=failed_techniques,
+            known_endpoints=known_endpoints,
+            known_files=known_files,
+            flag_candidates=flag_candidates,
+        )
+    return results
 
 
 def _truncate(s: str, n: int) -> str:

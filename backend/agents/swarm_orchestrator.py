@@ -41,7 +41,11 @@ from backend.environment.detector import environment_detector
 from backend.agents.agent_prompt import AgentContext, build_agent_prompt, make_context_from_env
 from backend.agents.artifact_acquisition import acquire_artifacts
 from backend.agents import checkpoint_pipeline
-from backend.agents.checkpoint_pipeline import AgentCheckpointRecord
+from backend.agents.checkpoint_pipeline import (
+    AgentCheckpointRecord,
+    evaluate_suggestions,
+    SuggestionDecision,
+)
 from backend.agents.strategic_planner import strategic_planner
 from backend.agent_runtime.verifier import (
     AnswerResolver, AnswerCandidate, AnswerVerdict, AnswerStatus, AnswerSource,
@@ -2275,13 +2279,49 @@ class SwarmOrchestrator:
 
         pasted = board.latest_pasted_response or ""
         parsed = checkpoint_pipeline.parse_suggestions(pasted, board.agent_ids)
+
+        # -- Pull state for evaluation from the shared mission (best-effort) --
+        # We use the board's own fields where available; the suggestion evaluator
+        # gracefully handles None/empty iterables.
+        _ms = getattr(board, "mission_state", None)
+        _exh = list(board.exhausted_strategies) if hasattr(board, "exhausted_strategies") else []
+        _fail = list(getattr(_ms, "failed_techniques", []) or []) if _ms else []
+        _eps = list(getattr(_ms, "endpoints", []) or getattr(_ms, "known_endpoints", []) or []) if _ms else []
+        _files = list(getattr(_ms, "known_files", []) or []) if _ms else []
+        _flags = list(getattr(_ms, "flag_candidates", []) or []) if _ms else []
+
+        def _evaluate_and_inject(aid: str, directive: str) -> None:
+            """Evaluate one directive; inject only if ACCEPTED or MODIFIED."""
+            ev = checkpoint_pipeline.evaluate_suggestion(
+                directive,
+                exhausted_strategies=_exh,
+                failed_techniques=_fail,
+                known_endpoints=_eps,
+                known_files=_files,
+                flag_candidates=_flags,
+            )
+            if ev.decision == SuggestionDecision.REJECT:
+                _append_to_challenge_log(
+                    board.challenge_id, "checkpoint",
+                    f"[SUGGESTION_REJECTED:{aid}] {ev.reason} | original: {directive[:120]}",
+                )
+                return  # Do NOT inject rejected suggestions
+            action_text = ev.suggested_action or directive
+            prev = board.agent_directives.get(aid, "")
+            if ev.decision == SuggestionDecision.MODIFY:
+                _append_to_challenge_log(
+                    board.challenge_id, "checkpoint",
+                    f"[SUGGESTION_MODIFIED:{aid}] {ev.reason}",
+                )
+            board.agent_directives[aid] = (prev + "\n\n" + action_text).strip() if prev else action_text
+
         if parsed.parsed:
             async with board._lock:
                 for aid, directive in parsed.directives.items():
-                    prev = board.agent_directives.get(aid, "")
-                    board.agent_directives[aid] = (prev + "\n\n" + directive).strip() if prev else directive
+                    _evaluate_and_inject(aid, directive)
+            injected = [aid for aid in parsed.directives if board.agent_directives.get(aid)]
             _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                     f"Routed directives to: {', '.join(sorted(parsed.directives.keys()))}"
+                                     f"Routed evaluated directives to: {', '.join(sorted(parsed.directives.keys()))}"
                                      + (f" | {parsed.note}" if parsed.note else ""))
             await ws_manager.broadcast({
                 "event": "CHECKPOINT_RESUMED", "challenge_id": board.challenge_id, "run_id": board.run_id,
@@ -2292,9 +2332,7 @@ class SwarmOrchestrator:
             if parsed.fallback and parsed.fallback_text:
                 async with board._lock:
                     for aid in board.agent_ids:
-                        prev = board.agent_directives.get(aid, "")
-                        add = "[GENERAL GUIDANCE] " + parsed.fallback_text
-                        board.agent_directives[aid] = (prev + "\n\n" + add).strip() if prev else add
+                        _evaluate_and_inject(aid, "[GENERAL GUIDANCE] " + parsed.fallback_text)
             _append_to_challenge_log(board.challenge_id, "checkpoint",
                                      f"UNPARSEABLE paste — {parsed.note} Applied as general guidance to all agents.")
             await ws_manager.broadcast({

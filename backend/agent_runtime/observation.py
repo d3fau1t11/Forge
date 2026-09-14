@@ -36,6 +36,10 @@ _FILE_SAVED_RE = re.compile(
     r"(?:saved to|written to|downloaded to|output written to|saving to|-o)\s+['\"]?([A-Za-z0-9._/\\\-]+)",
     re.IGNORECASE,
 )
+_FILE_UPLOADED_RE = re.compile(
+    r"(?:uploaded to|upload succeeded|upload successful|stored at|saved at|destination|path|uploaded file|uploaded)\s*(?:is|to|at|:)?\s+['\"]?([A-Za-z0-9._/\\\-]+)",
+    re.IGNORECASE,
+)
 _SOURCE_FILE_RE = re.compile(
     r'(?:open|fopen|file_get_contents|read_file|include|require|include_once|require_once)\s*\(\s*[\'"]([A-Za-z0-9._/\\\-]+)[\'"]',
     re.IGNORECASE,
@@ -154,6 +158,16 @@ class ObservationEngine:
         for m in _FILE_SAVED_RE.findall(combined):
             obs.new_files.append(m)
             obs.file_provenance[m] = "LOCAL_FILE"
+
+        # ── Uploaded / discovered remote files -> REMOTE_FILE ──
+        for m in _FILE_UPLOADED_RE.findall(combined):
+            clean_m = m.strip().rstrip(".,);")
+            if clean_m and len(clean_m) > 1:
+                obs.new_files.append(clean_m)
+                if clean_m not in obs.file_provenance:
+                    obs.file_provenance[clean_m] = "REMOTE_FILE"
+                if clean_m.startswith("/") or clean_m.startswith("uploads/") or "/" in clean_m:
+                    obs.new_endpoints.append(clean_m)
 
         # ── Source code file references -> SOURCE_CODE_REFERENCE ──
         for m in _SOURCE_FILE_RE.findall(combined):

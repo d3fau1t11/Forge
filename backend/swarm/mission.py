@@ -101,6 +101,7 @@ class SharedMissionState:
     successful_techniques: List[str] = field(default_factory=list)
     failed_techniques: List[str] = field(default_factory=list)
     dead_ends: List[str] = field(default_factory=list)
+    exhausted_strategies: List[str] = field(default_factory=list)
     attempted_signatures: List[str] = field(default_factory=list)  # normalized cmd/task dedup
 
     # ── Flags ───────────────────────────────────────────────────────────────
