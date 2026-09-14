@@ -47,7 +47,11 @@ FLAG_REGEX = re.compile(
 FALSE_FLAG_PATTERNS = re.compile(
     r"(?:picoCTF\{\.\.\.\}|FLAG\{\.\.\.\}|HTB\{\.\.\.\}|CTF\{\.\.\.\}|"
     r"\{[a-z_]+_here\}|\{example[^}]*\}|\{your[^}]*\}|\{placeholder[^}]*\}|"
-    r"\{some[^}]*\}|\{flag[^}]*format[^}]*\}|\{insert[^}]*\}|\{\.\.\.\})",
+    r"\{some[^}]*\}|\{flag[^}]*format[^}]*\}|\{insert[^}]*\}|\{\.\.\.\}|"
+    # Bare single-word placeholder bodies — the FULL content between braces is one
+    # of these common dummy words.  picoCTF{flag} / FLAG{value} / HTB{todo} etc.
+    # were previously not caught because the deny-list only covered _here/example/…
+    r"\{(?:flag|value|answer|x|todo|redacted|tbd)\})",
     re.IGNORECASE,
 )
 
@@ -210,8 +214,17 @@ class AnswerResolver:
 
     def looks_like_source_code(self, value: str) -> bool:
         """True when *value* is a source-code / extraction expression, not a captured
-        literal answer. For a flag envelope the BODY between the braces is inspected
-        (the envelope's own braces are legitimate); otherwise the whole value is."""
+        literal answer.
+
+        Two checks:
+        1. For a flag envelope the BODY between the braces is inspected for code
+           syntax signals (the envelope's own braces are legitimate).
+        2. Any non-whitespace characters immediately before or after the matched
+           envelope in the raw candidate string are treated as an interpolation
+           signal — e.g. a trailing ``")`` from a Python f-string, or a leading
+           ``f"`` prefix, are invisible to the body check but clearly not a captured
+           literal flag.
+        """
         if not value:
             return False
         subject = value.strip()
@@ -221,6 +234,12 @@ class AnswerResolver:
             brace = inner.find("{")
             if brace != -1 and inner.rstrip().endswith("}"):
                 subject = inner[brace + 1:inner.rstrip().rfind("}")]
+            # Check for non-whitespace context surrounding the envelope — anything
+            # outside a clean `prefix{...}` structure signals string interpolation.
+            pre = value[:m.start()].strip()
+            post = value[m.end():].strip()
+            if pre or post:
+                return True
         return bool(SOURCE_CODE_SIGNALS.search(subject))
 
     def normalize_source(self, source: Any) -> AnswerSource:

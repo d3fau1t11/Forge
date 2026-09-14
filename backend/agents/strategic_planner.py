@@ -605,4 +605,116 @@ class StrategicPlanner:
         mission_plan["updated_at"] = datetime.utcnow().isoformat()
         return mission_plan
 
+    async def review_swarm_pivot(
+        self,
+        challenge_name: str,
+        category: str,
+        target: str,
+        exhausted_strategies: List[str],
+        recent_history: List[str],
+        all_strategy_attempts: Dict[str, int],
+    ) -> tuple:
+        """Diagnose why a strategy class was exhausted and return a pivot directive.
+
+        Pure / side-effect-free: accepts swarm shared state, returns
+        ``(pivot_strategy_text: str, banned_strategies: List[str])`` without
+        mutating any caller data.  Called once per exhausted strategy event;
+        the caller writes the result to ``board.pivot_directive``.
+
+        Uses the same Gemini-first / DeepSeek-fallback chain as
+        ``review_and_adapt_plan``.
+        """
+        logger.info(
+            f"[StrategicPlanner] review_swarm_pivot for {challenge_name} "
+            f"| exhausted={exhausted_strategies}"
+        )
+        history_str = "\n".join(recent_history[-8:]) if recent_history else "No history recorded."
+        attempts_str = json.dumps(all_strategy_attempts, indent=2)
+        banned_str = ", ".join(exhausted_strategies) if exhausted_strategies else "(none yet)"
+
+        prompt = (
+            f"You are the Senior Strategic Review Model for the FORGE Autonomous Pentest System.\n"
+            f"The swarm of agents is STUCK: the following approach classes were tried repeatedly "
+            f"across ALL workers without producing any new evidence:\n"
+            f"  EXHAUSTED STRATEGIES: {banned_str}\n\n"
+            f"TARGET CONTEXT:\n"
+            f"Challenge: {challenge_name} | Category: {category} | Target: {target}\n\n"
+            f"STRATEGY ATTEMPT COUNTS (turns per class):\n{attempts_str}\n\n"
+            f"RECENT CROSS-AGENT COMMAND/OUTPUT HISTORY:\n{history_str}\n\n"
+            f"YOUR TASK:\n"
+            f"1. Identify the root cause: why did the exhausted strategy classes fail?\n"
+            f"2. Propose a CONCRETE pivot — a genuinely different class of approach "
+            f"(e.g. if credential_stuffing is exhausted, suggest jwt_tamper or idor_bypass).\n"
+            f"3. List ALL strategy labels that should remain banned (the exhausted ones + "
+            f"any variations that would have the same dead end).\n\n"
+            f"OUTPUT FORMAT (STRICT JSON ONLY):\n"
+            f"{{\n"
+            f'  "diagnosis": "1-2 sentence root cause",\n'
+            f'  "pivot_strategy": "Concrete, actionable pivot instruction for the agents",\n'
+            f'  "banned_strategies": ["label1", "label2"]\n'
+            f"}}"
+        )
+
+        pivot_strategy = (
+            f"All {banned_str} approaches exhausted. "
+            "Switch to a completely different attack class — enumerate the application "
+            "source/config, try JWT/session token manipulation, or probe for IDOR/SSRF."
+        )
+        banned: List[str] = list(exhausted_strategies)
+
+        # Primary: Gemini
+        gemini_success = False
+        try:
+            gemini_provider = model_router.providers.get("gemini")
+            if gemini_provider and await gemini_provider.is_available():
+                resp = await gemini_provider.generate_response(
+                    prompt=prompt,
+                    system_instruction=(
+                        "You are a Principal Cyber Operations Strategist. "
+                        "Analyze the stuck swarm and output valid JSON only."
+                    ),
+                    capability="general_reasoning",
+                )
+                if not resp.is_refusal and resp.content:
+                    raw = resp.content.strip()
+                    if not any(neg in raw.lower() for neg in ["i cannot", "i can't", "unable to assist"]):
+                        m = re.search(r"\{[\s\S]*\}", raw)
+                        if m:
+                            parsed = json.loads(m.group(0))
+                            if isinstance(parsed, dict) and "pivot_strategy" in parsed:
+                                pivot_strategy = parsed["pivot_strategy"]
+                                extra_banned = parsed.get("banned_strategies", [])
+                                if isinstance(extra_banned, list):
+                                    banned = list(set(banned) | set(extra_banned))
+                                gemini_success = True
+        except Exception as e:
+            logger.warning(f"[StrategicPlanner] review_swarm_pivot Gemini call failed: {e}")
+
+        # Fallback: model router (DeepSeek / best available)
+        if not gemini_success:
+            try:
+                resp = await model_router.route_request(
+                    prompt=prompt,
+                    capability="code_analysis",
+                    system_instruction=(
+                        "You are a Principal Security Researcher. "
+                        "Analyze the stuck swarm and output valid JSON only."
+                    ),
+                    speed_tier="deep",
+                )
+                raw = (resp.content or "").strip()
+                m = re.search(r"\{[\s\S]*\}", raw)
+                if m:
+                    parsed = json.loads(m.group(0))
+                    if isinstance(parsed, dict) and "pivot_strategy" in parsed:
+                        pivot_strategy = parsed["pivot_strategy"]
+                        extra_banned = parsed.get("banned_strategies", [])
+                        if isinstance(extra_banned, list):
+                            banned = list(set(banned) | set(extra_banned))
+            except Exception as e:
+                logger.warning(f"[StrategicPlanner] review_swarm_pivot fallback call failed: {e}")
+
+        return pivot_strategy, banned
+
+
 strategic_planner = StrategicPlanner()

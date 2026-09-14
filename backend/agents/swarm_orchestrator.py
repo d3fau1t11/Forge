@@ -42,6 +42,7 @@ from backend.agents.agent_prompt import AgentContext, build_agent_prompt, make_c
 from backend.agents.artifact_acquisition import acquire_artifacts
 from backend.agents import checkpoint_pipeline
 from backend.agents.checkpoint_pipeline import AgentCheckpointRecord
+from backend.agents.strategic_planner import strategic_planner
 from backend.agent_runtime.verifier import (
     AnswerResolver, AnswerCandidate, AnswerVerdict, AnswerStatus, AnswerSource,
     VerifierAgent, FLAG_REGEX, FALSE_FLAG_PATTERNS,
@@ -49,6 +50,13 @@ from backend.agent_runtime.verifier import (
 
 
 logger = logging.getLogger("forge.swarm")
+
+# ── Strategy-exhaustion constants (PRIMARY fix: "No FA" budget burn) ─────────
+# Number of consecutive/total turns on a strategy that produce NO new evidence
+# before the strategy is declared exhausted (mirrors blocked_failure_sigs threshold=3).
+STRATEGY_STALE_LIMIT = 3
+# Hard cap on total turns spent on any single strategy across all agents.
+STRATEGY_ATTEMPT_LIMIT = 5
 
 # HTTP header names are token characters per RFC 7230 (no spaces, no exotic
 # punctuation). Values must be printable single-line ASCII. Anything else is
@@ -357,6 +365,126 @@ def _normalize_command_shape(cmd: str) -> str:
     return f"{target_host}:{prog}:{args_str}"
 
 
+def _compute_evidence_fingerprint(output: str) -> str:
+    """Lightweight fingerprint of any NEW fact surfaced by an action output.
+
+    Normalises the output (strips timestamps, memory addresses, UUIDs) so that
+    cosmetically-different but semantically-identical outputs hash identically.
+    Returns an empty string for empty/whitespace-only output so callers can
+    treat falsy-fingerprint as 'produced nothing'.
+    """
+    if not output or not output.strip():
+        return ""
+    # Normalise away values that vary between runs but don't represent new facts.
+    norm = output.strip()
+    norm = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "UUID", norm, flags=re.IGNORECASE)
+    norm = re.sub(r"0x[0-9a-fA-F]+", "0xADDR", norm)
+    norm = re.sub(r"\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[.\d]*Z?\b", "TIMESTAMP", norm)
+    norm = re.sub(r"\s+", " ", norm).lower().strip()
+    return hashlib.sha256(norm[:800].encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _update_strategy_state(
+    board: "SwarmBlackboard",
+    agent_id: str,
+    strategy_label: str,
+    output: str,
+    res: object,
+) -> bool:
+    """Record one strategy turn and return True if the strategy just became exhausted.
+
+    Called after every command execution (including clean exit=0 runs). Updates:
+    - ``strategy_attempts``         — total turns on this label
+    - ``strategy_evidence_fingerprints`` — set of distinct evidence hashes seen
+    - ``strategy_stale_counts``     — consecutive stale turns (reset on new evidence)
+    - ``exhausted_strategies``      — set if stale or attempt limit is hit
+
+    This is a plain function (not a method) so it can be unit-tested without
+    constructing a live SwarmBlackboard.
+    """
+    label = (strategy_label or "unknown").strip().lower()
+    board.strategy_attempts[label] = board.strategy_attempts.get(label, 0) + 1
+
+    fp = _compute_evidence_fingerprint(output)
+    known = board.strategy_evidence_fingerprints.setdefault(label, set())
+    if fp and fp not in known:
+        known.add(fp)
+        board.strategy_stale_counts[label] = 0          # new evidence → reset stale
+        stale = 0
+    else:
+        board.strategy_stale_counts[label] = board.strategy_stale_counts.get(label, 0) + 1
+        stale = board.strategy_stale_counts[label]
+
+    attempts = board.strategy_attempts.get(label, 0)
+    if label not in board.exhausted_strategies:
+        if stale >= STRATEGY_STALE_LIMIT or attempts >= STRATEGY_ATTEMPT_LIMIT:
+            board.exhausted_strategies.add(label)
+            _append_to_challenge_log(
+                board.challenge_id, agent_id,
+                f"[STRATEGY EXHAUSTED] '{label}' (stale={stale}, total_attempts={attempts})"
+            )
+            logger.info("[%s] [STRATEGY EXHAUSTED] label=%s stale=%d attempts=%d",
+                        agent_id, label, stale, attempts)
+            return True
+    return False
+
+
+async def _force_pivot_if_needed(board: "SwarmBlackboard", agent_id: str, exhausted_label: str):
+    """Trigger a strategic pivot review when a strategy class is marked exhausted.
+
+    Guarded by board._lock so only one review runs at a time. Sets board.pivot_directive,
+    appends banned labels to board.exhausted_strategies, logs to challenge log, and
+    broadcasts STRATEGY_PIVOT_FORCED over WebSocket.
+    """
+    async with board._lock:
+        if board.pivot_directive and board.pivot_directive != "__pending__":
+            return
+        board.pivot_directive = "__pending__"
+
+    history = [
+        h.get("command", "") + " -> " + (h.get("output") or "")[:80]
+        for h in board.execution_history[-10:]
+    ]
+    try:
+        pivot_text, banned = await strategic_planner.review_swarm_pivot(
+            challenge_name=board.challenge_name,
+            category=board.category,
+            target=board.target_scope,
+            exhausted_strategies=list(board.exhausted_strategies),
+            recent_history=history,
+            all_strategy_attempts=dict(board.strategy_attempts),
+        )
+    except Exception as e:
+        logger.warning(f"[{agent_id}] Swarm pivot review failed: {e}")
+        pivot_text = (
+            f"All {', '.join(sorted(board.exhausted_strategies))} approaches exhausted. "
+            "Switch to a completely different attack class."
+        )
+        banned = list(board.exhausted_strategies)
+
+    async with board._lock:
+        board.pivot_directive = pivot_text
+        for b in banned:
+            if b:
+                board.exhausted_strategies.add(b.strip().lower())
+
+    _append_to_challenge_log(
+        board.challenge_id, agent_id,
+        f"[STRATEGY_PIVOT_FORCED] New directive: {pivot_text[:200]}"
+    )
+    try:
+        await ws_manager.broadcast({
+            "event": "STRATEGY_PIVOT_FORCED",
+            "challenge_id": board.challenge_id,
+            "run_id": board.run_id,
+            "exhausted": list(board.exhausted_strategies),
+            "pivot": pivot_text,
+            "triggered_by": agent_id,
+        })
+    except Exception:
+        pass
+
+
 class SwarmTask:
     def __init__(self, task_id: str, category: str, description: str, priority: int = 1, metadata: Optional[Dict] = None):
         self.task_id = task_id
@@ -404,6 +532,15 @@ class SwarmBlackboard:
         # (resumable) rather than FAILED. Distinct from is_stopped, which also
         # trips on flag capture / kill switch.
         self.pause_requested = False
+        # ── Strategy-exhaustion tracking (PRIMARY fix for "No FA" budget burn) ──
+        # Keyed by strategy label (snake_case, from the agent's STRATEGY: line).
+        # Shared across ALL agents on the blackboard — agent_1's stale result
+        # counts against agent_3's budget for the same strategy class.
+        self.strategy_attempts: Dict[str, int] = {}           # total turns per label
+        self.strategy_stale_counts: Dict[str, int] = {}       # consecutive stale turns
+        self.strategy_evidence_fingerprints: Dict[str, Set[str]] = {}  # distinct evidence hashes
+        self.exhausted_strategies: Set[str] = set()           # labels that hit the limit
+        self.pivot_directive: str = ""                        # injected after a forced pivot
         # Stall / refill / persistence state
         self.stall_reason: Optional[str] = None
         self.worker_states: Dict[str, Dict[str, Any]] = {}
@@ -812,6 +949,15 @@ class SwarmBlackboard:
                 "failure_signatures": dict(self.failure_signatures),
                 "blocked_failure_sigs": list(self.blocked_failure_sigs),
                 "blocked_capabilities": list(self.blocked_capabilities),
+                # Strategy-exhaustion state — survived across pause/resume so a
+                # resumed run never re-spends budget on already-exhausted approaches.
+                "strategy_attempts": dict(self.strategy_attempts),
+                "strategy_stale_counts": dict(self.strategy_stale_counts),
+                "strategy_evidence_fingerprints": {
+                    k: list(v) for k, v in self.strategy_evidence_fingerprints.items()
+                },
+                "exhausted_strategies": list(self.exhausted_strategies),
+                "pivot_directive": self.pivot_directive,
             },
         }
 
@@ -839,6 +985,18 @@ class SwarmBlackboard:
             self.blocked_failure_sigs.add(sig)
         for cap in (snapshot.get("blocked_capabilities") or []):
             self.blocked_capabilities.add(cap)
+        # Strategy-exhaustion state — restore so a resumed run doesn't re-burn budget
+        # on already-exhausted approaches (checkpoint-safe requirement).
+        for k, v in (snapshot.get("strategy_attempts") or {}).items():
+            self.strategy_attempts[k] = int(v)
+        for k, v in (snapshot.get("strategy_stale_counts") or {}).items():
+            self.strategy_stale_counts[k] = int(v)
+        for k, vs in (snapshot.get("strategy_evidence_fingerprints") or {}).items():
+            self.strategy_evidence_fingerprints.setdefault(k, set()).update(vs or [])
+        for label in (snapshot.get("exhausted_strategies") or []):
+            if label:
+                self.exhausted_strategies.add(label)
+        self.pivot_directive = snapshot.get("pivot_directive") or ""
 
         for ep in (snapshot.get("discovered_endpoints") or []):
             if ep:
@@ -1059,6 +1217,15 @@ class SwarmBlackboard:
         if self.flag_candidates:
             lines.append("Unverified flag candidates so far (MUST be reproduced from real output before accepting): "
                          + ", ".join(c.get("flag", "") for c in self.flag_candidates[:5]))
+        # Strategy-exhaustion awareness: every agent sees the global ban list and
+        # pivot directive so no worker independently rediscovers the dead end.
+        if self.exhausted_strategies:
+            lines.append(
+                "[STRATEGY GATE] Exhausted approaches — do NOT repeat these: "
+                + ", ".join(sorted(self.exhausted_strategies))
+            )
+        if self.pivot_directive and self.pivot_directive != "__pending__":
+            lines.append(f"[REQUIRED PIVOT] {self.pivot_directive}")
         # Escalation: reconstructed derived artifacts that still need analysis. This is
         # the shared-channel form of an `analyze_derived_artifact` task (WHAT/HOW/WHETHER)
         # — the swarm must not conclude "no flag" while any of these is un-analyzed.
@@ -1578,6 +1745,7 @@ class SwarmOrchestrator:
     def _build_agent_context(self, board: "SwarmBlackboard", workdir: str, agent_id: str) -> AgentContext:
         """Full challenge context for one agent this turn (identical template for all;
         only history_context + injected_directive differ per agent)."""
+        pivot = board.pivot_directive if board.pivot_directive != "__pending__" else ""
         return make_context_from_env(
             env_info=board.env_info or {},
             challenge_name=board.challenge_name,
@@ -1595,6 +1763,8 @@ class SwarmOrchestrator:
             history_context=board.build_history_context(agent_id),
             injected_directive=board.agent_directives.get(agent_id, ""),
             memory_context=board.memory_context,
+            exhausted_strategies=list(board.exhausted_strategies),
+            pivot_directive=pivot,
         )
 
     async def _agent_worker(self, agent_id: str, board: "SwarmBlackboard", workdir: str, capability: str):
@@ -1684,6 +1854,12 @@ class SwarmOrchestrator:
                 content = resp.content or ""
                 model_name = getattr(resp, "model_name", capability)
 
+                # ── Parse STRATEGY: tag (required from agent per system prompt Rule 7) ──
+                strategy_label = "unknown"
+                strategy_match = re.search(r"^STRATEGY:\s*(\w+)", content, re.MULTILINE | re.IGNORECASE)
+                if strategy_match:
+                    strategy_label = strategy_match.group(1).strip().lower()
+
                 # ── Parse the agent's single action per the prompt output contract ──
                 if re.search(r"\bBUDGET_EXHAUSTED\b", content):
                     board.record_agent_step(agent_id, note=f"Model reported BUDGET_EXHAUSTED: {content[:200]}")
@@ -1696,7 +1872,9 @@ class SwarmOrchestrator:
                     cand = flag_line.group(1).strip()
                     if FLAG_REGEX.search(cand) and not FALSE_FLAG_PATTERNS.search(cand):
                         await board.record_flag_candidate(cand, agent_id, "llm_reported")
-                        board.record_agent_step(agent_id, note=f"Agent reported flag candidate (unverified): {cand}")
+                        # NOTE: the verified/rejected log entry is written inside
+                        # record_flag_candidate() once the verifier returns its verdict.
+                        # Do NOT add a duplicate record_agent_step here (Secondary Bug 3).
 
                 # A Python solver block -> write solve.py and run it byte-safely.
                 py_match = re.search(r"```python\s*\n(.*?)\n```", content, re.DOTALL)
@@ -1806,6 +1984,23 @@ class SwarmOrchestrator:
 
                 board.executed_commands_dedup.add(cmd)
 
+                # ── Strategy gate pre-check ────────────────────────────────────────────
+                # Must run AFTER dedup so an exhausted-strategy command that is also a
+                # duplicate still hits the (cheaper) dedup guard first.
+                if strategy_label in board.exhausted_strategies:
+                    _append_to_challenge_log(
+                        board.challenge_id, agent_id,
+                        f"[STRATEGY BLOCKED] '{strategy_label}' is already exhausted — "
+                        f"forcing pivot (this command will not execute)."
+                    )
+                    board.record_agent_step(
+                        agent_id, command=cmd,
+                        note=f"[STRATEGY BLOCKED] Strategy '{strategy_label}' exhausted; skipping execution."
+                    )
+                    asyncio.create_task(_force_pivot_if_needed(board, agent_id, strategy_label))
+                    await asyncio.sleep(0.5)
+                    continue
+
                 _append_to_challenge_log(board.challenge_id, agent_id, f"Executing: {cmd[:200]}")
                 res = await tool_manager.execute_tool("bash", {"command": cmd}, timeout=25,
                                                       working_directory=workdir, canonical_target=board.target_scope)
@@ -1887,6 +2082,16 @@ class SwarmOrchestrator:
                 self._check_tool_output_for_flags(output, board, agent_id)
                 self._check_tool_output_for_rejections(output, board, agent_id)
                 await self._apply_decoded_directives(output, board, agent_id)
+
+                # ── Strategy evidence fingerprint + stale accounting ───────────────────
+                # Runs on EVERY clean execution (exit=0 or not) because a script that
+                # exits cleanly and prints "no flag found" is the exact failure mode we
+                # need to catch.  _update_strategy_state returns True when the strategy
+                # was just exhausted; in that case kick off the pivot immediately.
+                just_exhausted = _update_strategy_state(board, agent_id, strategy_label, output, res)
+                if just_exhausted:
+                    asyncio.create_task(_force_pivot_if_needed(board, agent_id, strategy_label))
+
                 # Encoded-artifact reconstruction: if this output is really an encoded
                 # file (e.g. ASCII 0/1 that reconstructs to a JPEG), rebuild it, preserve
                 # it as evidence, and escalate its analysis — never conclude "no flag"
