@@ -22,7 +22,9 @@ timeout · cancellation · unrecoverable failure · max turns.
 
 from __future__ import annotations
 
+import ast
 import os
+import re
 import sys
 import time
 import logging
@@ -55,6 +57,171 @@ class RunResult:
     turns: int = 0
     reason: str = ""
     flag_candidates: List[str] = field(default_factory=list)
+
+
+# ── Generic target/URL resolution (Task 3) ─────────────────────────────────── #
+# Resolve a possibly-relative URL reference against the challenge's canonical target.
+# Purely mechanical (urljoin) — no challenge-specific rules, no hardcoded endpoints.
+
+def resolve_target_url(reference: str, canonical_target: Optional[str]) -> str:
+    """Resolve *reference* against *canonical_target*.
+
+    - empty reference               → the canonical target (or "")
+    - reference already absolute     → returned unchanged (scheme present)
+    - no canonical target            → reference returned unchanged
+    - relative reference             → joined onto the canonical target, preserving
+                                       its scheme, host, non-default port and path prefix.
+    A leading-'/' reference resolves against the host root; a bare relative reference
+    resolves *under* the canonical target treated as a directory.
+    """
+    from urllib.parse import urljoin
+    ref = (reference or "").strip()
+    base = (canonical_target or "").strip()
+    if not ref:
+        return base
+    if "://" in ref:
+        return ref
+    if not base:
+        return ref
+    if "://" not in base:
+        base = "http://" + base
+    if ref.startswith("/"):
+        return urljoin(base, ref)
+    dir_base = base if base.endswith("/") else base + "/"
+    return urljoin(dir_base, ref)
+
+
+# ── Pre-execution generated-Python consistency check (Tasks 2, 3, 8) ────────── #
+# Catches a handful of GENERIC, reliably-detectable mistakes before a mission turn is
+# spent running a script that is guaranteed to fail. All checks are AST-based (never
+# fragile source regexes) and conservative: only unambiguous cases fire.
+#
+#   * INTERPRETER_ASSUMPTION — a Python-2-only string codec (str.encode('base64'), …)
+#     that always raises LookupError on a Python 3 host.
+#   * FILE_NOT_FOUND         — the script open()s a relative local file for READING
+#     that does not exist and is not created by an earlier write in the same script.
+#   * INVALID_URL            — a scheme-less URL literal passed to requests/httpx/urlopen
+#     that always raises "No scheme supplied".
+#
+# Anything not reliably detectable statically (arbitrary bytes/str misuse, dynamic
+# paths, non-literal URLs) is deliberately left to execution feedback + recovery.
+
+# Python-2-only text/binary transform codecs (invalid for str.encode/str.decode in py3).
+_PY2_TEXT_CODECS = {
+    "base64", "base64_codec", "hex", "hex_codec", "rot13", "rot_13", "uu", "uu_codec",
+    "zlib", "zlib_codec", "bz2", "bz2_codec", "quopri", "quopri_codec", "string_escape",
+}
+# HTTP entrypoints whose first positional argument is a URL. Kept tight (known modules
+# only) so a scheme-less first arg is UNAMBIGUOUSLY a bad URL — never a dict.get() etc.
+_HTTP_METHODS = {"get", "post", "put", "delete", "patch", "head", "options", "request"}
+_HTTP_MODULES = {"requests", "httpx"}
+
+
+def _py_str_literal(node: Any) -> Optional[str]:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _py_is_write_mode(mode: str) -> bool:
+    m = (mode or "").lower()
+    return any(c in m for c in "wax") or "+" in m
+
+
+def _py_is_relative_local(path: str) -> bool:
+    """True only for a workspace-relative path — absolute/home/drive/URL refs are
+    target- or host-side and are never flagged as a missing local artifact."""
+    if not path or "://" in path:
+        return False
+    if path.startswith(("/", "\\", "~")):
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", path):
+        return False
+    return True
+
+
+def _fail(category: str, message: str) -> "ExecResult":
+    return ExecResult(status="FAILED", stderr=f"Pre-execution check: {message}",
+                      exit_code=-1, execution_failure=True, failure_category=category)
+
+
+def analyze_python_script(script: str, *, cwd: Optional[str] = None,
+                          canonical_target: Optional[str] = None) -> Optional["ExecResult"]:
+    """Return a structured failure ExecResult for a reliably-detectable pre-exec issue,
+    or None when the script is clear to run. Syntax errors are the caller's concern."""
+    try:
+        tree = ast.parse(script or "")
+    except SyntaxError:
+        return None  # caller reports SYNTAX_ERROR separately
+
+    written: set = set()
+    read_paths: List[str] = []
+    py2_codec: Optional[str] = None
+    bad_url: Optional[str] = None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+
+        # open(path[, mode]) — track write-mode targets, collect read-mode relative paths.
+        if isinstance(f, ast.Name) and f.id == "open" and node.args:
+            p = _py_str_literal(node.args[0])
+            if p is not None:
+                mode = _py_str_literal(node.args[1]) if len(node.args) > 1 else "r"
+                for kw in node.keywords:
+                    if kw.arg == "mode":
+                        mode = _py_str_literal(kw.value) or mode
+                mode = mode or "r"
+                norm = p[2:] if p.startswith("./") else p
+                if _py_is_write_mode(mode):
+                    written.add(norm)
+                elif _py_is_relative_local(p):
+                    read_paths.append(norm)
+            continue
+
+        # x.encode('base64') / x.decode('hex') — Python-2-only string codec.
+        if isinstance(f, ast.Attribute) and f.attr in ("encode", "decode") and node.args:
+            codec = _py_str_literal(node.args[0])
+            if codec and codec.lower().replace("-", "_") in _PY2_TEXT_CODECS and py2_codec is None:
+                py2_codec = f"{f.attr}('{codec}')"
+            continue
+
+        # requests.post('upload.php') / httpx.get(...) / urlopen('upload.php') — scheme-less URL.
+        if bad_url is None:
+            method = recv = None
+            if isinstance(f, ast.Attribute):
+                method, recv = f.attr, (f.value.id if isinstance(f.value, ast.Name) else None)
+            elif isinstance(f, ast.Name):
+                method = f.id
+            arg0 = _py_str_literal(node.args[0]) if node.args else None
+            if arg0 and "://" not in arg0:
+                if (recv in _HTTP_MODULES and method in _HTTP_METHODS) or method in ("urlopen", "urlretrieve"):
+                    bad_url = arg0
+
+    if py2_codec is not None:
+        return _fail("INTERPRETER_ASSUMPTION",
+                     f"the script calls .{py2_codec}, a Python-2-only string codec that raises "
+                     f"LookupError on this Python 3 host. Use the base64 / binascii / codecs modules "
+                     f"instead (e.g. base64.b64encode(...), codecs.encode(data, '...')).")
+
+    check_dir = cwd if (cwd and os.path.isdir(cwd)) else "."
+    missing = [p for p in dict.fromkeys(read_paths)
+               if p not in written and not os.path.exists(os.path.join(check_dir, p))]
+    if missing:
+        return _fail("FILE_NOT_FOUND",
+                     f"the script reads local file(s) that do not exist in the workspace and are "
+                     f"not created by an earlier step: {', '.join(missing[:5])}. Create, download or "
+                     f"generate the artifact first, or use a technique that does not need it. Do NOT "
+                     f"re-run the same script unchanged.")
+
+    if bad_url is not None:
+        resolved = resolve_target_url(bad_url, canonical_target)
+        hint = (f" Use the absolute URL '{resolved}'." if resolved and "://" in resolved
+                else " Use the full target URL including scheme and host (e.g. http://<host>/...).")
+        return _fail("INVALID_URL",
+                     f"an HTTP request used the scheme-less URL '{bad_url}', which raises "
+                     f"'No scheme supplied'.{hint}")
+
+    return None
 
 
 class RealToolExecutor:
@@ -93,6 +260,13 @@ class RealToolExecutor:
                     execution_failure=True,
                     failure_category="SYNTAX_ERROR",
                 )
+            # Pre-execution consistency check (missing local artifact / scheme-less URL /
+            # Python-2-only codec). Returns a structured failure so the reasoning loop gets
+            # actionable evidence instead of wasting a turn on a guaranteed runtime crash.
+            issue = analyze_python_script(action.script, cwd=cwd, canonical_target=canonical_target)
+            if issue is not None:
+                issue.command = issue.command or action.display()
+                return issue
             script_path = os.path.join(cwd or ".", "solve.py")
             try:
                 with open(script_path, "w", encoding="utf-8") as f:

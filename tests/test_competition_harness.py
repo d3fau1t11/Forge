@@ -61,11 +61,17 @@ class TestCompetitionHarness(unittest.TestCase):
         init_db()
         cls.server = LocalCTFServer(port=8888)
         cls.server.start()
-        cls.forensics_path = create_forensics_fixture()
+        # Generate the forensics fixture in a throwaway dir so the committed
+        # tests/fixtures/evidence_sample.zip is never rewritten (keeps the tree clean).
+        cls._fixture_dir = tempfile.mkdtemp(prefix="forge_forensics_")
+        cls.forensics_path = create_forensics_fixture(
+            output_path=os.path.join(cls._fixture_dir, "evidence_sample.zip"))
 
     @classmethod
     def tearDownClass(cls):
         cls.server.stop()
+        import shutil
+        shutil.rmtree(getattr(cls, "_fixture_dir", ""), ignore_errors=True)
 
     def test_real_tool_manager_execution(self):
         """Tool Manager Validation: Execute real CLI tools on host system."""
@@ -278,19 +284,22 @@ class TestCompetitionHarness(unittest.TestCase):
         async def scenario():
             executor = RealToolExecutor(tool_manager=tool_manager)
 
-            # Valid script
-            valid_act = Action(type=ActionType.PYTHON_SCRIPT, script="a = 10\nb = 20\nprint(f'RES={a+b}')\n")
-            res_valid = await executor.execute(valid_act)
-            self.assertEqual(res_valid.status, "SUCCESS")
-            self.assertIn("RES=30", res_valid.stdout)
+            # Run in a throwaway workspace so the generated solve.py is not written
+            # into the repo root (keeps the working tree clean / zip-ready).
+            with tempfile.TemporaryDirectory() as tmp:
+                # Valid script
+                valid_act = Action(type=ActionType.PYTHON_SCRIPT, script="a = 10\nb = 20\nprint(f'RES={a+b}')\n")
+                res_valid = await executor.execute(valid_act, cwd=tmp)
+                self.assertEqual(res_valid.status, "SUCCESS")
+                self.assertIn("RES=30", res_valid.stdout)
 
-            # Invalid syntax script
-            invalid_act = Action(type=ActionType.PYTHON_SCRIPT, script="def broken_func(\n")
-            res_invalid = await executor.execute(invalid_act)
-            self.assertEqual(res_invalid.status, "FAILED")
-            self.assertTrue(res_invalid.execution_failure)
-            self.assertEqual(res_invalid.failure_category, "SYNTAX_ERROR")
-            self.assertIn("SyntaxError in generated Python script", res_invalid.stderr)
+                # Invalid syntax script
+                invalid_act = Action(type=ActionType.PYTHON_SCRIPT, script="def broken_func(\n")
+                res_invalid = await executor.execute(invalid_act, cwd=tmp)
+                self.assertEqual(res_invalid.status, "FAILED")
+                self.assertTrue(res_invalid.execution_failure)
+                self.assertEqual(res_invalid.failure_category, "SYNTAX_ERROR")
+                self.assertIn("SyntaxError in generated Python script", res_invalid.stderr)
 
         asyncio.run(scenario())
 

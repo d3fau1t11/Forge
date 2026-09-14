@@ -104,6 +104,9 @@ def classify_tool_execution(tool_name: str, exit_code: Optional[int], stdout: st
     if ("modulenotfounderror" in combined or "no module named" in combined
             or "importerror" in combined):
         return {"execution_failure": True, "failure_category": "MISSING_DEP"}
+    if ("no scheme supplied" in combined or "invalid url" in combined
+            or "missing scheme" in combined or "unknown url type" in combined):
+        return {"execution_failure": True, "failure_category": "INVALID_URL"}
 
     # ── NETWORK-level failures (left the host, no usable target response) ──────────────
     if exit_code in [6] or "could not resolve host" in combined or "name or service not known" in combined:
@@ -124,6 +127,7 @@ def classify_tool_execution(tool_name: str, exit_code: Optional[int], stdout: st
 # COMMAND_NOT_FOUND is included: a missing binary is a local problem, not a target signal.
 LOCAL_EXEC_CATEGORIES = frozenset({
     "FILE_NOT_FOUND", "SYNTAX_ERROR", "PERMISSION_DENIED", "MISSING_DEP", "COMMAND_NOT_FOUND",
+    "INVALID_URL", "INTERPRETER_ASSUMPTION",
 })
 
 

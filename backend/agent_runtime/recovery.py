@@ -26,6 +26,9 @@ class FailureCategory(str, Enum):
     COMMAND_NOT_FOUND = "COMMAND_NOT_FOUND"
     SYNTAX_ERROR = "SYNTAX_ERROR"
     MISSING_DEPENDENCY = "MISSING_DEPENDENCY"
+    FILE_NOT_FOUND = "FILE_NOT_FOUND"
+    INVALID_URL = "INVALID_URL"
+    INTERPRETER_ASSUMPTION = "INTERPRETER_ASSUMPTION"
     PERMISSION_FAILURE = "PERMISSION_FAILURE"
     NETWORK_FAILURE = "NETWORK_FAILURE"
     REPEATED_ACTION = "REPEATED_ACTION"
@@ -130,6 +133,40 @@ class RecoveryEngine:
             return RecoveryPlan(FailureCategory.NONE, RecoveryStrategy.CONTINUE)
 
         self._bump(True)
+
+        # ── Local-execution failures already classified by the ToolManager/runtime ──
+        # (Task 4) Surface the STRUCTURED failure category with an actionable directive
+        # that names local-vs-target and whether an identical retry is useful, rather than
+        # forcing the model to infer everything from raw log text.
+        if failure_cat == "FILE_NOT_FOUND" or (
+                not failure_cat and ("[errno 2]" in combined.lower()
+                                     or "no such file or directory" in combined.lower())):
+            return RecoveryPlan(
+                FailureCategory.FILE_NOT_FOUND, RecoveryStrategy.RETRY_MODIFIED,
+                "LOCAL execution failure (not a target response): the action referenced a local "
+                "file/artifact that does not exist in the workspace. Create, download or generate "
+                "that artifact in a prior step, or choose a technique that does not need it. Do NOT "
+                "re-run the same action unchanged.",
+                reasons=["Referenced local file/artifact is missing."],
+            )
+        if failure_cat == "INVALID_URL" or (
+                not failure_cat and ("no scheme supplied" in combined.lower()
+                                     or "invalid url" in combined.lower())):
+            return RecoveryPlan(
+                FailureCategory.INVALID_URL, RecoveryStrategy.RETRY_MODIFIED,
+                "LOCAL execution failure: an HTTP request used a scheme-less/relative URL. Reissue it "
+                "against the FULL canonical target URL (with scheme and host) — never pass a bare "
+                "filename or path to an HTTP client. Do NOT re-run the same request unchanged.",
+                reasons=["Scheme-less/relative URL passed to an HTTP client."],
+            )
+        if failure_cat == "INTERPRETER_ASSUMPTION":
+            return RecoveryPlan(
+                FailureCategory.INTERPRETER_ASSUMPTION, RecoveryStrategy.RETRY_MODIFIED,
+                "LOCAL execution failure: the script used a Python-2-only construct (e.g. "
+                "str.encode('base64')). This host runs Python 3 — use the base64 / binascii / codecs "
+                "modules instead, and resend a corrected script.",
+                reasons=["Python-2-only construct on a Python-3 host."],
+            )
 
         # ── Concrete failure classification (order = specificity) ──
         if status == "TIMEOUT" or "timed out" in combined.lower():

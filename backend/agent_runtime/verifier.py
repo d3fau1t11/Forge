@@ -51,6 +51,15 @@ FALSE_FLAG_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Signals that a "candidate value" is actually a fragment of SOURCE CODE / an
+# extraction *expression* (e.g. `{resp.text[resp.text.find('picoCTF{')...]}`) rather
+# than a literal answer captured from evidence. A real flag/answer read out of tool
+# output never contains quote characters, call/index syntax, or an ellipsis — those
+# only appear when the model emitted CODE describing how to find the answer instead
+# of the answer itself. Conservative on purpose: real flag/hash/username/number/URL
+# bodies use none of these, so this cannot reject a genuine captured answer.
+SOURCE_CODE_SIGNALS = re.compile(r"""['"]|\.\.\.|[\[\]()]|\.\w+\s*\(""")
+
 # Common hash patterns
 MD5_REGEX = re.compile(r"\b[a-f0-9]{32}\b", re.IGNORECASE)
 SHA1_REGEX = re.compile(r"\b[a-f0-9]{40}\b", re.IGNORECASE)
@@ -199,6 +208,21 @@ class AnswerResolver:
     def looks_like_flag(self, text: str) -> bool:
         return bool(text) and bool(FLAG_REGEX.search(text)) and not FALSE_FLAG_PATTERNS.search(text)
 
+    def looks_like_source_code(self, value: str) -> bool:
+        """True when *value* is a source-code / extraction expression, not a captured
+        literal answer. For a flag envelope the BODY between the braces is inspected
+        (the envelope's own braces are legitimate); otherwise the whole value is."""
+        if not value:
+            return False
+        subject = value.strip()
+        m = FLAG_REGEX.search(subject)
+        if m:
+            inner = m.group(0)
+            brace = inner.find("{")
+            if brace != -1 and inner.rstrip().endswith("}"):
+                subject = inner[brace + 1:inner.rstrip().rfind("}")]
+        return bool(SOURCE_CODE_SIGNALS.search(subject))
+
     def normalize_source(self, source: Any) -> AnswerSource:
         if isinstance(source, AnswerSource):
             return source
@@ -239,6 +263,8 @@ class AnswerResolver:
             if not v or v in seen_values:
                 return
             if FALSE_FLAG_PATTERNS.search(v):
+                return
+            if self.looks_like_source_code(v):
                 return
             seen_values.add(v)
             candidates.append(AnswerCandidate(
@@ -366,6 +392,16 @@ class AnswerResolver:
         if FALSE_FLAG_PATTERNS.search(candidate):
             return AnswerVerdict(AnswerStatus.REJECTED, 0.0, candidate,
                                  ["Matches a placeholder/example shape, not a real answer."],
+                                 AnswerType.CUSTOM, evidence)
+
+        # ── Source-Code / Extraction-Expression Gate ──
+        # A candidate that is really a code fragment describing HOW to extract the
+        # answer (e.g. `picoCTF{'):resp.text.find('}`) is never a captured answer,
+        # regardless of source. Reject it before any evidence-based promotion so a
+        # source-code artifact can never be recorded as RESOLVED/VERIFIED.
+        if self.looks_like_source_code(candidate):
+            return AnswerVerdict(AnswerStatus.REJECTED, 0.0, candidate,
+                                 ["Value is a source-code/extraction expression, not a literal captured answer."],
                                  AnswerType.CUSTOM, evidence)
 
         # ── Infer Expected Answer Type & Semantic Requirements ──
