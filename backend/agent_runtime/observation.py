@@ -37,7 +37,7 @@ _FILE_SAVED_RE = re.compile(
     re.IGNORECASE,
 )
 _FILE_UPLOADED_RE = re.compile(
-    r"(?:uploaded to|upload succeeded|upload successful|stored at|saved at|destination|path|uploaded file|uploaded)\s*(?:is|to|at|:)?\s+['\"]?([A-Za-z0-9._/\\\-]+)",
+    r"(?:uploaded successfully to|successfully uploaded to|uploaded to|upload succeeded|upload successful|upload successfully|stored at|saved at|destination|path|uploaded file|uploaded)\s*(?:is|to|at|:)?\s+['\"]?([A-Za-z0-9._/\\\-]+)",
     re.IGNORECASE,
 )
 _SOURCE_FILE_RE = re.compile(
