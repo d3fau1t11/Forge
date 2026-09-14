@@ -416,7 +416,8 @@ def _update_strategy_state(
         stale = board.strategy_stale_counts[label]
 
     attempts = board.strategy_attempts.get(label, 0)
-    if label not in board.exhausted_strategies:
+    # "unknown" strategy is exempt from entering exhausted_strategies to prevent locking out unformatted turns
+    if label != "unknown" and label not in board.exhausted_strategies:
         if stale >= STRATEGY_STALE_LIMIT or attempts >= STRATEGY_ATTEMPT_LIMIT:
             board.exhausted_strategies.add(label)
             _append_to_challenge_log(
@@ -432,41 +433,55 @@ def _update_strategy_state(
 async def _force_pivot_if_needed(board: "SwarmBlackboard", agent_id: str, exhausted_label: str):
     """Trigger a strategic pivot review when a strategy class is marked exhausted.
 
-    Guarded by board._lock so only one review runs at a time. Sets board.pivot_directive,
-    appends banned labels to board.exhausted_strategies, logs to challenge log, and
-    broadcasts STRATEGY_PIVOT_FORCED over WebSocket.
+    Serializes review calls per-label and globally so only one LLM review runs at a time,
+    while queuing/allowing subsequent reviews for newly exhausted strategies. Sets
+    board.pivot_directive, appends banned labels to board.exhausted_strategies, logs to
+    challenge log, and broadcasts STRATEGY_PIVOT_FORCED over WebSocket.
     """
+    label = (exhausted_label or "").strip().lower()
+    if not label:
+        return
+
     async with board._lock:
-        if board.pivot_directive and board.pivot_directive != "__pending__":
+        if (
+            label in board.pivot_reviews_in_flight
+            or label in board.reviewed_pivot_strategies
+        ):
             return
-        board.pivot_directive = "__pending__"
+        board.pivot_reviews_in_flight.add(label)
 
-    history = [
-        h.get("command", "") + " -> " + (h.get("output") or "")[:80]
-        for h in board.execution_history[-10:]
-    ]
     try:
-        pivot_text, banned = await strategic_planner.review_swarm_pivot(
-            challenge_name=board.challenge_name,
-            category=board.category,
-            target=board.target_scope,
-            exhausted_strategies=list(board.exhausted_strategies),
-            recent_history=history,
-            all_strategy_attempts=dict(board.strategy_attempts),
-        )
-    except Exception as e:
-        logger.warning(f"[{agent_id}] Swarm pivot review failed: {e}")
-        pivot_text = (
-            f"All {', '.join(sorted(board.exhausted_strategies))} approaches exhausted. "
-            "Switch to a completely different attack class."
-        )
-        banned = list(board.exhausted_strategies)
+        async with board._pivot_lock:
+            history = [
+                h.get("command", "") + " -> " + (h.get("output") or "")[:80]
+                for h in board.execution_history[-10:]
+            ]
+            try:
+                pivot_text, banned = await strategic_planner.review_swarm_pivot(
+                    challenge_name=board.challenge_name,
+                    category=board.category,
+                    target=board.target_scope,
+                    exhausted_strategies=list(board.exhausted_strategies),
+                    recent_history=history,
+                    all_strategy_attempts=dict(board.strategy_attempts),
+                )
+            except Exception as e:
+                logger.warning(f"[{agent_id}] Swarm pivot review failed: {e}")
+                pivot_text = (
+                    f"All {', '.join(sorted(board.exhausted_strategies))} approaches exhausted. "
+                    "Switch to a completely different attack class."
+                )
+                banned = list(board.exhausted_strategies)
 
-    async with board._lock:
-        board.pivot_directive = pivot_text
-        for b in banned:
-            if b:
-                board.exhausted_strategies.add(b.strip().lower())
+            async with board._lock:
+                board.pivot_directive = pivot_text
+                board.reviewed_pivot_strategies.add(label)
+                for b in banned:
+                    if b:
+                        board.exhausted_strategies.add(b.strip().lower())
+    finally:
+        async with board._lock:
+            board.pivot_reviews_in_flight.discard(label)
 
     _append_to_challenge_log(
         board.challenge_id, agent_id,
@@ -541,6 +556,8 @@ class SwarmBlackboard:
         self.strategy_evidence_fingerprints: Dict[str, Set[str]] = {}  # distinct evidence hashes
         self.exhausted_strategies: Set[str] = set()           # labels that hit the limit
         self.pivot_directive: str = ""                        # injected after a forced pivot
+        self.pivot_reviews_in_flight: Set[str] = set()        # labels currently being reviewed
+        self.reviewed_pivot_strategies: Set[str] = set()      # labels whose pivot review has completed
         # Stall / refill / persistence state
         self.stall_reason: Optional[str] = None
         self.worker_states: Dict[str, Dict[str, Any]] = {}
@@ -561,6 +578,7 @@ class SwarmBlackboard:
         self.processed_decode_hashes: Set[str] = set()
         self.last_target_rejection: Optional[str] = None
         self._lock = asyncio.Lock()
+        self._pivot_lock = asyncio.Lock()
 
         # ── Experience memory (retrieved ONCE per mission, shared by all agents) ──
         # memory_context is a compact, reference-only prompt block; retrieved_memory_ids
@@ -958,6 +976,7 @@ class SwarmBlackboard:
                 },
                 "exhausted_strategies": list(self.exhausted_strategies),
                 "pivot_directive": self.pivot_directive,
+                "reviewed_pivot_strategies": list(self.reviewed_pivot_strategies),
             },
         }
 
@@ -996,6 +1015,9 @@ class SwarmBlackboard:
         for label in (snapshot.get("exhausted_strategies") or []):
             if label:
                 self.exhausted_strategies.add(label)
+        for label in (snapshot.get("reviewed_pivot_strategies") or []):
+            if label:
+                self.reviewed_pivot_strategies.add(label)
         self.pivot_directive = snapshot.get("pivot_directive") or ""
 
         for ep in (snapshot.get("discovered_endpoints") or []):
@@ -1859,6 +1881,16 @@ class SwarmOrchestrator:
                 strategy_match = re.search(r"^STRATEGY:\s*(\w+)", content, re.MULTILINE | re.IGNORECASE)
                 if strategy_match:
                     strategy_label = strategy_match.group(1).strip().lower()
+                else:
+                    board.record_agent_step(
+                        agent_id,
+                        note="[FORMAT WARNING] Missing STRATEGY: <label> line. Prefix your response with 'STRATEGY: <strategy_name>' to categorize your action.",
+                    )
+                    await board.update_worker_state(
+                        agent_id,
+                        status="RUNNING",
+                        current_task="Restating action with valid STRATEGY: <label> line",
+                    )
 
                 # ── Parse the agent's single action per the prompt output contract ──
                 if re.search(r"\bBUDGET_EXHAUSTED\b", content):
@@ -1982,10 +2014,8 @@ class SwarmOrchestrator:
                     await asyncio.sleep(0.5)
                     continue
 
-                board.executed_commands_dedup.add(cmd)
-
                 # ── Strategy gate pre-check ────────────────────────────────────────────
-                # Must run AFTER dedup so an exhausted-strategy command that is also a
+                # Must run AFTER the dedup check so an exhausted-strategy command that is also a
                 # duplicate still hits the (cheaper) dedup guard first.
                 if strategy_label in board.exhausted_strategies:
                     _append_to_challenge_log(
@@ -2001,6 +2031,7 @@ class SwarmOrchestrator:
                     await asyncio.sleep(0.5)
                     continue
 
+                board.executed_commands_dedup.add(cmd)
                 _append_to_challenge_log(board.challenge_id, agent_id, f"Executing: {cmd[:200]}")
                 res = await tool_manager.execute_tool("bash", {"command": cmd}, timeout=25,
                                                       working_directory=workdir, canonical_target=board.target_scope)
