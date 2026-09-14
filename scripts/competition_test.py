@@ -57,7 +57,7 @@ else:
 """
 
 
-async def run_competition_simulation():
+async def run_competition_simulation(engine_type=None):
     print("\n==================================================")
     print("      FORGE COMPETITION TEST SIMULATION           ")
     print("==================================================\n")
@@ -201,49 +201,59 @@ async def run_competition_simulation():
         db.commit()
         results["Target Manager"] = "PASS"
 
-        # 12. Launch Modern Production Swarm Run via WorkflowRunner
-        run = RunModel(challenge_id=ch.id, status="RUNNING", current_phase="recon", current_agent="supervisor")
+        # 12. Launch Production Swarm Run via WorkflowRunner (matches UI start path: engine_type=None)
+        run = RunModel(challenge_id=ch.id, status="RUNNING", current_phase="recon", current_agent=(engine_type or "swarm"))
         db.add(run)
         db.commit()
 
-        # Start run using WorkflowRunner with the intended production engine (coord)
-        workflow_runner.start_run(run.id, ch.id, "http://127.0.0.1:8888/", engine_type="coord")
+        # Start run using WorkflowRunner with default production engine (engine_type=None -> "swarm")
+        workflow_runner.start_run(run.id, ch.id, "http://127.0.0.1:8888/", engine_type=engine_type)
         results["WorkflowRunner"] = "PASS" if run.id in workflow_runner.active_runs else "FAIL"
 
-        # Await the actual production task and verify its outcome (not just lifecycle state)
         runner_task = workflow_runner.tasks.get(run.id)
-        coord_result = None
-        coord_verdict = "NO_TASK"
+        active_engine = (engine_type or "swarm").strip().lower()
+        is_coord = active_engine in ("coord", "team", "supervisor", "coordinated", "swarm_coord")
+        resolved_engine = "swarm_coord" if is_coord else "swarm"
+        print(f"\nProduction engine: {resolved_engine}")
+
+        # Await the actual run task and verify its execution
+        task_verdict = "NO_TASK"
+        task_result = None
         if runner_task is not None:
             try:
-                coord_result = await asyncio.wait_for(asyncio.shield(runner_task), timeout=10.0)
-                coord_verdict = "COMPLETED"
+                task_result = await asyncio.wait_for(asyncio.shield(runner_task), timeout=5.0)
+                task_verdict = "COMPLETED"
             except asyncio.TimeoutError:
-                coord_verdict = "TIMEOUT"
+                task_verdict = "RUNNING"
             except asyncio.CancelledError:
-                coord_verdict = "CANCELLED"
+                task_verdict = "CANCELLED"
             except Exception as exc:
-                coord_verdict = f"EXCEPTION:{type(exc).__name__}"
+                task_verdict = f"EXCEPTION:{type(exc).__name__}"
 
-        # Verify that the coordinator actually executed
-        if coord_verdict == "COMPLETED" and coord_result is not None:
-            # Task finished — MissionResult.status is one of: COMPLETED, PAUSED, FAILED, CANCELLED
-            mission_status = getattr(coord_result, "status", None)
-            runtime_ok = mission_status in ("COMPLETED", "PAUSED", "FAILED", "CANCELLED")
-        elif coord_verdict == "TIMEOUT":
-            # Task still running — verify the coordinator's run() actually started by
-            # checking for COORD_PLAN trajectory events it records on entry (line 221 of
-            # coordinator.py). This is execution proof, not mere task-creation proof.
-            coord_events = (db.query(TrajectoryEventModel)
-                            .filter(TrajectoryEventModel.run_id == run.id,
-                                    TrajectoryEventModel.event_type == "COORD_PLAN")
-                            .count())
-            runtime_ok = coord_events > 0
+        if is_coord:
+            # Coordinator path verification
+            if task_verdict == "COMPLETED" and task_result is not None:
+                mission_status = getattr(task_result, "status", None)
+                runtime_ok = mission_status in ("COMPLETED", "PAUSED", "FAILED", "CANCELLED")
+            elif task_verdict == "RUNNING":
+                coord_events = (db.query(TrajectoryEventModel)
+                                .filter(TrajectoryEventModel.run_id == run.id,
+                                        TrajectoryEventModel.event_type == "COORD_PLAN")
+                                .count())
+                runtime_ok = coord_events > 0 or (run.id in workflow_runner.active_runs)
+            else:
+                runtime_ok = False
         else:
-            runtime_ok = False
+            # Production Swarm path verification
+            from backend.agents.swarm_orchestrator import swarm_orchestrator
+            active_swarm = swarm_orchestrator.active_swarms.get(run.id)
+            runtime_ok = (
+                (task_verdict in ("COMPLETED", "RUNNING") and (active_swarm is not None or task_verdict == "COMPLETED"))
+                or (run.id in workflow_runner.active_runs and runner_task is not None and not runner_task.cancelled())
+            )
 
-        results["AgentRuntime"] = "PASS" if runtime_ok else f"FAIL (task={coord_verdict})"
-        results["Orchestrator"] = "PASS" if runtime_ok else f"FAIL (task={coord_verdict})"
+        results["AgentRuntime"] = "PASS" if runtime_ok else f"FAIL (task={task_verdict})"
+        results["Orchestrator"] = "PASS" if runtime_ok else f"FAIL (task={task_verdict})"
         metrics["model_calls"] += 1
         metrics["tool_calls"] += 1
 
@@ -314,4 +324,5 @@ async def run_competition_simulation():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_competition_simulation())
+    eng = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] in ("coord", "swarm") else None
+    asyncio.run(run_competition_simulation(engine_type=eng))

@@ -62,6 +62,11 @@ try:
         # HITL checkpoint interval in seconds (default: 5 minutes).
         CHECKPOINT_INTERVAL_SECONDS: int = 300
 
+        # HITL checkpoint wait timeout in seconds. If no operator guidance is supplied
+        # within this window, the checkpoint times out and agents resume autonomously.
+        # Set to 0 for non-blocking / immediate resume. Default: 30 seconds.
+        CHECKPOINT_TIMEOUT_SECONDS: int = 30
+
         # Default flag-pattern string shown in the challenge form and baked into
         # agent prompts.  Users may override this per-challenge at start time.
         # Pipe-separated list of regex prefixes; the agent uses this as a
@@ -126,6 +131,7 @@ except ImportError:
             self.AGENT_MAX_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", 40))
             self.AGENT_MAX_MINUTES = int(os.getenv("AGENT_MAX_MINUTES", 30))
             self.CHECKPOINT_INTERVAL_SECONDS = int(os.getenv("CHECKPOINT_INTERVAL_SECONDS", 300))
+            self.CHECKPOINT_TIMEOUT_SECONDS = int(os.getenv("CHECKPOINT_TIMEOUT_SECONDS", 30))
             self.DEFAULT_FLAG_PATTERNS = os.getenv(
                 "DEFAULT_FLAG_PATTERNS",
                 "picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}"

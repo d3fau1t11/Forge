@@ -2270,75 +2270,114 @@ class SwarmOrchestrator:
         _append_to_challenge_log(board.challenge_id, "checkpoint",
                                  f"Report emitted for cycle {board.cycle_n}; awaiting operator paste")
 
-        # HARD WAIT for the operator's pasted external-model response.
-        await board.checkpoint_response_event.wait()
+        # Bounded wait for operator's pasted external-model response.
+        # Respects CHECKPOINT_TIMEOUT_SECONDS and instance wind-down buffer so
+        # unattended runs never deadlock.
+        timeout = float(getattr(settings, "CHECKPOINT_TIMEOUT_SECONDS", 30))
+        buffer = float(getattr(settings, "INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
+        if board.instance_expiry_ts:
+            secs_left = board.instance_expiry_ts - time.time() - buffer
+            if secs_left > 0:
+                timeout = min(timeout, max(0.1, secs_left))
+            else:
+                self._wind_down_for_expiry(board)
+                board.checkpoint_pause = False
+                board.checkpoint_active = False
+                return
+
+        timed_out = False
+        try:
+            if timeout > 0:
+                await asyncio.wait_for(board.checkpoint_response_event.wait(), timeout=timeout)
+            else:
+                timed_out = True
+        except asyncio.TimeoutError:
+            timed_out = True
+
         if board.is_stopped or board.flag_captured:
             board.checkpoint_pause = False
             board.checkpoint_active = False
             return
 
-        pasted = board.latest_pasted_response or ""
-        parsed = checkpoint_pipeline.parse_suggestions(pasted, board.agent_ids)
+        if board.instance_expiry_ts and (board.instance_expiry_ts - time.time()) <= buffer:
+            self._wind_down_for_expiry(board)
+            board.checkpoint_pause = False
+            board.checkpoint_active = False
+            return
 
-        # -- Pull state for evaluation from the shared mission (best-effort) --
-        # We use the board's own fields where available; the suggestion evaluator
-        # gracefully handles None/empty iterables.
-        _ms = getattr(board, "mission_state", None)
-        _exh = list(board.exhausted_strategies) if hasattr(board, "exhausted_strategies") else []
-        _fail = list(getattr(_ms, "failed_techniques", []) or []) if _ms else []
-        _eps = list(getattr(_ms, "endpoints", []) or getattr(_ms, "known_endpoints", []) or []) if _ms else []
-        _files = list(getattr(_ms, "known_files", []) or []) if _ms else []
-        _flags = list(getattr(_ms, "flag_candidates", []) or []) if _ms else []
-
-        def _evaluate_and_inject(aid: str, directive: str) -> None:
-            """Evaluate one directive; inject only if ACCEPTED or MODIFIED."""
-            ev = checkpoint_pipeline.evaluate_suggestion(
-                directive,
-                exhausted_strategies=_exh,
-                failed_techniques=_fail,
-                known_endpoints=_eps,
-                known_files=_files,
-                flag_candidates=_flags,
+        pasted = board.latest_pasted_response
+        if timed_out or not pasted:
+            _append_to_challenge_log(
+                board.challenge_id, "checkpoint",
+                f"No operator guidance received within timeout ({timeout:.1f}s) — resuming autonomous execution"
             )
-            if ev.decision == SuggestionDecision.REJECT:
-                _append_to_challenge_log(
-                    board.challenge_id, "checkpoint",
-                    f"[SUGGESTION_REJECTED:{aid}] {ev.reason} | original: {directive[:120]}",
-                )
-                return  # Do NOT inject rejected suggestions
-            action_text = ev.suggested_action or directive
-            prev = board.agent_directives.get(aid, "")
-            if ev.decision == SuggestionDecision.MODIFY:
-                _append_to_challenge_log(
-                    board.challenge_id, "checkpoint",
-                    f"[SUGGESTION_MODIFIED:{aid}] {ev.reason}",
-                )
-            board.agent_directives[aid] = (prev + "\n\n" + action_text).strip() if prev else action_text
-
-        if parsed.parsed:
-            async with board._lock:
-                for aid, directive in parsed.directives.items():
-                    _evaluate_and_inject(aid, directive)
-            injected = [aid for aid in parsed.directives if board.agent_directives.get(aid)]
-            _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                     f"Routed evaluated directives to: {', '.join(sorted(parsed.directives.keys()))}"
-                                     + (f" | {parsed.note}" if parsed.note else ""))
             await ws_manager.broadcast({
                 "event": "CHECKPOINT_RESUMED", "challenge_id": board.challenge_id, "run_id": board.run_id,
-                "cycle": board.cycle_n, "routed": sorted(parsed.directives.keys()),
-                "unknown_labels": parsed.unknown_labels,
+                "cycle": board.cycle_n, "routed": [], "timeout": True,
             })
         else:
-            if parsed.fallback and parsed.fallback_text:
+            pasted_str = pasted or ""
+            parsed = checkpoint_pipeline.parse_suggestions(pasted_str, board.agent_ids)
+
+            # -- Pull state for evaluation from the shared mission (best-effort) --
+            # We use the board's own fields where available; the suggestion evaluator
+            # gracefully handles None/empty iterables.
+            _ms = getattr(board, "mission_state", None)
+            _exh = list(board.exhausted_strategies) if hasattr(board, "exhausted_strategies") else []
+            _fail = list(getattr(_ms, "failed_techniques", []) or []) if _ms else []
+            _eps = list(getattr(_ms, "endpoints", []) or getattr(_ms, "known_endpoints", []) or []) if _ms else []
+            _files = list(getattr(_ms, "known_files", []) or []) if _ms else []
+            _flags = list(getattr(_ms, "flag_candidates", []) or []) if _ms else []
+
+            def _evaluate_and_inject(aid: str, directive: str) -> None:
+                """Evaluate one directive; inject only if ACCEPTED or MODIFIED."""
+                ev = checkpoint_pipeline.evaluate_suggestion(
+                    directive,
+                    exhausted_strategies=_exh,
+                    failed_techniques=_fail,
+                    known_endpoints=_eps,
+                    known_files=_files,
+                    flag_candidates=_flags,
+                )
+                if ev.decision == SuggestionDecision.REJECT:
+                    _append_to_challenge_log(
+                        board.challenge_id, "checkpoint",
+                        f"[SUGGESTION_REJECTED:{aid}] {ev.reason} | original: {directive[:120]}",
+                    )
+                    return  # Do NOT inject rejected suggestions
+                action_text = ev.suggested_action or directive
+                prev = board.agent_directives.get(aid, "")
+                if ev.decision == SuggestionDecision.MODIFY:
+                    _append_to_challenge_log(
+                        board.challenge_id, "checkpoint",
+                        f"[SUGGESTION_MODIFIED:{aid}] {ev.reason}",
+                    )
+                board.agent_directives[aid] = (prev + "\n\n" + action_text).strip() if prev else action_text
+
+            if parsed.parsed:
                 async with board._lock:
-                    for aid in board.agent_ids:
-                        _evaluate_and_inject(aid, "[GENERAL GUIDANCE] " + parsed.fallback_text)
-            _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                     f"UNPARSEABLE paste — {parsed.note} Applied as general guidance to all agents.")
-            await ws_manager.broadcast({
-                "event": "CHECKPOINT_PARSE_ERROR", "challenge_id": board.challenge_id, "run_id": board.run_id,
-                "cycle": board.cycle_n, "note": parsed.note, "applied_as_general": bool(parsed.fallback_text),
-            })
+                    for aid, directive in parsed.directives.items():
+                        _evaluate_and_inject(aid, directive)
+                injected = [aid for aid in parsed.directives if board.agent_directives.get(aid)]
+                _append_to_challenge_log(board.challenge_id, "checkpoint",
+                                         f"Routed evaluated directives to: {', '.join(sorted(parsed.directives.keys()))}"
+                                         + (f" | {parsed.note}" if parsed.note else ""))
+                await ws_manager.broadcast({
+                    "event": "CHECKPOINT_RESUMED", "challenge_id": board.challenge_id, "run_id": board.run_id,
+                    "cycle": board.cycle_n, "routed": sorted(parsed.directives.keys()),
+                    "unknown_labels": parsed.unknown_labels,
+                })
+            else:
+                if parsed.fallback and parsed.fallback_text:
+                    async with board._lock:
+                        for aid in board.agent_ids:
+                            _evaluate_and_inject(aid, "[GENERAL GUIDANCE] " + parsed.fallback_text)
+                _append_to_challenge_log(board.challenge_id, "checkpoint",
+                                         f"UNPARSEABLE paste — {parsed.note} Applied as general guidance to all agents.")
+                await ws_manager.broadcast({
+                    "event": "CHECKPOINT_PARSE_ERROR", "challenge_id": board.challenge_id, "run_id": board.run_id,
+                    "cycle": board.cycle_n, "note": parsed.note, "applied_as_general": bool(parsed.fallback_text),
+                })
 
         # Refresh each agent's budget for the new cycle. The operator just re-authorized
         # continuation at the checkpoint, so directives get a fresh iteration/minute window
