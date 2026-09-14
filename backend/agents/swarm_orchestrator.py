@@ -285,7 +285,16 @@ def _normalize_recon_target(cmd: str) -> Optional[str]:
         cookies_str = ";".join(sorted(cookies))
         body_str = ";".join(sorted(body))
 
-        return f"web:{method}:{url.lower()}:h={headers_str}:c={cookies_str}:u={auth}:b={body_str}"
+        # A bare fetch and the same fetch piped through grep/head/cat/etc. must
+        # NOT collapse to the same cache key - only truly identical commands
+        # (including identical downstream processing) should dedupe.
+        pipeline_match = re.search(r"[|;]|&&|\$\(|`", cmd)
+        pipeline_suffix = ""
+        if pipeline_match:
+            downstream = cmd[pipeline_match.start():]
+            pipeline_suffix = re.sub(r"\s+", " ", downstream.strip().lower())
+
+        return f"web:{method}:{url.lower()}:h={headers_str}:c={cookies_str}:u={auth}:b={body_str}:p={pipeline_suffix}"
 
     elif prog in ("cat", "head", "tail", "strings"):
         files = [t for t in tokens[1:] if not t.startswith("-")]

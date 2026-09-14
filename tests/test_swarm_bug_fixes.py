@@ -43,6 +43,30 @@ class TestSwarmBugFixes(unittest.TestCase):
         self.assertNotEqual(key_unauth, key_post)
         self.assertNotEqual(key_auth, key_cookie)
 
+    def test_recon_cache_pipeline_differentiation(self):
+        cmd1 = "curl -s http://standard-pizzas.picoctf.net:59328/"
+        cmd2 = "curl -s http://standard-pizzas.picoctf.net:59328/ | cat"
+        cmd3 = "curl -s http://standard-pizzas.picoctf.net:59328/ | grep -oE 'name=\"[^\"]*\"|<input[^>]*>'"
+        cmd4 = "curl -s http://standard-pizzas.picoctf.net:59328/ -o /tmp/idx.html; grep -oE 'name=\"[^\"]*\"|action=\"[^\"]*\"'"
+
+        k1 = _normalize_recon_target(cmd1)
+        k2 = _normalize_recon_target(cmd2)
+        k3 = _normalize_recon_target(cmd3)
+        k4 = _normalize_recon_target(cmd4)
+
+        keys = [k1, k2, k3, k4]
+        self.assertEqual(len(set(keys)), 4, "All four pipeline variations must produce distinct cache keys")
+
+        # Verify genuine duplicate commands return identical keys
+        cmd_a = "curl -s http://standard-pizzas.picoctf.net:59328/"
+        cmd_b = "curl -s http://standard-pizzas.picoctf.net:59328/"
+        self.assertEqual(_normalize_recon_target(cmd_a), _normalize_recon_target(cmd_b))
+
+        cmd_c = "curl -s http://standard-pizzas.picoctf.net:59328/ | grep -oE 'name=\"[^\"]*\"'"
+        cmd_d = "curl -s http://standard-pizzas.picoctf.net:59328/ | grep -oE 'name=\"[^\"]*\"'"
+        self.assertEqual(_normalize_recon_target(cmd_c), _normalize_recon_target(cmd_d))
+
+
     def test_recon_cache_file_and_nmap(self):
         key_cat = _normalize_recon_target("cat /etc/passwd")
         key_cat2 = _normalize_recon_target("cat -n /etc/passwd")
