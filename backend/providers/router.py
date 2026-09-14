@@ -88,18 +88,22 @@ class ModelRouter:
         "magistral-medium-latest": ("mistral", "magistral-medium-latest"),
         "magistral-small-latest": ("mistral", "magistral-small-latest"),
         # xKiro Free-Tier Models (Zero cost, high quota)
-        "xkiro-deepseek-v4": ("xkiro", "deepseek/deepseek-v4-flash"),
-        "xkiro-deepseek-chat": ("xkiro", "deepseek/deepseek-chat-v3.1"),
+        "xkiro-sensenova": ("xkiro", "sensenova/sensenova-6.8-flash-lite"),
+        "xkiro-sensenova-6.7": ("xkiro", "sensenova/sensenova-6.7-flash-lite"),
+        "xkiro-codestral": ("xkiro_coder", "mistralai/codestral-2508"),
+        "xkiro-devstral": ("xkiro_coder", "mistralai/devstral-medium"),
         "xkiro-mistral-large": ("xkiro_planner", "mistralai/mistral-large-2512"),
-        "xkiro-qwen-coder": ("xkiro_coder", "qwen/qwen3-coder-plus:free"),
-        "xkiro-minimax-m3": ("xkiro", "minimax/minimax-m3:free"),
+        "xkiro-mistral-medium": ("xkiro_mistral", "mistralai/mistral-medium-3.5"),
+        "xkiro-mistral-small": ("xkiro_mistral", "mistralai/mistral-small-2603"),
         # xKiro-hosted Mistral family — free & unthrottled, unlike the direct Mistral API
         # where mistral-small/medium are gated to limit=0 on the free tier.
         "ministral-8b": ("xkiro_mistral", "mistralai/ministral-8b"),
         "ministral-3b": ("xkiro_mistral", "mistralai/ministral-3b"),
         "ministral-14b": ("xkiro_mistral", "mistralai/ministral-14b"),
-        "xkiro-mistral-small": ("xkiro_mistral", "mistralai/mistral-small-2603"),
-        "xkiro-mistral-medium": ("xkiro_mistral", "mistralai/mistral-medium-3.5")
+        # Direct aliases
+        "codestral-2508": ("xkiro_coder", "mistralai/codestral-2508"),
+        "devstral-medium": ("xkiro_coder", "mistralai/devstral-medium"),
+        "sensenova-6.8": ("xkiro", "sensenova/sensenova-6.8-flash-lite"),
     }
 
     def __init__(self):
@@ -213,21 +217,21 @@ class ModelRouter:
         # 8. xKiro AI Gateway Provider (Free models, verified CTF unrestricted)
         xkiro_key = (getattr(settings, "XKIRO_API_KEY", "") or os.getenv("XKIRO_API_KEY", "")).strip()
         if xkiro_key:
-            # Default fast reasoning / recon
+            # Default fast reasoning / recon (Free SenseNova 6.8 Flash-Lite, 262k context)
             self.register_provider("xkiro", OpenAISpecProvider(
                 name="xkiro",
                 is_paid=False,
                 api_key=xkiro_key,
-                default_model="deepseek/deepseek-v4-flash",
+                default_model="sensenova/sensenova-6.8-flash-lite",
                 base_url="https://api.xkiro.com/v1",
                 speed_tier="fast"
             ))
-            # Binary decompilation and code reversing
+            # Binary decompilation and code reversing (Free Mistral Codestral, 256k context)
             self.register_provider("xkiro_coder", OpenAISpecProvider(
                 name="xkiro_coder",
                 is_paid=False,
                 api_key=xkiro_key,
-                default_model="qwen/qwen3-coder-plus:free",
+                default_model="mistralai/codestral-2508",
                 base_url="https://api.xkiro.com/v1",
                 speed_tier="fast"
             ))
