@@ -28,6 +28,12 @@ class TestHttpClassification(unittest.TestCase):
         self.assertTrue(r.is_binary)
         self.assertEqual(r.artifact_type, "elf")
 
+    def test_octet_stream_with_text_body_is_not_binary(self):
+        body = b"import re\nflag = open('flag.txt').read()\n"
+        r = classify_http_response("http://x/lyric-reader.py", "application/octet-stream", "nginx", len(body), body)
+        self.assertFalse(r.is_binary)
+        self.assertEqual(r.artifact_type, "text")
+
     def test_amazons3_server_is_binary(self):
         r = classify_http_response("http://bucket.example.com/a", "", "AmazonS3", 1234, ZIP_MAGIC)
         self.assertTrue(r.is_binary)
@@ -77,6 +83,15 @@ class TestLocalFileClassification(unittest.TestCase):
                 fh.write("print('hello world')\n")
             r = classify_local_file(p)
             self.assertFalse(r.is_binary)
+
+    def test_binary_extension_with_text_content_is_not_binary(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "script.bin")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("import re\nflag = open('flag.txt').read()\n")
+            r = classify_local_file(p)
+            self.assertFalse(r.is_binary)
+            self.assertEqual(r.artifact_type, "text")
 
     def test_missing_file(self):
         r = classify_local_file("/no/such/file.bin")

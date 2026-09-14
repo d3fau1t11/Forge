@@ -170,6 +170,12 @@ def classify_http_response(
     for binary_ct in _BINARY_CONTENT_TYPES:
         if ct.startswith(binary_ct):
             label, tools = _classify_magic(response_body_prefix)
+            if label == "text":
+                return ClassificationResult(
+                    is_binary=False,
+                    reason=f"Content-Type '{ct}' claimed binary but response body is plain text",
+                    artifact_type="text",
+                )
             return ClassificationResult(
                 is_binary=True,
                 reason=f"Content-Type '{ct}' indicates binary artifact",
@@ -264,9 +270,23 @@ def classify_local_file(file_path: str) -> ClassificationResult:
     # Extension check first (cheap)
     _, ext = os.path.splitext(file_path.lower())
     if ext in _BINARY_EXTENSIONS:
-        with open(file_path, "rb") as fh:
-            header = fh.read(32)
+        try:
+            with open(file_path, "rb") as fh:
+                header = fh.read(32)
+        except OSError as exc:
+            return ClassificationResult(
+                is_binary=False,
+                reason=f"Could not read file for magic classification: {exc}",
+                artifact_type="unknown",
+            )
         label, tools = _classify_magic(header)
+        if label == "text":
+            return ClassificationResult(
+                is_binary=False,
+                reason=f"File extension '{ext}' claimed binary but file content is plain text",
+                artifact_type="text",
+                safe_file_path=file_path,
+            )
         return ClassificationResult(
             is_binary=True,
             reason=f"File extension '{ext}' indicates binary artifact",
