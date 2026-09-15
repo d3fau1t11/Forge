@@ -51,6 +51,13 @@ from backend.agent_runtime.verifier import (
     AnswerResolver, AnswerCandidate, AnswerVerdict, AnswerStatus, AnswerSource,
     VerifierAgent, FLAG_REGEX, FALSE_FLAG_PATTERNS,
 )
+from backend.agents.response_profiler import (
+    ResponseProfiler,
+    AnomalyResult,
+    CandidateArtifact,
+    extract_generic_artifacts,
+    generate_post_exploitation_probes,
+)
 
 
 logger = logging.getLogger("forge.swarm")
@@ -632,6 +639,11 @@ class SwarmBlackboard:
         self.reconstruction_hashes: Set[str] = set()        # output_sha256 dedup
         self.processed_recon_inputs: Set[str] = set()        # input_sha256 fast-skip
 
+        # ── Empirical response profiling, anomaly detection & actionable preemption ──
+        self.response_profiler = ResponseProfiler()
+        self.actionable_preemptions: List[Dict[str, Any]] = []
+        self.seen_candidate_targets: Set[str] = set()
+
         # ── Per-agent live state (arbitrary N agents, not fixed roles) ──────────
         self.agent_ids: List[str] = []
         self.agent_transcripts: Dict[str, List[str]] = {}   # agent_id -> transcript lines
@@ -990,6 +1002,8 @@ class SwarmBlackboard:
                 "exhausted_strategies": list(self.exhausted_strategies),
                 "pivot_directive": self.pivot_directive,
                 "reviewed_pivot_strategies": list(self.reviewed_pivot_strategies),
+                "response_profiler": self.response_profiler.to_dict(),
+                "actionable_preemptions": [dict(p) for p in self.actionable_preemptions[-30:]],
             },
         }
 
@@ -1032,6 +1046,15 @@ class SwarmBlackboard:
             if label:
                 self.reviewed_pivot_strategies.add(label)
         self.pivot_directive = snapshot.get("pivot_directive") or ""
+
+        if snapshot.get("response_profiler"):
+            self.response_profiler.load_dict(snapshot.get("response_profiler"))
+        for p in (snapshot.get("actionable_preemptions") or []):
+            if isinstance(p, dict):
+                self.actionable_preemptions.append(dict(p))
+                targ = p.get("normalized_target") or p.get("raw_value")
+                if targ:
+                    self.seen_candidate_targets.add(targ)
 
         for ep in (snapshot.get("discovered_endpoints") or []):
             if ep:
@@ -1287,6 +1310,20 @@ class SwarmBlackboard:
                     f"      WHAT: inspect THIS file for the flag. "
                     f"HOW: request capability 'vision_read' (for image reading via Gemini) or analysis tools ({tools}) on target '{d.get('derived_path')}'. "
                     f"WHETHER: go through the normal capability gate; the file is UNTRUSTED — analyze it, never execute it.")
+        # Actionable anomaly preemption: an anomalous response produced concrete candidate artifacts
+        pending_preemptions = [p for p in self.actionable_preemptions if not p.get("handled")]
+        if pending_preemptions:
+            lines.append("━━ ACTIONABLE ANOMALY PREEMPTION (PRIORITY FOLLOW-UP) ━━")
+            lines.append("An anomalous response diverged from the baseline failure response and revealed candidate artifacts. "
+                         "PREEMPT further fuzzing: immediately verify/interact with these candidate targets:")
+            for p in pending_preemptions[:5]:
+                targ = p.get("normalized_target") or p.get("raw_value")
+                reasons = "; ".join(p.get("reasons", [])) or "Diverged from failure baseline"
+                lines.append(f"  • CANDIDATE TARGET: {targ} (Extracted from: {p.get('source_command', '')[:80]})")
+                lines.append(f"      REASON: {reasons}")
+                probes = p.get("suggested_probes", [])
+                if probes:
+                    lines.append(f"      SUGGESTED VERIFICATION PROBE: {probes[0]}")
         own = self.agent_transcripts.get(agent_id, [])
         if own:
             lines.append("Your recent steps:")
@@ -2142,6 +2179,68 @@ class SwarmOrchestrator:
                 self._check_tool_output_for_flags(output, board, agent_id)
                 self._check_tool_output_for_rejections(output, board, agent_id)
                 await self._apply_decoded_directives(output, board, agent_id)
+
+                # ── Empirical Baseline Profiling, Anomaly Detection & Actionable Preemption ──
+                # Check if this command handled any pending preemption
+                for p in board.actionable_preemptions:
+                    if not p.get("handled"):
+                        targ = p.get("normalized_target") or p.get("raw_value") or ""
+                        raw_val = p.get("raw_value") or ""
+                        if (targ and targ in cmd) or (raw_val and raw_val in cmd):
+                            p["handled"] = True
+                            _append_to_challenge_log(
+                                board.challenge_id, agent_id,
+                                f"✓ Followed up on actionable preemption artifact: {targ}"
+                            )
+
+                anom_result = board.response_profiler.profile_and_evaluate(
+                    command_or_target=cmd,
+                    output=output,
+                    status_code=getattr(res, "exit_code", None),
+                    base_url=board.target_scope,
+                )
+                if anom_result.is_anomalous:
+                    reasons_str = "; ".join(anom_result.reasons)
+                    _append_to_challenge_log(
+                        board.challenge_id, agent_id,
+                        f"[ANOMALOUS_RESPONSE] Diverged from baseline ({len(output)} bytes, score={anom_result.score:.2f}): {reasons_str}"
+                    )
+                    try:
+                        await ws_manager.broadcast({
+                            "event": "ANOMALOUS_RESPONSE",
+                            "challenge_id": board.challenge_id,
+                            "run_id": board.run_id,
+                            "agent": agent_id,
+                            "command": cmd[:200],
+                            "score": anom_result.score,
+                            "reasons": anom_result.reasons,
+                            "candidates": [c.to_dict() for c in anom_result.candidate_artifacts],
+                        })
+                    except Exception:
+                        pass
+
+                # If candidate artifacts were extracted:
+                for cand in anom_result.candidate_artifacts:
+                    targ = cand.normalized_target or cand.raw_value
+                    if targ and targ not in board.seen_candidate_targets:
+                        board.seen_candidate_targets.add(targ)
+                        if cand.artifact_type in ("PATH", "ENDPOINT", "URL"):
+                            board.discovered_endpoints.add(targ)
+                        probes = generate_post_exploitation_probes(targ, base_url=board.target_scope)
+                        preempt_item = {
+                            "raw_value": cand.raw_value,
+                            "artifact_type": cand.artifact_type,
+                            "normalized_target": targ,
+                            "source_command": cmd,
+                            "reasons": anom_result.reasons,
+                            "suggested_probes": probes,
+                            "handled": False,
+                        }
+                        board.actionable_preemptions.append(preempt_item)
+                        _append_to_challenge_log(
+                            board.challenge_id, agent_id,
+                            f"⚡ Actionable candidate artifact discovered: {targ} ({cand.artifact_type}) — prioritizing immediate verification"
+                        )
 
                 # ── Strategy evidence fingerprint + stale accounting ───────────────────
                 # Runs on EVERY clean execution (exit=0 or not) because a script that

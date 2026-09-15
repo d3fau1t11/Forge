@@ -100,6 +100,8 @@ def _detect_technologies(text: str) -> List[str]:
     return found
 
 
+from backend.agents.response_profiler import extract_generic_artifacts, ResponseProfiler, AnomalyResult
+
 @dataclass
 class Observation:
     """Structured, evidence-only view of a single command's output."""
@@ -116,6 +118,8 @@ class Observation:
     new_cookies: Dict[str, str] = field(default_factory=dict)
     flag_candidates: List[str] = field(default_factory=list)
     answer_candidates: List[Any] = field(default_factory=list)
+    candidate_artifacts: List[Dict[str, Any]] = field(default_factory=list)
+    anomalous_response: Optional[Dict[str, Any]] = None
     errors: List[str] = field(default_factory=list)
     important_output: str = ""
     summary: str = ""
@@ -132,12 +136,14 @@ class Observation:
 class ObservationEngine:
     """Deterministically converts an ExecResult into an Observation (no model calls)."""
 
-    def __init__(self, resolver: Optional[AnswerResolver] = None):
+    def __init__(self, resolver: Optional[AnswerResolver] = None, profiler: Optional[ResponseProfiler] = None):
         self.resolver = resolver or AnswerResolver()
+        self.profiler = profiler or ResponseProfiler()
 
     def observe(self, result: Any, state: Optional[Any] = None) -> Observation:
         stdout = getattr(result, "stdout", "") or ""
         stderr = getattr(result, "stderr", "") or ""
+        cmd_or_target = getattr(result, "command", "") or ""
         combined = f"{stdout}\n{stderr}"
         obs = Observation()
 
@@ -170,6 +176,34 @@ class ObservationEngine:
                     obs.file_provenance[clean_m] = "REMOTE_FILE"
                 if clean_m.startswith("/") or clean_m.startswith("uploads/") or "/" in clean_m:
                     obs.new_endpoints.append(clean_m)
+
+        # ── Generic Structural Artifact Extraction (Pattern-based, no keyword reliance) ──
+        target_base = getattr(state, "target", "") or getattr(state, "target_url", "") or ""
+        generic_artifacts = extract_generic_artifacts(combined, base_url=target_base)
+        for cand in generic_artifacts:
+            obs.candidate_artifacts.append(cand.to_dict())
+            if cand.artifact_type in ("PATH", "ENDPOINT", "URL"):
+                val = cand.normalized_target or cand.raw_value
+                if val and val not in obs.new_endpoints:
+                    obs.new_endpoints.append(val)
+                if cand.artifact_type == "PATH":
+                    raw_val = cand.raw_value
+                    if raw_val not in obs.new_files:
+                        obs.new_files.append(raw_val)
+                    if raw_val not in obs.file_provenance:
+                        obs.file_provenance[raw_val] = "REMOTE_FILE"
+
+        # ── Empirical Baseline Profiling & Anomaly Evaluation ──
+        status_code = getattr(result, "status_code", None)
+        if self.profiler and (stdout or stderr):
+            anom_result = self.profiler.profile_and_evaluate(
+                command_or_target=cmd_or_target,
+                output=stdout or stderr,
+                status_code=status_code,
+                base_url=target_base,
+            )
+            if anom_result.is_anomalous:
+                obs.anomalous_response = anom_result.to_dict()
 
         # ── Source code file references -> SOURCE_CODE_REFERENCE ──
         for m in _SOURCE_FILE_RE.findall(combined):
@@ -277,12 +311,14 @@ class ObservationEngine:
 
     @staticmethod
     def _compute_novelty(obs: Observation, state: Optional[Any]) -> bool:
+        if obs.anomalous_response is not None:
+            return True
         buckets = [
             obs.new_endpoints, obs.new_services, obs.new_technologies, obs.new_files,
             obs.new_credentials, obs.new_vulnerabilities, obs.flag_candidates,
         ]
         if state is None:
-            return any(buckets) or bool(obs.new_headers or obs.new_cookies)
+            return any(buckets) or bool(obs.new_headers or obs.new_cookies or obs.candidate_artifacts)
         # Novel only if at least one extracted item is NOT already known.
         known_maps = {
             "endpoints": set(getattr(state, "known_endpoints", []) or []),
@@ -315,6 +351,8 @@ class ObservationEngine:
     @staticmethod
     def _summarize(obs: Observation, result: Any) -> str:
         parts: List[str] = []
+        if obs.anomalous_response:
+            parts.append("ANOMALOUS_RESPONSE detected")
         if obs.flag_candidates:
             parts.append(f"{len(obs.flag_candidates)} flag candidate(s)")
         if obs.new_vulnerabilities:
