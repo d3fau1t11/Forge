@@ -28,6 +28,8 @@ from backend.database.session import SessionLocal
 from backend.database.models import RunModel, ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel, ToolExecutionModel, CheckpointModel, TrajectoryEventModel
 from backend.providers.router import model_router
 from backend.tools.manager import tool_manager, LOCAL_EXEC_CATEGORIES
+from backend.privilege.manager import privilege_manager
+from backend.privilege.classify import classify_command_privilege
 from backend.websocket.manager import ws_manager
 from backend.engine.keep_awake import keep_awake_manager
 from backend.reporting.generator import report_generator
@@ -1204,7 +1206,7 @@ class SwarmBlackboard:
             state["last_activity"] = time.time()
             self.last_activity_ts = time.time()
 
-    async def record_tool_execution(self, worker_id: str, command: str, res):
+    async def record_tool_execution(self, worker_id: str, command: str, res, privilege_level: str = "SAFE", approved: bool = True):
         """Persist a swarm tool execution to ToolExecutionModel so terminal history survives restarts/refreshes."""
         try:
             db = SessionLocal()
@@ -1216,8 +1218,8 @@ class SwarmBlackboard:
                     tool_name=getattr(res, "tool_name", "bash") or "bash",
                     capability="swarm_" + (worker_id or "worker"),
                     command=(command or "")[:2000],
-                    privilege_level="SAFE",
-                    approved=True,
+                    privilege_level=privilege_level,
+                    approved=approved,
                     status=status,
                     stdout=(getattr(res, "stdout", "") or "")[:4000],
                     stderr=(getattr(res, "stderr", "") or "")[:4000],
@@ -2096,6 +2098,29 @@ class SwarmOrchestrator:
                     await asyncio.sleep(0.5)
                     continue
 
+                # ── Privilege gate ─────────────────────────────────────────────────────
+                bin_name = os.path.basename(cmd.strip().split()[0]) if cmd.strip() else ""
+                priv_level = classify_command_privilege(cmd, bin_name)
+                approved = False
+                try:
+                    db = SessionLocal()
+                    try:
+                        approved = privilege_manager.evaluate_privilege(
+                            agent=agent_id, tool_name=bin_name, privilege_level=priv_level, db=db
+                        )
+                    except Exception as e:
+                        logger.debug(f"[SwarmOrchestrator] Privilege evaluation error: {e}")
+                    finally:
+                        db.close()
+                except Exception:
+                    pass
+
+                # TODO(approval-flow): A future task will replace the immediate-deny with an actual pause-and-wait for operator approval.
+                if not approved:
+                    _append_to_challenge_log(board.challenge_id, agent_id, f"[PRIVILEGE BLOCKED] level={priv_level} cmd={cmd[:150]}")
+                    await asyncio.sleep(0.5)
+                    continue
+
                 board.executed_commands_dedup.add(cmd)
                 consecutive_duplicates = 0
                 _append_to_challenge_log(board.challenge_id, agent_id, f"Executing: {cmd[:200]}")
@@ -2106,7 +2131,7 @@ class SwarmOrchestrator:
                     _append_to_challenge_log(board.challenge_id, agent_id,
                                              f"Execution failure ({getattr(res, 'failure_category', 'UNKNOWN')}): {res.stderr[:200]}")
 
-                await board.record_tool_execution(agent_id, cmd, res)
+                await board.record_tool_execution(agent_id, cmd, res, privilege_level=priv_level, approved=approved)
                 board.record_agent_step(agent_id, command=cmd, output=output)
 
                 # Bug 1 Store: populate recon cache on successful execution
