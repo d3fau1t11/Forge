@@ -671,6 +671,9 @@ class SwarmBlackboard:
         self.instance_expiry_ts: Optional[float] = None     # epoch secs, or None
         self.cycle_window_start_ts: float = time.time()     # start of the current report window
 
+        # ── Command Privilege Approvals (Per-Request HITL Gate) ────────────────
+        self.pending_approvals: Dict[str, Dict[str, Any]] = {}
+
     async def add_task(self, category: str, description: str, priority: int = 1, metadata: Optional[Dict] = None) -> SwarmTask:
         async with self._lock:
             # Check for duplicate description in pending/claimed tasks
@@ -2115,17 +2118,97 @@ class SwarmOrchestrator:
                 except Exception:
                     pass
 
-                # TODO(approval-flow): A future task will replace the immediate-deny with an actual pause-and-wait for operator approval.
+                # ── Privilege approval wait gate (Per-Request) ─────────────────────────
+                # Defaults: only set inside the gate when needs_approval is true.
+                req_sudo: bool = False
+                _sudo_pw_for_exec: Optional[str] = None
                 if not approved:
-                    _append_to_challenge_log(board.challenge_id, agent_id, f"[PRIVILEGE BLOCKED] level={priv_level} cmd={cmd[:150]}")
-                    await asyncio.sleep(0.5)
-                    continue
+                    req_id = str(uuid.uuid4())
+                    req_sudo = bool(re.search(r"\bsudo\b", cmd))
+                    approval_event = asyncio.Event()
+                    board.pending_approvals[req_id] = {
+                        "event": approval_event,
+                        "decision": None,
+                        "command": cmd,
+                        "privilege_level": priv_level,
+                        "agent_id": agent_id,
+                        "requires_sudo": req_sudo,
+                        "sudo_password": None,
+                    }
+                    await ws_manager.broadcast({
+                        "event": "APPROVAL_REQUIRED",
+                        "request_id": req_id,
+                        "challenge_id": board.challenge_id,
+                        "run_id": board.run_id,
+                        "agent_id": agent_id,
+                        "command": cmd,
+                        "privilege_level": priv_level,
+                        "requires_sudo": req_sudo,
+                    })
+                    timeout_secs = getattr(settings, "CHECKPOINT_TIMEOUT_SECONDS", 30)
+                    try:
+                        await asyncio.wait_for(approval_event.wait(), timeout=timeout_secs)
+                    except asyncio.TimeoutError:
+                        pass
+
+                    decision = board.pending_approvals.get(req_id, {}).get("decision")
+                    # Retrieve sudo_password BEFORE popping the entry, then
+                    # immediately wipe it from the dict so it cannot be read again
+                    # even transiently (single-use, in-memory only).
+                    _sudo_pw_for_exec: Optional[str] = board.pending_approvals.get(req_id, {}).get("sudo_password")
+                    if req_id in board.pending_approvals:
+                        board.pending_approvals[req_id]["sudo_password"] = None
+                    board.pending_approvals.pop(req_id, None)
+
+                    if decision == "approve":
+                        approved = True
+                    else:
+                        _sudo_pw_for_exec = None  # discard on deny/timeout
+                        status_str = "timed out" if decision is None else "denied"
+                        _append_to_challenge_log(
+                            board.challenge_id,
+                            agent_id,
+                            f"[PRIVILEGE {status_str.upper()}] level={priv_level} cmd={cmd[:150]}"
+                        )
+                        await asyncio.sleep(0.5)
+                        continue
 
                 board.executed_commands_dedup.add(cmd)
                 consecutive_duplicates = 0
                 _append_to_challenge_log(board.challenge_id, agent_id, f"Executing: {cmd[:200]}")
-                res = await tool_manager.execute_tool("bash", {"command": cmd}, timeout=25,
-                                                      working_directory=workdir, canonical_target=board.target_scope)
+
+                # ── Sudo stdin injection (security: password never in command string) ────
+                _stdin_data: Optional[str] = None
+                _logged_cmd = cmd
+                if req_sudo and approved and _sudo_pw_for_exec:
+                    # Strip leading 'sudo' tokens and rebuild as 'sudo -S' so the
+                    # password is read from stdin, never from a command-line argument.
+                    _stripped = cmd.strip()
+                    if _stripped.startswith("sudo "):
+                        _inner_cmd = _stripped[5:].lstrip()
+                        # Remove any -S that is already present to avoid duplication
+                        if _inner_cmd.startswith("-S "):
+                            _inner_cmd = _inner_cmd[3:].lstrip()
+                    else:
+                        _inner_cmd = _stripped
+                    # Logged command shows the sudo form WITHOUT the password.
+                    _logged_cmd = f"sudo -S {_inner_cmd}"
+                    cmd = _logged_cmd  # use rewritten form for execution
+                    _stdin_data = f"{_sudo_pw_for_exec}\n"
+                    # Wipe the local password variable now that we've used it to
+                    # build stdin; the password exists only inside _stdin_data for
+                    # the duration of the subprocess call below.
+                    _sudo_pw_for_exec = None
+
+                try:
+                    res = await tool_manager.execute_tool(
+                        "bash", {"command": cmd}, timeout=25,
+                        working_directory=workdir, canonical_target=board.target_scope,
+                        stdin=_stdin_data,
+                    )
+                finally:
+                    # Ensure the password bytes leave scope regardless of outcome.
+                    _stdin_data = None
                 output = res.stdout or res.stderr or ""
                 if getattr(res, "execution_failure", False):
                     _append_to_challenge_log(board.challenge_id, agent_id,
@@ -2592,6 +2675,30 @@ class SwarmOrchestrator:
                     "note": preview.note,
                 }
         return {"accepted": False, "reason": "No active checkpoint is awaiting a response for this challenge."}
+
+    async def submit_approval_response(self, request_id: str, decision: str, sudo_password: Optional[str] = None) -> Dict[str, Any]:
+        """Deliver operator's approve/deny decision for a pending privileged command.
+
+        When *decision* is 'approve' and the pending entry has requires_sudo=True,
+        *sudo_password* is stored in-memory on the pending entry dict ONLY — it is
+        never logged, never persisted, never broadcast.  The worker loop retrieves it
+        once, wipes it from the dict before execution, and discards it after the
+        subprocess completes.
+        """
+        if decision not in ("approve", "deny"):
+            return {"accepted": False, "reason": "Invalid decision. Must be 'approve' or 'deny'."}
+
+        for board in list(self.active_swarms.values()):
+            if request_id in board.pending_approvals:
+                entry = board.pending_approvals[request_id]
+                entry["decision"] = decision
+                # Store sudo_password in-memory only; only when approving a sudo command.
+                if decision == "approve" and entry.get("requires_sudo"):
+                    entry["sudo_password"] = sudo_password  # may be None if not a sudo command
+                entry["event"].set()
+                return {"accepted": True}
+
+        return {"accepted": False, "reason": "No pending approval with this request_id."}
 
     def _extract_command(self, text: str) -> Optional[str]:
         if not text:

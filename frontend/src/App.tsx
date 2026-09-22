@@ -21,6 +21,7 @@ import { TopBar } from './components/Shell/TopBar';
 import { EmergencyStopModal } from './components/Shell/EmergencyStopModal';
 import { PackageInstallModal, PackageInstallRequest } from './components/Shell/PackageInstallModal';
 import { RootPermissionModal, RootPermissionRequest } from './components/Shell/RootPermissionModal';
+import { CommandApprovalModal, CommandApprovalRequest } from './components/Shell/CommandApprovalModal';
 
 import { CommandCenter } from './components/Pages/CommandCenter';
 import { Challenges } from './components/Pages/Challenges';
@@ -118,6 +119,7 @@ export default function App() {
   const [workflowNodes] = useState<WorkflowNode[]>(INITIAL_WORKFLOW_PIPELINE);
   const [packageRequests, setPackageRequests] = useState<PackageInstallRequest[]>([]);
   const [rootRequests, setRootRequests] = useState<RootPermissionRequest[]>([]);
+  const [commandApprovals, setCommandApprovals] = useState<CommandApprovalRequest[]>([]);
   const [knowledgeRefreshTrigger, setKnowledgeRefreshTrigger] = useState(0);
 
   // Connectivity & Observability States
@@ -578,6 +580,20 @@ export default function App() {
               ]);
             } else if (data.event === 'ROOT_PERMISSION_RESULT') {
               setRootRequests((prev) => prev.filter((r) => r.requestId !== data.request_id));
+            } else if (data.event === 'APPROVAL_REQUIRED') {
+              setCommandApprovals((prev) => [
+                ...prev.filter((r) => r.requestId !== data.request_id),
+                {
+                  requestId: data.request_id,
+                  challengeId: data.challenge_id,
+                  runId: data.run_id,
+                  agentId: data.agent_id,
+                  command: data.command,
+                  privilegeLevel: data.privilege_level || 'PRIVILEGED',
+                  requiresSudo: !!data.requires_sudo,
+                  timestamp: new Date().toLocaleTimeString()
+                }
+              ]);
             } else if (data.type === 'PROVIDER_FALLBACK_TRIGGERED' || data.event === 'PROVIDER_FALLBACK_TRIGGERED') {
               const fallbackData = data.data || data;
               setFallbackNotice({
@@ -992,6 +1008,23 @@ export default function App() {
     }
   };
 
+  const handleRespondCommandApproval = async (requestId: string, decision: 'approve' | 'deny', sudoPassword?: string) => {
+    try {
+      const res = await apiService.respondApproval(requestId, decision, sudoPassword);
+      if (!res.accepted) {
+        console.warn('Approval response not accepted:', res.reason);
+      }
+      setCommandApprovals((prev) => prev.filter((r) => r.requestId !== requestId));
+    } catch (e) {
+      console.error('Failed to submit approval response:', e);
+      setCommandApprovals((prev) => prev.filter((r) => r.requestId !== requestId));
+    }
+  };
+
+  const handleDismissCommandApproval = (requestId: string) => {
+    setCommandApprovals((prev) => prev.filter((r) => r.requestId !== requestId));
+  };
+
   const handleOpenChallengeWorkspace = (ch: Challenge) => {
     setActiveChallenge(ch);
   };
@@ -1206,6 +1239,13 @@ export default function App() {
         requests={rootRequests}
         onApprove={handleApproveRoot}
         onDismiss={handleDismissRoot}
+      />
+
+      {/* 7. Per-Command Privilege Approval Modal */}
+      <CommandApprovalModal
+        requests={commandApprovals}
+        onRespond={handleRespondCommandApproval}
+        onDismiss={handleDismissCommandApproval}
       />
     </div>
   );

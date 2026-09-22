@@ -159,6 +159,23 @@ export class ApiService {
     return await res.json();
   }
 
+  public async respondApproval(requestId: string, decision: 'approve' | 'deny', sudoPassword?: string): Promise<{ accepted: boolean; reason?: string }> {
+    const body: Record<string, string> = { decision };
+    if (sudoPassword !== undefined && sudoPassword !== '') {
+      body['sudo_password'] = sudoPassword;
+    }
+    const res = await fetch(`${API_BASE_URL}/approvals/${requestId}/respond`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      return { accepted: false, reason: err.detail || 'Request failed' };
+    }
+    return await res.json();
+  }
+
   public async deleteChallenge(challengeId: string) {
     const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}`, { method: 'DELETE' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);

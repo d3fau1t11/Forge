@@ -166,6 +166,7 @@ class TestSwarmBugFixes(unittest.TestCase):
             return mock_tool_res
 
         with patch("backend.agents.swarm_orchestrator.model_router.route_request", side_effect=fake_route_request), \
+             patch("backend.agents.swarm_orchestrator.privilege_manager.evaluate_privilege", return_value=True), \
              patch("backend.agents.swarm_orchestrator.tool_manager.execute_tool", side_effect=fake_execute_tool):
 
             board.max_iterations = 4

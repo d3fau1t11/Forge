@@ -569,16 +569,23 @@ class ToolManager:
         params: Dict[str, Any],
         timeout: int = 60,
         working_directory: Optional[str] = None,
-        canonical_target: Optional[str] = None
+        canonical_target: Optional[str] = None,
+        stdin: Optional[str] = None,
     ) -> ToolExecutionResult:
-        """Universal tool invocation supporting CLI/bash commands and registered capabilities."""
+        """Universal tool invocation supporting CLI/bash commands and registered capabilities.
+
+        *stdin* is an optional string written once to the subprocess's stdin (e.g. a
+        sudo password for ``sudo -S`` invocations).  It is NOT stored, logged, or
+        embedded into any command string — it is passed exclusively via the stdin pipe.
+        """
         if tool_name in ["bash", "sh", "cli", "terminal", "command", "raw"]:
             cmd = params.get("command") or params.get("cmd") or ""
             return await self.execute_raw_command(
                 command=cmd,
                 cwd=working_directory,
                 timeout_seconds=timeout,
-                canonical_target=canonical_target
+                canonical_target=canonical_target,
+                stdin=stdin,
             )
         elif tool_name in ["interactive_open", "interactive_send", "interactive_read", "interactive_send_and_read", "interactive_close", "interactive"]:
             action = tool_name

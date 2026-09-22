@@ -647,6 +647,26 @@ async def respond_checkpoint(challenge_id: str, req: CheckpointRespondRequest, d
     return result
 
 
+class ApprovalRespondRequest(BaseModel):
+    decision: str  # "approve" or "deny"
+    # WARNING: Never log this field.  It is accepted only for sudo approvals and
+    # is held in memory for the single execution then discarded.
+    sudo_password: Optional[str] = None
+
+
+@router.post("/approvals/{request_id}/respond")
+async def respond_approval(request_id: str, req: ApprovalRespondRequest, db: Session = Depends(get_db)):
+    from backend.agents.swarm_orchestrator import swarm_orchestrator
+    # NOTE: sudo_password is forwarded to the orchestrator's in-memory dict; it is
+    # NEVER passed to any logger, broadcast payload, DB model, or exception message.
+    result = await swarm_orchestrator.submit_approval_response(
+        request_id, req.decision, sudo_password=req.sudo_password
+    )
+    if not result.get("accepted"):
+        raise HTTPException(status_code=409, detail=result.get("reason", "No pending approval with this request_id."))
+    return result
+
+
 # NOTE: The guarded DELETE /challenges and DELETE /challenges/{challenge_id}
 # endpoints are defined earlier in this file (see delete_challenge /
 # delete_all_challenges near the top). Duplicate unguarded definitions that
@@ -1594,20 +1614,29 @@ async def approve_privilege_execution(req: PrivilegeApprovalRequest):
 
     logger = logging.getLogger("forge.privilege")
     cmd = req.command.strip()
+    # Log only the bare command — NEVER the password.
     logger.info(f"Operator approved root elevation for command: {cmd}")
 
-    if req.sudo_password:
-        elevated_cmd = f"echo {req.sudo_password} | sudo -S {cmd.removeprefix('sudo ').strip()}"
-    elif not cmd.startswith("sudo"):
-        elevated_cmd = f"sudo {cmd}"
-    else:
-        elevated_cmd = cmd
+    # Build the sudo command string WITHOUT the password (password is fed via stdin).
+    # SECURITY: do NOT use f"echo {password} | sudo -S ..." — that puts the password
+    # in the command string (visible in ps aux, stored in ToolExecutionModel.command,
+    # and captured by logger.info above).  Use sudo -S and pass stdin instead.
+    inner_cmd = cmd.removeprefix("sudo").lstrip("-S").strip() if cmd.startswith("sudo") else cmd
+    elevated_cmd = f"sudo -S {inner_cmd}"
 
-    tool_res = await tool_manager.execute_raw_command(
-        command=elevated_cmd,
-        cwd=req.working_directory,
-        timeout_seconds=120
-    )
+    # Pass the password via stdin only (never embedded in the command string).
+    _stdin_input: Optional[str] = f"{req.sudo_password}\n" if req.sudo_password else None
+
+    try:
+        tool_res = await tool_manager.execute_raw_command(
+            command=elevated_cmd,
+            cwd=req.working_directory,
+            timeout_seconds=120,
+            stdin=_stdin_input,
+        )
+    finally:
+        # Discard the password immediately after the subprocess call.
+        _stdin_input = None
 
     await ws_manager.broadcast({
         "event": "ROOT_PERMISSION_RESULT",
