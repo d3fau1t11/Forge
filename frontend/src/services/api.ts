@@ -1,5 +1,23 @@
 // API Service Client connecting FORGE Frontend to FastAPI REST Endpoints & WebSockets
 
+// Operator API key for the backend's X-Forge-Key gate. Empty in local dev, where the
+// backend runs with FORGE_API_KEY unset and accepts unauthenticated calls.
+const FORGE_API_KEY: string = import.meta.env.VITE_FORGE_API_KEY || '';
+
+/**
+ * Drop-in `fetch` that attaches the X-Forge-Key header to every backend call.
+ * Every request in this module goes through it, so the key cannot be missed on a
+ * newly added endpoint. Existing headers are preserved and never overwritten —
+ * notably, FormData uploads keep the browser-generated multipart Content-Type.
+ */
+export const apiFetch = (input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> => {
+  if (!FORGE_API_KEY) return fetch(input, init);
+  return fetch(input, {
+    ...init,
+    headers: { ...(init.headers || {}), 'X-Forge-Key': FORGE_API_KEY }
+  });
+};
+
 const getApiBaseUrl = (): string => {
   if (typeof window !== 'undefined' && window.location) {
     if (window.location.port === '5173') {
@@ -67,7 +85,7 @@ export class ApiService {
   // ----------------------------------------------------
 
   public async getHealth() {
-    const res = await fetch(`${getApiBaseUrl()}/health`);
+    const res = await apiFetch(`${getApiBaseUrl()}/health`);
     if (!res.ok) {
       this.isOnline = false;
       this.lastError = `HTTP ${res.status}`;
@@ -79,7 +97,7 @@ export class ApiService {
   }
 
   public async getEnvironment() {
-    const res = await fetch(`${getApiBaseUrl()}/environment`);
+    const res = await apiFetch(`${getApiBaseUrl()}/environment`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
@@ -89,7 +107,7 @@ export class ApiService {
   // ----------------------------------------------------
 
   public async getChallenges() {
-    const res = await fetch(`${getApiBaseUrl()}/challenges`);
+    const res = await apiFetch(`${getApiBaseUrl()}/challenges`);
     if (!res.ok) {
       this.isOnline = false;
       this.lastError = `HTTP ${res.status}`;
@@ -102,7 +120,7 @@ export class ApiService {
 
   public async getChallengePlan(challengeId: string) {
     try {
-      const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/plan`);
+      const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/plan`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -125,7 +143,7 @@ export class ApiService {
     instance_expiry_minutes?: number;
     attached_file_paths?: string[];
   }) {
-    const res = await fetch(`${API_BASE_URL}/challenges`, {
+    const res = await apiFetch(`${API_BASE_URL}/challenges`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -138,19 +156,19 @@ export class ApiService {
     const form = new FormData();
     form.append('file', file);
     // No explicit Content-Type — the browser sets the multipart boundary.
-    const res = await fetch(`${API_BASE_URL}/challenges/upload`, { method: 'POST', body: form });
+    const res = await apiFetch(`${API_BASE_URL}/challenges/upload`, { method: 'POST', body: form });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async getCheckpoint(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint`);
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async respondToCheckpoint(challengeId: string, text: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint/respond`, {
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint/respond`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text })
@@ -164,7 +182,7 @@ export class ApiService {
     if (sudoPassword !== undefined && sudoPassword !== '') {
       body['sudo_password'] = sudoPassword;
     }
-    const res = await fetch(`${API_BASE_URL}/approvals/${requestId}/respond`, {
+    const res = await apiFetch(`${API_BASE_URL}/approvals/${requestId}/respond`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -177,37 +195,37 @@ export class ApiService {
   }
 
   public async deleteChallenge(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}`, { method: 'DELETE' });
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}`, { method: 'DELETE' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async deleteAllChallenges() {
-    const res = await fetch(`${API_BASE_URL}/challenges`, { method: 'DELETE' });
+    const res = await apiFetch(`${API_BASE_URL}/challenges`, { method: 'DELETE' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async generateReport(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/report`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/report`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async getChallengeCandidates(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/candidates`);
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/candidates`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async getChallengeDerivedArtifacts(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/derived-artifacts`);
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/derived-artifacts`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async getChallengeDecisions(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/decisions`);
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/decisions`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
@@ -219,7 +237,7 @@ export class ApiService {
 
   public async getTargets() {
     try {
-      const res = await fetch(`${API_BASE_URL}/targets`);
+      const res = await apiFetch(`${API_BASE_URL}/targets`);
       if (!res.ok) {
         this.isOnline = false;
         this.lastError = `HTTP ${res.status}`;
@@ -236,19 +254,19 @@ export class ApiService {
   }
 
   public async verifyTarget(targetId: string) {
-    const res = await fetch(`${API_BASE_URL}/targets/${targetId}/verify`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE_URL}/targets/${targetId}/verify`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async rediscoverTarget(targetId: string) {
-    const res = await fetch(`${API_BASE_URL}/targets/${targetId}/rediscover`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE_URL}/targets/${targetId}/rediscover`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async updateTargetAddress(targetId: string, newAddress: string) {
-    const res = await fetch(`${API_BASE_URL}/targets/${targetId}/address`, {
+    const res = await apiFetch(`${API_BASE_URL}/targets/${targetId}/address`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ new_address: newAddress })
@@ -262,19 +280,19 @@ export class ApiService {
   // ----------------------------------------------------
 
   public async startRun(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/runs/${challengeId}/start`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE_URL}/runs/${challengeId}/start`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async pauseChallenge(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/pause`, { method: 'POST' });
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/pause`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async activateKillSwitch(runId?: string) {
-    const res = await fetch(`${API_BASE_URL}/killswitch`, {
+    const res = await apiFetch(`${API_BASE_URL}/killswitch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId })
@@ -289,7 +307,7 @@ export class ApiService {
 
   public async getTools() {
     try {
-      const res = await fetch(`${API_BASE_URL}/tools`);
+      const res = await apiFetch(`${API_BASE_URL}/tools`);
       if (!res.ok) {
         this.isOnline = false;
         this.lastError = `HTTP ${res.status}`;
@@ -309,7 +327,7 @@ export class ApiService {
     try {
       const params = new URLSearchParams({ limit: String(limit) });
       if (challengeId) params.set('challenge_id', challengeId);
-      const res = await fetch(`${API_BASE_URL}/tools/executions?${params.toString()}`);
+      const res = await apiFetch(`${API_BASE_URL}/tools/executions?${params.toString()}`);
       if (!res.ok) {
         this.isOnline = false;
         this.lastError = `HTTP ${res.status}`;
@@ -327,7 +345,7 @@ export class ApiService {
 
   public async getAgents() {
     try {
-      const res = await fetch(`${API_BASE_URL}/agents`);
+      const res = await apiFetch(`${API_BASE_URL}/agents`);
       if (!res.ok) {
         this.isOnline = false;
         this.lastError = `HTTP ${res.status}`;
@@ -344,7 +362,7 @@ export class ApiService {
   }
 
   public async executeTerminalCommand(command: string, challengeId?: string) {
-    const res = await fetch(`${API_BASE_URL}/terminal/execute`, {
+    const res = await apiFetch(`${API_BASE_URL}/terminal/execute`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command, challenge_id: challengeId })
@@ -359,7 +377,7 @@ export class ApiService {
 
   public async getPendingPrivileges() {
     try {
-      const res = await fetch(`${API_BASE_URL}/privilege/pending`);
+      const res = await apiFetch(`${API_BASE_URL}/privilege/pending`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -368,7 +386,7 @@ export class ApiService {
   }
 
   public async sendPrivilegeDecision(auditId: string, approved: boolean) {
-    const res = await fetch(`${API_BASE_URL}/privilege/decision`, {
+    const res = await apiFetch(`${API_BASE_URL}/privilege/decision`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ audit_id: auditId, approved })
@@ -383,7 +401,7 @@ export class ApiService {
 
   public async getProviders() {
     try {
-      const res = await fetch(`${API_BASE_URL}/providers/health`);
+      const res = await apiFetch(`${API_BASE_URL}/providers/health`);
       if (!res.ok) {
         this.isOnline = false;
         this.lastError = `HTTP ${res.status}`;
@@ -401,7 +419,7 @@ export class ApiService {
 
   public async getEvidence() {
     try {
-      const res = await fetch(`${API_BASE_URL}/evidence`);
+      const res = await apiFetch(`${API_BASE_URL}/evidence`);
       if (!res.ok) {
         this.isOnline = false;
         this.lastError = `HTTP ${res.status}`;
@@ -419,7 +437,7 @@ export class ApiService {
 
   public async getFindings() {
     try {
-      const res = await fetch(`${API_BASE_URL}/findings`);
+      const res = await apiFetch(`${API_BASE_URL}/findings`);
       if (!res.ok) {
         this.isOnline = false;
         this.lastError = `HTTP ${res.status}`;
@@ -441,7 +459,7 @@ export class ApiService {
 
   public async getSystemSettings() {
     try {
-      const res = await fetch(`${API_BASE_URL}/system/settings`);
+      const res = await apiFetch(`${API_BASE_URL}/system/settings`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -458,7 +476,7 @@ export class ApiService {
   }
 
   public async updateSystemSettings(data: any) {
-    const res = await fetch(`${API_BASE_URL}/system/settings`, {
+    const res = await apiFetch(`${API_BASE_URL}/system/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -472,7 +490,7 @@ export class ApiService {
   // ----------------------------------------------------
 
   public async installPackage(requestId: string, packageName: string, challengeId?: string) {
-    const res = await fetch(`${API_BASE_URL}/package/install`, {
+    const res = await apiFetch(`${API_BASE_URL}/package/install`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -486,7 +504,7 @@ export class ApiService {
   }
 
   public async skipPackageInstall(requestId: string, challengeId?: string) {
-    const res = await fetch(`${API_BASE_URL}/package/skip`, {
+    const res = await apiFetch(`${API_BASE_URL}/package/skip`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -499,7 +517,7 @@ export class ApiService {
   }
 
   public async approvePrivilege(requestId: string, command: string, sudoPassword?: string, challengeId?: string, workingDirectory?: string) {
-    const res = await fetch(`${API_BASE_URL}/privilege/approve`, {
+    const res = await apiFetch(`${API_BASE_URL}/privilege/approve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -515,7 +533,7 @@ export class ApiService {
   }
 
   public async rejectPrivilege(requestId: string, challengeId?: string) {
-    const res = await fetch(`${API_BASE_URL}/privilege/reject`, {
+    const res = await apiFetch(`${API_BASE_URL}/privilege/reject`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -534,7 +552,7 @@ export class ApiService {
   public async browseDirectory(path?: string) {
     try {
       const url = path ? `${API_BASE_URL}/system/browse-dir?path=${encodeURIComponent(path)}` : `${API_BASE_URL}/system/browse-dir`;
-      const res = await fetch(url);
+      const res = await apiFetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -548,7 +566,7 @@ export class ApiService {
   }
 
   public async createDirectory(parent_path: string, dir_name: string) {
-    const res = await fetch(`${API_BASE_URL}/system/create-dir`, {
+    const res = await apiFetch(`${API_BASE_URL}/system/create-dir`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ parent_path, dir_name })
@@ -559,7 +577,7 @@ export class ApiService {
 
   public async selectFolderDialog() {
     try {
-      const res = await fetch(`${API_BASE_URL}/system/select-folder-dialog`, { method: 'POST' });
+      const res = await apiFetch(`${API_BASE_URL}/system/select-folder-dialog`, { method: 'POST' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -576,7 +594,7 @@ export class ApiService {
 
     for (const url of urlsToTry) {
       try {
-        const res = await fetch(url);
+        const res = await apiFetch(url);
         if (res.ok) {
           return await res.json();
         }
@@ -621,7 +639,7 @@ export class ApiService {
   }
 
   public async parseProviderSnippet(snippet: string) {
-    const res = await fetch(`${API_BASE_URL}/providers/parse-snippet`, {
+    const res = await apiFetch(`${API_BASE_URL}/providers/parse-snippet`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ snippet })
@@ -638,7 +656,7 @@ export class ApiService {
     base_url?: string;
     test_connection?: boolean;
   }) {
-    const res = await fetch(`${API_BASE_URL}/providers/register-snippet`, {
+    const res = await apiFetch(`${API_BASE_URL}/providers/register-snippet`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -653,7 +671,7 @@ export class ApiService {
     model_id?: string;
     base_url?: string;
   }) {
-    const res = await fetch(`${API_BASE_URL}/providers/update-key`, {
+    const res = await apiFetch(`${API_BASE_URL}/providers/update-key`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -668,7 +686,7 @@ export class ApiService {
 
   public async getPlaybooks() {
     try {
-      const res = await fetch(`${API_BASE_URL}/playbooks`);
+      const res = await apiFetch(`${API_BASE_URL}/playbooks`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -678,7 +696,7 @@ export class ApiService {
 
   public async searchPlaybooks(query: string, category?: string) {
     try {
-      const res = await fetch(`${API_BASE_URL}/playbooks/search`, {
+      const res = await apiFetch(`${API_BASE_URL}/playbooks/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, category, top_k: 10, include_unpromoted: true })
@@ -696,7 +714,7 @@ export class ApiService {
     source_type?: string;
     title?: string;
   }) {
-    const res = await fetch(`${API_BASE_URL}/playbooks/ingest`, {
+    const res = await apiFetch(`${API_BASE_URL}/playbooks/ingest`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -714,7 +732,7 @@ export class ApiService {
 
   public async getKnowledgeCoverage() {
     try {
-      const res = await fetch(`${API_BASE_URL}/knowledge/coverage`);
+      const res = await apiFetch(`${API_BASE_URL}/knowledge/coverage`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -732,7 +750,7 @@ export class ApiService {
       if (category && category !== 'ALL') params.set('category', category.toLowerCase());
       if (outcome && outcome !== 'ALL') params.set('outcome', outcome.toLowerCase());
       const qs = params.toString();
-      const res = await fetch(`${API_BASE_URL}/memory${qs ? `?${qs}` : ''}`);
+      const res = await apiFetch(`${API_BASE_URL}/memory${qs ? `?${qs}` : ''}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -741,14 +759,14 @@ export class ApiService {
   }
 
   public async getMemoryDetail(experienceId: string) {
-    const res = await fetch(`${API_BASE_URL}/memory/${experienceId}`);
+    const res = await apiFetch(`${API_BASE_URL}/memory/${experienceId}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async searchMemory(query: string, category?: string) {
     try {
-      const res = await fetch(`${API_BASE_URL}/memory/search`, {
+      const res = await apiFetch(`${API_BASE_URL}/memory/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, category: category && category !== 'ALL' ? category.toLowerCase() : undefined, top_k: 10 })
@@ -761,7 +779,7 @@ export class ApiService {
   }
 
   public async sendMemoryFeedback(experienceId: string, success: boolean, note?: string) {
-    const res = await fetch(`${API_BASE_URL}/memory/${experienceId}/feedback`, {
+    const res = await apiFetch(`${API_BASE_URL}/memory/${experienceId}/feedback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ success, note: note || '' })
@@ -781,7 +799,7 @@ export class ApiService {
   public async getWriteup(challengeId: string, refresh: boolean = false): Promise<{ content: string; generated_by: string; saved?: boolean; file_path?: string }> {
     try {
       const qs = refresh ? '?refresh=1' : '';
-      const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/writeup${qs}`);
+      const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/writeup${qs}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -791,7 +809,7 @@ export class ApiService {
 
   // Persist the operator-confirmed writeup into the challenge working folder.
   public async saveWriteup(challengeId: string, content: string): Promise<{ status: string; file_path: string; content?: string; generated_by?: string; saved?: boolean }> {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/writeup/save`, {
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/writeup/save`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content })

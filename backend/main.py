@@ -1,10 +1,11 @@
 import os
 import logging
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from backend.config import settings
+from backend.auth import require_api_key
 from backend.database.session import init_db
 from backend.api.routes import router as api_router
 from backend.websocket.manager import ws_manager
@@ -29,10 +30,12 @@ app = FastAPI(
     description="Autonomous CTF Intelligence & Exploitation Framework"
 )
 
-# Enable CORS for local Vite development frontend
+# CORS is restricted to an explicit origin allowlist (FORGE_ALLOWED_ORIGINS).
+# A wildcard here is unsafe: with allow_credentials=True Starlette reflects the
+# caller's Origin header back, so any site the operator visits could drive this API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in settings.FORGE_ALLOWED_ORIGINS.split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -88,7 +91,9 @@ async def on_shutdown():
     except Exception as e:
         logger.warning(f"[Shutdown] Interactive session cleanup failed: {e}")
 
-app.include_router(api_router, prefix="/api")
+# Single router-level gate: covers every current and future /api handler without
+# touching routes.py. No-op while FORGE_API_KEY is unset (dev mode).
+app.include_router(api_router, prefix="/api", dependencies=[Depends(require_api_key)])
 
 @app.websocket("/ws/events")
 async def websocket_endpoint(websocket: WebSocket):

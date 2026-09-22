@@ -37,7 +37,7 @@ import { SystemView } from './components/Pages/SystemView';
 import { ChallengeWorkspace } from './components/Pages/ChallengeWorkspace';
 import { KnowledgeCoverage } from './components/Pages/KnowledgeCoverage';
 import { ExperienceMemory } from './components/Pages/ExperienceMemory';
-import { apiService } from './services/api';
+import { apiService, apiFetch } from './services/api';
 import { AlertTriangle, X } from 'lucide-react';
 import { soundEngine } from './utils/soundEngine';
 import { formatDuration, parseUtcMs } from './utils/timeUtils';
@@ -953,7 +953,7 @@ export default function App() {
     setKillSwitchActive(true);
     setShowModalKillSwitch(true);
     try {
-      await fetch('/api/killswitch', { method: 'POST' });
+      await apiFetch('/api/killswitch', { method: 'POST' });
     } catch (e) {
       console.log('Kill switch triggered locally');
     }

@@ -15,7 +15,16 @@ try:
         HOST: str = "127.0.0.1"
         PORT: int = 8000
         SECRET_KEY: str = "forge-secret-key-change-in-production"
-        
+
+        # API gate. Empty string => auth disabled (local dev mode); any non-empty
+        # value is required in the X-Forge-Key header on every /api route.
+        # MUST be set before exposing FORGE beyond localhost.
+        FORGE_API_KEY: str = ""
+
+        # Comma-separated CORS origin allowlist. Never "*": the API is unauthenticated
+        # by default, so a wildcard origin lets any visited site drive this backend.
+        FORGE_ALLOWED_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+
         # Database
         DATABASE_URL: str = "sqlite:///./forge.db"
         
@@ -99,6 +108,11 @@ except ImportError:
             self.HOST = os.getenv("HOST", "127.0.0.1")
             self.PORT = int(os.getenv("PORT", 8000))
             self.SECRET_KEY = os.getenv("SECRET_KEY", "forge-secret-key")
+            self.FORGE_API_KEY = os.getenv("FORGE_API_KEY", "")
+            self.FORGE_ALLOWED_ORIGINS = os.getenv(
+                "FORGE_ALLOWED_ORIGINS",
+                "http://localhost:5173,http://127.0.0.1:5173"
+            )
             self.DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./forge.db")
             self.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
             self.NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
