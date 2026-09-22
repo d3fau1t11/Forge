@@ -1,12 +1,27 @@
 """Unit tests for command privilege classification and evaluation."""
 
+import os
 import unittest
 from backend.privilege.classify import classify_command_privilege
 from backend.privilege.manager import PrivilegeManager
-from backend.database.session import SessionLocal
+from backend.database.session import SessionLocal, init_db
+
+# backend.config runs load_dotenv(override=True) at import time, which clobbers any
+# DATABASE_URL set BEFORE the backend imports above — so the usual "set it at the top
+# of the file" ordering silently leaves this suite pointed at production forge.db.
+# Assigning it here, after those imports have run and before get_engine() is first
+# called, actually sticks: get_engine() re-reads the variable on every call. This keeps
+# the suite on the isolated test_forge.db required by project rule #5.
+os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
 
 class TestPrivilegeClassification(unittest.TestCase):
+    def setUp(self):
+        # evaluate_privilege writes AuditLogModel rows, so the schema must exist even
+        # when this file is run alone against a fresh database. init_db() is idempotent
+        # and is the same setup used by the other SessionLocal-based test modules.
+        init_db()
+
     def test_registered_safe_tool_classifies_as_safe(self):
         # Tools explicitly registered in ToolRegistry as SAFE (e.g. nmap, ffuf, curl, strings, binwalk)
         self.assertEqual(classify_command_privilege("nmap -sV 10.0.0.1", "nmap"), "SAFE")
