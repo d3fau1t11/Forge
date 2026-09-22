@@ -39,6 +39,7 @@ from backend.knowledge.memory_retriever import memory_retriever
 from backend.knowledge.experience_memory import experience_memory
 from backend.knowledge.experience_extractor import experience_extractor
 from backend.recon.turbo_recon import turbo_recon
+from backend.recon.web_forms import describe_form, extract_forms, verify_template_probe
 from backend.config import settings
 from backend.environment.detector import environment_detector
 from backend.agents.agent_prompt import AgentContext, build_agent_prompt, make_context_from_env
@@ -113,6 +114,44 @@ def _is_meaningful_header(name: str, value: str) -> bool:
     return True
 
 
+# ── English-likeness scoring (ROT13 discrimination) ──────────────────────────
+# Relative frequency of each letter in English prose. ROT13 swaps every letter
+# with its partner, so letters move across this table: e (12.7%) -> r (6.0%),
+# t (9.1%) -> g (2.0%), a (8.2%) -> n (6.8%). Scoring text before and after the
+# rotation therefore separates "this was ROT13-encoded" (score goes UP) from
+# "this was already plain" (score goes DOWN) — the test the old guard only
+# claimed to make, since ROT13 preserves printability and every ASCII string
+# passed `_readable`.
+_ENGLISH_LETTER_FREQ = {
+    "a": 0.0817, "b": 0.0149, "c": 0.0278, "d": 0.0425, "e": 0.1270,
+    "f": 0.0223, "g": 0.0202, "h": 0.0609, "i": 0.0697, "j": 0.0015,
+    "k": 0.0077, "l": 0.0403, "m": 0.0241, "n": 0.0675, "o": 0.0751,
+    "p": 0.0193, "q": 0.0010, "r": 0.0599, "s": 0.0633, "t": 0.0906,
+    "u": 0.0276, "v": 0.0098, "w": 0.0236, "x": 0.0015, "y": 0.0197,
+    "z": 0.0007,
+}
+# A rotation must clear this absolute floor to count as a decode. Real English
+# prose scores ~0.060+; a rotated/flat letter distribution scores ~0.045, and
+# the table's own mean is 0.0385. The floor is what rejects short non-prose
+# strings (a flag body, a base64 blob) that no amount of comparison can judge.
+_ROT13_ENGLISH_FLOOR = 0.055
+# ...and it must beat the original text by at least this much, so a marginal
+# wobble between two equally English-ish strings is never reported as a decode.
+_ROT13_IMPROVEMENT_MIN = 0.008
+
+
+def _english_score(text: str) -> float:
+    """Mean English letter frequency across the alphabetic characters of *text*.
+
+    Higher means more English-like. Returns 0.0 when there are no letters, so a
+    purely numeric or symbolic artifact can never clear the floor.
+    """
+    letters = [c.lower() for c in text if c.isascii() and c.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(_ENGLISH_LETTER_FREQ.get(c, 0.0) for c in letters) / len(letters)
+
+
 def _decode_artifacts(text: str) -> List[Dict[str, str]]:
     """Deterministically decode ROT13 / base64 / hex artifacts found in text.
 
@@ -132,15 +171,20 @@ def _decode_artifacts(text: str) -> List[Dict[str, str]]:
         printable = sum(1 for c in s if 0x20 <= ord(c) <= 0x7E)
         return printable / max(len(s), 1) > 0.85
 
-    # ROT13 over the whole text — cheap and reversible; only keep if it changed
-    # the text into something readable (ROT13 of already-plain text is garbage).
+    # ROT13 over the whole text — cheap and reversible. Only keep it when the
+    # rotation actually turned the text INTO English: ROT13 of already-plain text
+    # is more gibberish, not a secret, and reporting it as a decode pollutes the
+    # log and feeds junk into candidate extraction.
     try:
         rot = codecs.decode(text, "rot_13")
         if rot != text and _readable(rot):
-            key = ("rot13", rot[:200])
-            if key not in seen:
-                seen.add(key)
-                results.append({"scheme": "rot13", "input": text[:200], "decoded": rot[:400]})
+            rot_score = _english_score(rot)
+            if (rot_score >= _ROT13_ENGLISH_FLOOR
+                    and rot_score - _english_score(text) >= _ROT13_IMPROVEMENT_MIN):
+                key = ("rot13", rot[:200])
+                if key not in seen:
+                    seen.add(key)
+                    results.append({"scheme": "rot13", "input": text[:200], "decoded": rot[:400]})
     except Exception:
         pass
 
@@ -554,6 +598,10 @@ class SwarmBlackboard:
         self.discovered_endpoints: Set[str] = set()
         self.extracted_headers: Dict[str, str] = {}
         self.observed_cookies: Dict[str, str] = {}
+        # Forms read off the target's own HTML (action/method/field names). Field
+        # names are FACTS from the markup, never guessed by an agent: an invented
+        # field name silently no-ops against a form that redirects regardless.
+        self.observed_forms: List[Dict[str, Any]] = []
         self.deobfuscated_secrets: List[Dict[str, str]] = []
         self.execution_history: List[Dict[str, Any]] = []
         self.executed_commands_dedup: Set[str] = set()
@@ -972,6 +1020,10 @@ class SwarmBlackboard:
                 "discovered_endpoints": list(self.discovered_endpoints),
                 "extracted_headers": dict(self.extracted_headers),
                 "observed_cookies": dict(self.observed_cookies),
+                # Form field names discovered from the target's HTML — durable across a
+                # pause/resume so a resumed run keeps the real field names instead of
+                # re-guessing them.
+                "observed_forms": [dict(f) for f in self.observed_forms[-20:]],
                 "deobfuscated_secrets": list(self.deobfuscated_secrets),
                 "executed_commands": list(self.executed_commands_dedup),
                 "flag_candidates": list(self.flag_candidates),
@@ -1069,6 +1121,11 @@ class SwarmBlackboard:
             self.extracted_headers[k] = v
         for k, v in (snapshot.get("observed_cookies") or {}).items():
             self.observed_cookies[k] = v
+        # Absent in snapshots written before forms were captured — an empty default keeps
+        # older paused runs resumable.
+        for form in (snapshot.get("observed_forms") or []):
+            if isinstance(form, dict) and form.get("fields") and form not in self.observed_forms:
+                self.observed_forms.append(dict(form))
         for sec in (snapshot.get("deobfuscated_secrets") or []):
             self.deobfuscated_secrets.append(sec)
         for cand in (snapshot.get("flag_candidates") or []):
@@ -1270,6 +1327,13 @@ class SwarmBlackboard:
             lines.append("Known / exploit headers: " + "; ".join(f"{k}: {v}" for k, v in list(self.extracted_headers.items())[:10]))
         if self.observed_cookies:
             lines.append("Cookies: " + "; ".join(f"{k}={v}" for k, v in list(self.observed_cookies.items())[:8]))
+        if self.observed_forms:
+            # Field names are read off the target's own HTML. Sending anything else
+            # no-ops silently on a form that redirects regardless of what it received.
+            lines.append("Known web forms (USE THESE EXACT FIELD NAMES — a name the form does "
+                         "not expose is silently ignored by the target):")
+            for form in self.observed_forms[:5]:
+                lines.append("  • " + describe_form(form))
         if self.deobfuscated_secrets:
             lines.append("Decoded secrets: " + "; ".join(str(s)[:120] for s in self.deobfuscated_secrets[:6]))
         if self.candidate_usernames:
@@ -2178,6 +2242,38 @@ class SwarmOrchestrator:
 
                 await board.record_tool_execution(agent_id, cmd, res, privilege_level=priv_level, approved=approved)
                 board.record_agent_step(agent_id, command=cmd, output=output)
+
+                # ── Deterministic web-surface facts: forms + probe delivery ───────────
+                # Record the form field names this response actually exposes, so no agent
+                # ever has to guess one. An invented field name silently no-ops against a
+                # form that redirects regardless — the exact way the SSTI1 run burned its
+                # whole budget on payloads the template never saw.
+                for form in extract_forms(output, base_url=board.target_scope):
+                    if form not in board.observed_forms:
+                        board.observed_forms.append(form)
+                        action = form.get("action") or ""
+                        if action and action not in board.discovered_endpoints:
+                            board.discovered_endpoints.add(action)
+                        _append_to_challenge_log(
+                            board.challenge_id, agent_id,
+                            f"🧾 Form discovered — {describe_form(form)}")
+
+                # A self-checking payload that never renders means the injection is not
+                # reaching the sink — NOT that the technique failed. Surfacing it (in the
+                # challenge log AND the shared agent transcript) lets the swarm correct
+                # course instead of concluding the approach is dead.
+                if not getattr(res, "execution_failure", False):
+                    probe = verify_template_probe(cmd, output)
+                    if probe and probe.get("delivered") is False:
+                        probe_notice = (
+                            f"[PROBE] self-checking payload {probe['payload']} did not render "
+                            f"(expected {probe['expected']}): {probe['reason']}. If this is a "
+                            f"reflection-based injection then the payload is not reaching the sink — "
+                            f"confirm the form field name and follow redirects before treating this "
+                            f"approach as failed."
+                        )
+                        _append_to_challenge_log(board.challenge_id, agent_id, probe_notice)
+                        board.record_agent_step(agent_id, note=probe_notice)
 
                 # Bug 1 Store: populate recon cache on successful execution
                 if recon_key and getattr(res, "exit_code", 1) == 0 and output.strip():
