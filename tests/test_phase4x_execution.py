@@ -158,8 +158,14 @@ class TestScriptedStdin(unittest.TestCase):
         # The AgentRuntime's RealToolExecutor threads Action.stdin through to the process.
         from backend.agent_runtime.runtime import RealToolExecutor
         from backend.agent_runtime.action import Action, ActionType
+
+        async def _auto_approve_gate(cmd, **kwargs):
+            # This test exercises stdin plumbing, not the approval policy, so it injects
+            # an operator who approves. RealToolExecutor's default is the real gate.
+            return True, "approve", None
+
         p = _write_child(INTERACTIVE_CHILD)
-        ex = RealToolExecutor()
+        ex = RealToolExecutor(approval_gate=_auto_approve_gate)
         res = _run(ex.execute(Action(type=ActionType.COMMAND, command=f'"{PY}" "{p}"',
                                      stdin="RETURN 0\n"), timeout_seconds=30))
         self.assertIn("picoCTF{flag_hunters_interactive}", res.stdout)

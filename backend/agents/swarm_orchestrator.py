@@ -30,6 +30,7 @@ from backend.providers.router import model_router
 from backend.tools.manager import tool_manager, LOCAL_EXEC_CATEGORIES
 from backend.privilege.manager import privilege_manager
 from backend.privilege.classify import classify_command_privilege
+from backend.privilege.gate import require_approval, SHARED_PENDING_APPROVALS
 from backend.websocket.manager import ws_manager
 from backend.engine.keep_awake import keep_awake_manager
 from backend.reporting.generator import report_generator
@@ -2102,97 +2103,37 @@ class SwarmOrchestrator:
                     continue
 
                 # ── Privilege gate ─────────────────────────────────────────────────────
+                # classify/approve/wait/reconcile all live in the shared gate so this
+                # path cannot drift from the other agent command paths that use it.
+                # `bin_name` is deliberately recomputed here (NOT reused from the
+                # lower-cased pre-check above) because the failure-blocking code below
+                # keys board.blocked_capabilities on this exact value.
                 bin_name = os.path.basename(cmd.strip().split()[0]) if cmd.strip() else ""
                 priv_level = classify_command_privilege(cmd, bin_name)
-                approved = False
-                # audit_log_id lets us reconcile the AuditLogModel row (written now,
-                # showing approved=False for a non-SAFE command) with the operator's
-                # REAL approve/deny decision once the async approval gate resolves.
-                audit_log_id: Optional[str] = None
-                try:
-                    db = SessionLocal()
-                    try:
-                        approved, audit_log_id = privilege_manager.evaluate_privilege_ex(
-                            agent=agent_id, tool_name=bin_name, privilege_level=priv_level, db=db
-                        )
-                    except Exception as e:
-                        logger.debug(f"[SwarmOrchestrator] Privilege evaluation error: {e}")
-                    finally:
-                        db.close()
-                except Exception:
-                    pass
 
-                # ── Privilege approval wait gate (Per-Request) ─────────────────────────
-                # Defaults: only set inside the gate when needs_approval is true.
-                req_sudo: bool = False
-                _sudo_pw_for_exec: Optional[str] = None
+                approved, decision, _sudo_pw_for_exec = await require_approval(
+                    cmd=cmd,
+                    agent_id=agent_id,
+                    pending_approvals=board.pending_approvals,
+                    broadcast_fn=ws_manager.broadcast,
+                    challenge_id=board.challenge_id,
+                    run_id=board.run_id,
+                )
+                # req_sudo is only consulted inside the sudo-stdin block below, which
+                # additionally requires a password the gate returns only on approval —
+                # so recomputing it here is behavior-identical to the previous inline gate.
+                req_sudo = bool(re.search(r"\bsudo\b", cmd))
+
                 if not approved:
-                    req_id = str(uuid.uuid4())
-                    req_sudo = bool(re.search(r"\bsudo\b", cmd))
-                    approval_event = asyncio.Event()
-                    board.pending_approvals[req_id] = {
-                        "event": approval_event,
-                        "decision": None,
-                        "command": cmd,
-                        "privilege_level": priv_level,
-                        "agent_id": agent_id,
-                        "requires_sudo": req_sudo,
-                        "sudo_password": None,
-                    }
-                    await ws_manager.broadcast({
-                        "event": "APPROVAL_REQUIRED",
-                        "request_id": req_id,
-                        "challenge_id": board.challenge_id,
-                        "run_id": board.run_id,
-                        "agent_id": agent_id,
-                        "command": cmd,
-                        "privilege_level": priv_level,
-                        "requires_sudo": req_sudo,
-                    })
-                    timeout_secs = getattr(settings, "CHECKPOINT_TIMEOUT_SECONDS", 30)
-                    try:
-                        await asyncio.wait_for(approval_event.wait(), timeout=timeout_secs)
-                    except asyncio.TimeoutError:
-                        pass
-
-                    decision = board.pending_approvals.get(req_id, {}).get("decision")
-                    # Retrieve sudo_password BEFORE popping the entry, then
-                    # immediately wipe it from the dict so it cannot be read again
-                    # even transiently (single-use, in-memory only).
-                    _sudo_pw_for_exec: Optional[str] = board.pending_approvals.get(req_id, {}).get("sudo_password")
-                    if req_id in board.pending_approvals:
-                        board.pending_approvals[req_id]["sudo_password"] = None
-                    board.pending_approvals.pop(req_id, None)
-
-                    # Finalize the local allow flag from the operator's real decision…
-                    if decision == "approve":
-                        approved = True
-
-                    # …then reconcile the AuditLogModel row written at classification
-                    # time (approved=False) so the audit trail reflects what actually
-                    # happened. approve -> flips False->True; deny/timeout -> already
-                    # False, so record_privilege_decision confirms it without rewriting.
-                    # Runs on BOTH branches; guarded so a missing id is a safe no-op.
-                    if audit_log_id:
-                        try:
-                            _adb = SessionLocal()
-                            try:
-                                privilege_manager.record_privilege_decision(audit_log_id, approved, _adb)
-                            finally:
-                                _adb.close()
-                        except Exception as _ae:
-                            logger.debug(f"[SwarmOrchestrator] Audit reconcile skip: {_ae}")
-
-                    if decision != "approve":
-                        _sudo_pw_for_exec = None  # discard on deny/timeout
-                        status_str = "timed out" if decision is None else "denied"
-                        _append_to_challenge_log(
-                            board.challenge_id,
-                            agent_id,
-                            f"[PRIVILEGE {status_str.upper()}] level={priv_level} cmd={cmd[:150]}"
-                        )
-                        await asyncio.sleep(0.5)
-                        continue
+                    _sudo_pw_for_exec = None  # discard on deny/timeout
+                    status_str = "timed out" if decision is None else "denied"
+                    _append_to_challenge_log(
+                        board.challenge_id,
+                        agent_id,
+                        f"[PRIVILEGE {status_str.upper()}] level={priv_level} cmd={cmd[:150]}"
+                    )
+                    await asyncio.sleep(0.5)
+                    continue
 
                 board.executed_commands_dedup.add(cmd)
                 consecutive_duplicates = 0
@@ -2718,6 +2659,17 @@ class SwarmOrchestrator:
                     entry["sudo_password"] = sudo_password  # may be None if not a sudo command
                 entry["event"].set()
                 return {"accepted": True}
+
+        # Non-swarm callers (legacy ReAct loop, agent_runtime RealToolExecutor) own no
+        # board, so their requests live in the shared registry. Same uuid4 keyspace, so
+        # there is no ambiguity with the board lookup above.
+        shared_entry = SHARED_PENDING_APPROVALS.get(request_id)
+        if shared_entry is not None:
+            shared_entry["decision"] = decision
+            if decision == "approve" and shared_entry.get("requires_sudo"):
+                shared_entry["sudo_password"] = sudo_password
+            shared_entry["event"].set()
+            return {"accepted": True}
 
         return {"accepted": False, "reason": "No pending approval with this request_id."}
 

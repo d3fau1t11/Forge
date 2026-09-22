@@ -27,6 +27,7 @@ from backend.api.runner import workflow_runner
 from backend.websocket.manager import ws_manager
 from backend.reporting.generator import report_generator
 from backend.privilege.manager import privilege_manager
+from backend.privilege.gate import require_approval, SHARED_PENDING_APPROVALS
 from backend.utils.workspace import (
     CTF_WORKSPACE_ROOT,
     is_deletable_working_dir,
@@ -1077,8 +1078,42 @@ def get_swarm_for_challenge(challenge_id: str, db: Session = Depends(get_db)):
                 "task_counts": {"total": 0}, "live": False}
     return _assemble_swarm_snapshot(row, db)
 
+# Capabilities that spawn a process from a caller-supplied string rather than running a
+# fixed, audited binary. For these, `target` IS the command line (see
+# ToolManager.execute_capability → interactive_open), so it must be classified and gated
+# as a command — not by the capability name, which the registry marks SAFE.
+SHELL_CAPABILITIES = frozenset({"interactive_open", "interactive_start"})
+
+
 @router.post("/tools/execute")
 async def execute_tool(req: ExecuteToolRequest):
+    """Execute a tool capability.
+
+    `execute_capability` reaches the shell for the process-spawning capabilities above,
+    which makes this an execution entry point — so it passes the SAME operator-approval
+    gate as every agent command path. A denied or timed-out request never reaches the
+    execution layer.
+    """
+    capability = (req.capability or "").strip()
+    effective_cmd = (req.target or "").strip() if capability in SHELL_CAPABILITIES \
+        else f"{capability} {req.target or ''}".strip()
+
+    approved, decision, _sudo_pw = await require_approval(
+        cmd=effective_cmd,
+        agent_id="api:/tools/execute",
+        pending_approvals=SHARED_PENDING_APPROVALS,
+        broadcast_fn=ws_manager.broadcast,
+        challenge_id=None,
+        run_id=None,
+    )
+    if not approved:
+        status_str = "TIMEOUT" if decision is None else "DENIED"
+        raise HTTPException(
+            status_code=403,
+            detail=(f"[PRIVILEGE {status_str}] Operator did not approve capability "
+                    f"'{capability}'. Nothing was executed."),
+        )
+
     result = await tool_manager.execute_capability(capability=req.capability, target=req.target)
     return result
 

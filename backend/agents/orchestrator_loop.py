@@ -13,8 +13,8 @@ from sqlalchemy.orm import Session
 from backend.database.session import SessionLocal
 from backend.agents.manager import agent_manager
 from backend.providers.router import model_router
-from backend.tools.manager import tool_manager
-from backend.privilege.manager import privilege_manager
+from backend.tools.manager import tool_manager, ToolExecutionResult
+from backend.privilege.gate import require_approval, SHARED_PENDING_APPROVALS
 from backend.checkpoints.manager import checkpoint_manager
 from backend.environment.detector import environment_detector
 from backend.database.models import RunModel, ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel
@@ -43,6 +43,32 @@ IMPORT_TO_PACKAGE_MAP = {
     "flask_unsign": "flask-unsign",
     "pwn": "pwntools",
 }
+
+def _privilege_denied_result(command: str, decision: Optional[str]) -> ToolExecutionResult:
+    """Build a normal FAILED result for a command the operator did NOT approve.
+
+    The command is never executed; the reasoning loop receives a structured failure
+    (rather than an exception) so it can pivot instead of crashing.
+    """
+    timed_out = decision is None
+    return ToolExecutionResult(
+        tool_name="raw_cmd",
+        capability="custom_command",
+        command=command,
+        status="FAILED",
+        stdout="",
+        stderr=(
+            f"[PRIVILEGE {'TIMEOUT' if timed_out else 'DENIED'}] Operator did not approve "
+            f"this command ({'no response before the approval window closed' if timed_out else 'denied'}). "
+            f"The command was NOT executed. Pivot to an approach that does not require "
+            f"privilege elevation."
+        ),
+        exit_code=-1,
+        duration_ms=0.0,
+        execution_failure=True,
+        failure_category="PRIVILEGE_DENIED",
+    )
+
 
 class AutonomousOrchestrator:
     """Central autonomous investigation ReAct 1-Command Cycle loop."""
@@ -573,17 +599,38 @@ class AutonomousOrchestrator:
                 dir_before = self._snapshot_dir(challenge.working_directory)
                 cmd_start_time = time.time()
 
-                # Execute Command inside working directory
-                tool_res = await tool_manager.execute_raw_command(
-                    command=cmd_line,
-                    cwd=challenge.working_directory,
-                    timeout_seconds=120
+                # ── Privilege gate: operator approval required before ANY execution ──
+                # Shared with the swarm path (backend/privilege/gate.py). Timeout, deny,
+                # a missing decision or a broadcast failure all resolve to approved=False,
+                # in which case execute_raw_command is never reached at all.
+                _approved, _decision, _sudo_pw = await require_approval(
+                    cmd=cmd_line,
+                    agent_id="orchestrator_loop",
+                    pending_approvals=SHARED_PENDING_APPROVALS,
+                    broadcast_fn=ws_manager.broadcast,
+                    challenge_id=challenge_id,
+                    run_id=run_id,
                 )
-                cmd_duration_ms = int((time.time() - cmd_start_time) * 1000)
 
-                stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
-                stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
-                log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Execution finished with no output."
+                if not _approved:
+                    logger.warning(f"[PRIVILEGE] ReAct loop command not approved ({_decision}): {cmd_line[:120]}")
+                    tool_res = _privilege_denied_result(cmd_line, _decision)
+                    cmd_duration_ms = int((time.time() - cmd_start_time) * 1000)
+                    stdout_text = ""
+                    stderr_text = tool_res.stderr[:1000]
+                    log_output = stderr_text
+                else:
+                    # Execute Command inside working directory
+                    tool_res = await tool_manager.execute_raw_command(
+                        command=cmd_line,
+                        cwd=challenge.working_directory,
+                        timeout_seconds=120
+                    )
+                    cmd_duration_ms = int((time.time() - cmd_start_time) * 1000)
+
+                    stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
+                    stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
+                    log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Execution finished with no output."
 
                 # ── ImportError Auto-Install Detection ──
                 if is_python_script and tool_res.exit_code != 0:
@@ -619,13 +666,26 @@ class AutonomousOrchestrator:
                             await asyncio.wait_for(install_event.wait(), timeout=120)
                             if self._install_results.get(request_id, False):
                                 logger.info(f"Package '{pip_package}' installed. Retrying solver script.")
-                                # Re-run the same solver script
-                                cmd_retry_start = time.time()
-                                tool_res = await tool_manager.execute_raw_command(
-                                    command=cmd_line,
-                                    cwd=challenge.working_directory,
-                                    timeout_seconds=120
+                                # Re-run the same solver script — gated exactly like the
+                                # first attempt; a retry is a NEW execution, not a free pass.
+                                _r_approved, _r_decision, _r_sudo_pw = await require_approval(
+                                    cmd=cmd_line,
+                                    agent_id="orchestrator_loop",
+                                    pending_approvals=SHARED_PENDING_APPROVALS,
+                                    broadcast_fn=ws_manager.broadcast,
+                                    challenge_id=challenge_id,
+                                    run_id=run_id,
                                 )
+                                cmd_retry_start = time.time()
+                                if not _r_approved:
+                                    logger.warning(f"[PRIVILEGE] Solver retry not approved ({_r_decision}): {cmd_line[:120]}")
+                                    tool_res = _privilege_denied_result(cmd_line, _r_decision)
+                                else:
+                                    tool_res = await tool_manager.execute_raw_command(
+                                        command=cmd_line,
+                                        cwd=challenge.working_directory,
+                                        timeout_seconds=120
+                                    )
                                 cmd_duration_ms += int((time.time() - cmd_retry_start) * 1000)
                                 stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
                                 stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
@@ -651,12 +711,27 @@ class AutonomousOrchestrator:
                     if getattr(challenge, "requires_root", False):
                         logger.info(f"Challenge has requires_root=True enabled. Auto-elevating command with sudo: {cmd_line}")
                         sudo_cmd = cmd_line if cmd_line.startswith("sudo ") else f"sudo {cmd_line}"
-                        cmd_elev_start = time.time()
-                        tool_res = await tool_manager.execute_raw_command(
-                            command=sudo_cmd,
-                            cwd=challenge.working_directory,
-                            timeout_seconds=120
+                        # Auto-elevation is still an agent-originated privileged execution —
+                        # `requires_root` is a challenge property, NOT an operator approval,
+                        # so it must pass the same gate as every other command.
+                        _s_approved, _s_decision, _s_sudo_pw = await require_approval(
+                            cmd=sudo_cmd,
+                            agent_id="orchestrator_loop",
+                            pending_approvals=SHARED_PENDING_APPROVALS,
+                            broadcast_fn=ws_manager.broadcast,
+                            challenge_id=challenge_id,
+                            run_id=run_id,
                         )
+                        cmd_elev_start = time.time()
+                        if not _s_approved:
+                            logger.warning(f"[PRIVILEGE] Auto-elevation not approved ({_s_decision}): {sudo_cmd[:120]}")
+                            tool_res = _privilege_denied_result(sudo_cmd, _s_decision)
+                        else:
+                            tool_res = await tool_manager.execute_raw_command(
+                                command=sudo_cmd,
+                                cwd=challenge.working_directory,
+                                timeout_seconds=120
+                            )
                         cmd_duration_ms += int((time.time() - cmd_elev_start) * 1000)
                         stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
                         stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
@@ -689,12 +764,29 @@ class AutonomousOrchestrator:
                                     tool_res = res["tool_res"]
                                 else:
                                     sudo_cmd = cmd_line if cmd_line.startswith("sudo ") else f"sudo {cmd_line}"
-                                    cmd_elev_start = time.time()
-                                    tool_res = await tool_manager.execute_raw_command(
-                                        command=sudo_cmd,
-                                        cwd=challenge.working_directory,
-                                        timeout_seconds=120
+                                    # The ROOT_PERMISSION_REQUEST approval above covers the
+                                    # operator's elevation consent, but this is still a
+                                    # distinct sudo execution originating from the agent, so
+                                    # it passes the same per-command gate (re-asking is
+                                    # redundant, never unsafe — there is no default-allow).
+                                    _e_approved, _e_decision, _e_sudo_pw = await require_approval(
+                                        cmd=sudo_cmd,
+                                        agent_id="orchestrator_loop",
+                                        pending_approvals=SHARED_PENDING_APPROVALS,
+                                        broadcast_fn=ws_manager.broadcast,
+                                        challenge_id=challenge_id,
+                                        run_id=run_id,
                                     )
+                                    cmd_elev_start = time.time()
+                                    if not _e_approved:
+                                        logger.warning(f"[PRIVILEGE] Elevated execution not approved ({_e_decision}): {sudo_cmd[:120]}")
+                                        tool_res = _privilege_denied_result(sudo_cmd, _e_decision)
+                                    else:
+                                        tool_res = await tool_manager.execute_raw_command(
+                                            command=sudo_cmd,
+                                            cwd=challenge.working_directory,
+                                            timeout_seconds=120
+                                        )
                                     cmd_duration_ms += int((time.time() - cmd_elev_start) * 1000)
                                 stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
                                 stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""

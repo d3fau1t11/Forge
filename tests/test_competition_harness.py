@@ -31,6 +31,17 @@ from tests.fixtures.forensics_fixture import create_forensics_fixture
 
 PY = sys.executable or "python"
 
+
+async def _auto_approve_gate(cmd, **kwargs):
+    """Test double standing in for the operator: approve every gated command.
+
+    RealToolExecutor's production default is the shared require_approval() gate. Tests
+    here exercise generated-script validation / real subprocess plumbing, not approval
+    policy, so they inject an operator who approves unconditionally — the deny path has
+    its own dedicated coverage in tests/test_privilege_gate.py.
+    """
+    return True, "approve", None
+
 FAKE_DIALOGUE_CHILD = """\
 import sys
 
@@ -282,7 +293,8 @@ class TestCompetitionHarness(unittest.TestCase):
     def test_generated_script_syntax_validation(self):
         """Verify Python solver scripts are validated for syntax before execution."""
         async def scenario():
-            executor = RealToolExecutor(tool_manager=tool_manager)
+            executor = RealToolExecutor(tool_manager=tool_manager,
+                                        approval_gate=_auto_approve_gate)
 
             # Run in a throwaway workspace so the generated solve.py is not written
             # into the repo root (keeps the working tree clean / zip-ready).

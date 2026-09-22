@@ -103,10 +103,21 @@ class PipelineFixBase(unittest.IsolatedAsyncioTestCase):
 # Task 2 — missing local artifact dependency (pre-execution consistency check)
 # =========================================================================== #
 
+async def _auto_approve_gate(cmd, **kwargs):
+    """Test double standing in for the operator: approve every gated command.
+
+    RealToolExecutor's production default is the shared require_approval() gate. These
+    tests exercise real subprocess plumbing (a real interpreter in a temp workspace),
+    so they inject an operator who approves unconditionally — the deny path has its own
+    dedicated coverage in tests/test_privilege_gate.py.
+    """
+    return True, "approve", None
+
+
 class TestLocalArtifactDependency(PipelineFixBase):
 
     async def test_missing_local_dependency_is_structured_failure(self):
-        ex = RealToolExecutor()
+        ex = RealToolExecutor(approval_gate=_auto_approve_gate)
         with tempfile.TemporaryDirectory() as d:
             act = Action(type=ActionType.PYTHON_SCRIPT, script="data = open('artifact.bin', 'rb').read()\nprint(len(data))\n")
             res = await ex.execute(act, cwd=d, timeout_seconds=30)
@@ -116,7 +127,7 @@ class TestLocalArtifactDependency(PipelineFixBase):
         self.assertIn("artifact.bin", res.stderr)
 
     async def test_existing_local_dependency_is_allowed(self):
-        ex = RealToolExecutor()
+        ex = RealToolExecutor(approval_gate=_auto_approve_gate)
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "artifact.bin"), "wb") as f:
                 f.write(b"hello")
@@ -127,7 +138,7 @@ class TestLocalArtifactDependency(PipelineFixBase):
 
     async def test_dependency_created_by_previous_action_in_same_script_is_allowed(self):
         # A file the script itself writes before reading must NOT be flagged as missing.
-        ex = RealToolExecutor()
+        ex = RealToolExecutor(approval_gate=_auto_approve_gate)
         with tempfile.TemporaryDirectory() as d:
             act = Action(type=ActionType.PYTHON_SCRIPT,
                          script="open('made.txt','w').write('x')\nprint(open('made.txt').read())\n")
@@ -137,7 +148,7 @@ class TestLocalArtifactDependency(PipelineFixBase):
 
     async def test_dependency_created_by_earlier_mission_action_is_allowed(self):
         # Simulate an earlier action having produced the file (it exists on disk).
-        ex = RealToolExecutor()
+        ex = RealToolExecutor(approval_gate=_auto_approve_gate)
         with tempfile.TemporaryDirectory() as d:
             # earlier action: write the artifact
             await ex.execute(Action(type=ActionType.PYTHON_SCRIPT,
@@ -148,7 +159,7 @@ class TestLocalArtifactDependency(PipelineFixBase):
         self.assertEqual(res.status, "SUCCESS")
 
     async def test_normal_script_with_no_local_dependency_runs(self):
-        ex = RealToolExecutor()
+        ex = RealToolExecutor(approval_gate=_auto_approve_gate)
         with tempfile.TemporaryDirectory() as d:
             act = Action(type=ActionType.PYTHON_SCRIPT, script="x = sum(range(5))\nprint(f'RES={x}')\n")
             res = await ex.execute(act, cwd=d, timeout_seconds=30)

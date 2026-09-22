@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
 from backend.agent_runtime.action import Action, ActionType, ActionValidator, ExecResult, ToolExecutor
+from backend.privilege.gate import require_approval, SHARED_PENDING_APPROVALS
+from backend.websocket.manager import ws_manager
 from backend.agent_runtime.context import ContextBuilder
 from backend.agent_runtime.decision import DecisionEngine, ProviderGateway, RouterProviderGateway
 from backend.agent_runtime.observation import ObservationEngine
@@ -230,18 +232,68 @@ class RealToolExecutor:
     COMMAND      → tool_manager.execute_raw_command
     PYTHON_SCRIPT→ writes solve.py in the workspace, then runs it (raw command)
     TOOL_CALL    → tool_manager.execute_capability
-    Never used in tests (a scripted executor is injected there).
+
+    EVERY process-spawning path is gated by the shared operator-approval gate
+    (``backend/privilege/gate.py``) immediately BEFORE its execution call, so an agent
+    cannot run a command — least of all a DANGEROUS one — without explicit operator
+    approval. A denied/timed-out command returns a normal FAILED ``ExecResult`` so the
+    reasoning loop can pivot, instead of raising.
+
+    ``approval_gate`` is a test seam, not a policy switch: it defaults to ``None``,
+    which resolves to the REAL :func:`~backend.privilege.gate.require_approval` at call
+    time. A misconfigured/mis-wired caller therefore gets MORE security, never less.
+    Only tests that exercise real subprocess plumbing inject an explicit auto-approving
+    stub, exactly as they already inject their own ``tool_manager``.
     """
 
-    def __init__(self, tool_manager=None):
+    # Capabilities that spawn a process from a caller-supplied string. Unlike a fixed
+    # binary (nmap, curl), the capability name itself is NOT what runs — `target` IS the
+    # command line — so it must be classified and gated as a command.
+    _SHELL_CAPABILITIES = frozenset({"interactive_open", "interactive_start"})
+
+    def __init__(self, tool_manager=None, approval_gate=None):
         if tool_manager is None:
             from backend.tools.manager import tool_manager as tm
             tool_manager = tm
         self.tool_manager = tool_manager
+        self._approval_gate = approval_gate
+
+    async def _gate(self, cmd: str) -> Optional[ExecResult]:
+        """Gate *cmd*. Returns None when approved, else a blocked ExecResult."""
+        gate = self._approval_gate or require_approval
+        approved, decision, _sudo_pw = await gate(
+            cmd=cmd,
+            agent_id="agent_runtime",
+            pending_approvals=SHARED_PENDING_APPROVALS,
+            broadcast_fn=ws_manager.broadcast,
+            challenge_id=None,
+            run_id=None,
+        )
+        if approved:
+            return None
+        timed_out = decision is None
+        return ExecResult(
+            command=cmd,
+            status="FAILED",
+            stdout="",
+            stderr=(
+                f"[PRIVILEGE DENIED] Operator did not approve this command "
+                f"({'no response before the approval window closed' if timed_out else 'denied'}). "
+                f"The command was NOT executed. Pivot to an approach that does not require "
+                f"privilege elevation."
+            ),
+            exit_code=-1,
+            execution_failure=True,
+            failure_category="PRIVILEGE_DENIED",
+        )
 
     async def execute(self, action: Action, *, cwd: Optional[str] = None,
                       timeout_seconds: int = 120, canonical_target: Optional[str] = None) -> ExecResult:
         if action.type == ActionType.COMMAND:
+            blocked = await self._gate(action.command)
+            if blocked is not None:
+                blocked.command = blocked.command or action.display()
+                return blocked
             r = await self.tool_manager.execute_raw_command(
                 action.command, cwd=cwd, timeout_seconds=timeout_seconds,
                 canonical_target=canonical_target, stdin=(action.stdin or None))
@@ -281,16 +333,34 @@ class RealToolExecutor:
                 from backend.execution.backends.local import _resolve_python
                 resolved = _resolve_python()
                 py_bin = resolved or "python"
+            py_cmd = f'"{py_bin}" "{script_path}"'
+            # Gate the command that will ACTUALLY run (interpreter + script path), not the
+            # model's raw script text — that is what reaches the shell.
+            blocked = await self._gate(py_cmd)
+            if blocked is not None:
+                blocked.command = action.display()
+                return blocked
             r = await self.tool_manager.execute_raw_command(
-                f'"{py_bin}" "{script_path}"', cwd=cwd, timeout_seconds=timeout_seconds,
+                py_cmd, cwd=cwd, timeout_seconds=timeout_seconds,
                 canonical_target=canonical_target, stdin=(action.stdin or None))
             return ExecResult.from_tool_result(r)
 
         if action.type == ActionType.TOOL_CALL:
             args = dict(action.tool_args or {})
             target = args.pop("target", None) or canonical_target or ""
+            capability = action.capability or action.tool_name
+            if capability in self._SHELL_CAPABILITIES:
+                # `target`/extra_args ARE the command line this capability spawns.
+                extra = args.get("extra_args")
+                spawned = (target or "").strip()
+                if extra:
+                    spawned = f"{spawned} {extra}".strip() if spawned else str(extra).strip()
+                blocked = await self._gate(spawned)
+                if blocked is not None:
+                    blocked.command = action.display()
+                    return blocked
             r = await self.tool_manager.execute_capability(
-                capability=action.capability or action.tool_name, target=target,
+                capability=capability, target=target,
                 cwd=cwd, **args)
             return ExecResult.from_tool_result(r)
 
