@@ -4,6 +4,7 @@ import difflib
 from urllib.parse import urlparse
 import asyncio
 import time
+import shlex
 import shutil
 import logging
 from typing import Dict, Any, Optional
@@ -26,6 +27,25 @@ class ToolExecutionResult(BaseModel):
     duration_ms: float = 0.0
     execution_failure: bool = False       # True if DNS failure, connection refused, or timeout
     failure_category: Optional[str] = None # DNS_ERROR, TIMEOUT, CONNECTION_REFUSED, COMMAND_NOT_FOUND
+
+
+def format_tool_args(template: str, **values: str) -> str:
+    """
+    Interpolate externally-sourced values into a registered tool's args template.
+
+    The values substituted here come from outside this module's control: the challenge
+    target (an IP, hostname or URL) and the runtime-resolved wordlist path. The resulting
+    argument string is handed to a shell (see ExecutionService.run_command ->
+    create_subprocess_shell), so an unquoted `;`, `|`, backtick or `$(...)` inside a
+    target would execute as a separate command instead of being scanned as a hostname.
+    Every keyword value is therefore passed through shlex.quote() so that it reaches the
+    shell as a single literal argument.
+
+    Only the `.format()` keyword values are quoted. Literals already written into the
+    template itself (`-sV -F`, `-i -s`, `-n 8`, `-e`) must stay unquoted so the tool's
+    flags remain flags.
+    """
+    return template.format(**{key: shlex.quote(str(value)) for key, value in values.items()})
 
 
 def sanitize_and_correct_command_target(command: str, canonical_target_url: Optional[str] = None) -> str:
@@ -439,14 +459,19 @@ class ToolManager:
         if selected_tool.tool_name == "nmap":
             target_for_cmd = host_only
             extra_port = f" -p {target_port}" if target_port else ""
-            raw_args = selected_tool.args_template.format(target=target_for_cmd) + extra_port
+            raw_args = format_tool_args(selected_tool.args_template, target=target_for_cmd) + extra_port
         elif selected_tool.tool_name == "ffuf":
             from backend.execution.wordlist import wordlist_resolver  # lazy — avoids circular import
             clean_url = base_url.rstrip("/")
             wl_path = wordlist_resolver.resolve("web_common")
-            raw_args = f"-u {clean_url}/FUZZ -w {wl_path} -mc 200,301,302,401,403 -s"
+            # Both values are external — the URL derives from the challenge target and the
+            # wordlist is resolved at runtime — so both go through the template's quoted
+            # substitution rather than being pasted straight into the command.
+            raw_args = format_tool_args(
+                selected_tool.args_template, target=clean_url, wordlist=wl_path
+            ) + " -mc 200,301,302,401,403 -s"
         else:
-            raw_args = selected_tool.args_template.format(target=parsed_target)
+            raw_args = format_tool_args(selected_tool.args_template, target=parsed_target)
 
         if extra_args:
             raw_args += f" {extra_args}"
