@@ -2105,10 +2105,14 @@ class SwarmOrchestrator:
                 bin_name = os.path.basename(cmd.strip().split()[0]) if cmd.strip() else ""
                 priv_level = classify_command_privilege(cmd, bin_name)
                 approved = False
+                # audit_log_id lets us reconcile the AuditLogModel row (written now,
+                # showing approved=False for a non-SAFE command) with the operator's
+                # REAL approve/deny decision once the async approval gate resolves.
+                audit_log_id: Optional[str] = None
                 try:
                     db = SessionLocal()
                     try:
-                        approved = privilege_manager.evaluate_privilege(
+                        approved, audit_log_id = privilege_manager.evaluate_privilege_ex(
                             agent=agent_id, tool_name=bin_name, privilege_level=priv_level, db=db
                         )
                     except Exception as e:
@@ -2160,9 +2164,26 @@ class SwarmOrchestrator:
                         board.pending_approvals[req_id]["sudo_password"] = None
                     board.pending_approvals.pop(req_id, None)
 
+                    # Finalize the local allow flag from the operator's real decision…
                     if decision == "approve":
                         approved = True
-                    else:
+
+                    # …then reconcile the AuditLogModel row written at classification
+                    # time (approved=False) so the audit trail reflects what actually
+                    # happened. approve -> flips False->True; deny/timeout -> already
+                    # False, so record_privilege_decision confirms it without rewriting.
+                    # Runs on BOTH branches; guarded so a missing id is a safe no-op.
+                    if audit_log_id:
+                        try:
+                            _adb = SessionLocal()
+                            try:
+                                privilege_manager.record_privilege_decision(audit_log_id, approved, _adb)
+                            finally:
+                                _adb.close()
+                        except Exception as _ae:
+                            logger.debug(f"[SwarmOrchestrator] Audit reconcile skip: {_ae}")
+
+                    if decision != "approve":
                         _sudo_pw_for_exec = None  # discard on deny/timeout
                         status_str = "timed out" if decision is None else "denied"
                         _append_to_challenge_log(
