@@ -563,3 +563,25 @@ class SwarmEvidenceModel(Base):
     __table_args__ = (
         Index("ix_swarm_evidence_mission_type", "mission_id", "evidence_type"),
     )
+
+# ============================================================================ #
+# Schema versioning
+#
+# `Base.metadata.create_all()` only creates tables that are missing; it never
+# alters an existing one. Columns added to a model after a database was first
+# created therefore need an explicit ALTER TABLE for that database — the ordered
+# list in backend/database/session.py. This table records which of those have
+# been applied, so `SELECT MAX(version) FROM schema_version` is the authoritative
+# answer to "what schema is this database at?".
+#
+# Deliberately not Alembic: for a single-developer tool with one migration set, a
+# versioned list plus this table is the honest size of the problem.
+# ============================================================================ #
+
+class SchemaVersionModel(Base):
+    """One row per applied migration in session.py's MIGRATIONS list."""
+    __tablename__ = "schema_version"
+
+    id = Column(Integer, primary_key=True)
+    version = Column(Integer, nullable=False)
+    applied_at = Column(DateTime, default=datetime.utcnow)
