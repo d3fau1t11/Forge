@@ -10,6 +10,12 @@ export interface CommandApprovalRequest {
   command: string;
   privilegeLevel: string; // "PRIVILEGED" | "DANGEROUS" | etc.
   requiresSudo: boolean;
+  /**
+   * false only when FORGE runs in auto-approval mode and the command needs sudo:
+   * execution is already authorized, so the operator is asked for the credential
+   * alone — no Approve/Deny decision. Absent/true keeps the manual-mode UI.
+   */
+  decisionRequired?: boolean;
   timestamp?: string;
 }
 
@@ -130,6 +136,9 @@ export const CommandApprovalModal: React.FC<CommandApprovalModalProps> = ({
         const isPrivileged = req.privilegeLevel === 'PRIVILEGED';
         const isSubmitting = !!submittingIds[req.requestId];
         const sudoError = sudoErrors[req.requestId];
+        // Auto-approval mode + sudo command: execution is already authorized, so this
+        // is a credential prompt, not a yes/no decision — render the reduced UI.
+        const isCredentialOnly = req.decisionRequired === false;
 
         return (
           <div
@@ -170,7 +179,11 @@ export const CommandApprovalModal: React.FC<CommandApprovalModalProps> = ({
                         isDangerous ? 'bg-rose-400' : 'bg-amber-400'
                       } animate-ping`}
                     ></span>
-                    <span>Operator authorization required before execution</span>
+                    <span>
+                      {isCredentialOnly
+                        ? 'Auto-approve mode: only the sudo credential is required to continue'
+                        : 'Operator authorization required before execution'}
+                    </span>
                   </p>
                 </div>
               </div>
@@ -220,8 +233,10 @@ export const CommandApprovalModal: React.FC<CommandApprovalModalProps> = ({
               </pre>
             </div>
 
-            {/* Sudo Password Field — only shown when requiresSudo is true */}
-            {req.requiresSudo && (
+            {/* Sudo Password Field — shown whenever the command needs sudo. In auto
+                (credential-only) mode it IS the whole interaction, so it is always
+                rendered there rather than being conditional on an Approve click. */}
+            {(req.requiresSudo || isCredentialOnly) && (
               <div className="mb-4">
                 <div className="flex items-center space-x-2 mb-2">
                   <Key className="w-4 h-4 text-amber-400 flex-shrink-0" />
@@ -229,6 +244,12 @@ export const CommandApprovalModal: React.FC<CommandApprovalModalProps> = ({
                     Sudo Password Required
                   </span>
                 </div>
+                {isCredentialOnly && (
+                  <p className="mb-2 text-[11px] text-amber-200/90 leading-relaxed">
+                    Auto-approve mode is active — this command is already authorized to run.
+                    Supply the sudo password to continue, or cancel to deny it.
+                  </p>
+                )}
                 <div className="relative">
                   <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500 pointer-events-none" />
                   <input
@@ -250,7 +271,7 @@ export const CommandApprovalModal: React.FC<CommandApprovalModalProps> = ({
                     }}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && !isSubmitting) {
-                        handleAction(req.requestId, 'approve', req.requiresSudo);
+                        handleAction(req.requestId, 'approve', req.requiresSudo || isCredentialOnly);
                       }
                     }}
                     className={`w-full pl-9 pr-3 py-2.5 rounded text-xs font-mono bg-obsidian-900 border ${
@@ -278,32 +299,67 @@ export const CommandApprovalModal: React.FC<CommandApprovalModalProps> = ({
 
             {/* Action Buttons */}
             <div className="flex items-center justify-end space-x-3 pt-3 border-t border-slate-800">
-              <button
-                type="button"
-                onClick={() => handleAction(req.requestId, 'deny', req.requiresSudo)}
-                disabled={isSubmitting}
-                className="px-4 py-2 text-xs font-semibold rounded bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-600/50 hover:border-rose-500 transition-all flex items-center space-x-1.5 disabled:opacity-50"
-              >
-                {submittingIds[req.requestId] === 'deny' ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <XCircle className="w-3.5 h-3.5" />
-                )}
-                <span>Deny</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => handleAction(req.requestId, 'approve', req.requiresSudo)}
-                disabled={isSubmitting}
-                className="px-5 py-2 text-xs font-bold rounded bg-emerald-600 hover:bg-emerald-500 text-slate-950 hover:text-black border border-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.4)] transition-all flex items-center space-x-1.5 disabled:opacity-50"
-              >
-                {submittingIds[req.requestId] === 'approve' ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                )}
-                <span>Approve &amp; Execute</span>
-              </button>
+              {isCredentialOnly ? (
+                <>
+                  {/* Cancel submits an explicit DENY with no password — it must never
+                      be turned into an empty-password approval by the backend. */}
+                  <button
+                    type="button"
+                    onClick={() => handleAction(req.requestId, 'deny', true)}
+                    disabled={isSubmitting}
+                    className="px-4 py-2 text-xs font-semibold rounded bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-600/50 hover:border-rose-500 transition-all flex items-center space-x-1.5 disabled:opacity-50"
+                  >
+                    {submittingIds[req.requestId] === 'deny' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <XCircle className="w-3.5 h-3.5" />
+                    )}
+                    <span>Cancel</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleAction(req.requestId, 'approve', true)}
+                    disabled={isSubmitting}
+                    className="px-5 py-2 text-xs font-bold rounded bg-emerald-600 hover:bg-emerald-500 text-slate-950 hover:text-black border border-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.4)] transition-all flex items-center space-x-1.5 disabled:opacity-50"
+                  >
+                    {submittingIds[req.requestId] === 'approve' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                    )}
+                    <span>Continue</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => handleAction(req.requestId, 'deny', req.requiresSudo)}
+                    disabled={isSubmitting}
+                    className="px-4 py-2 text-xs font-semibold rounded bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-600/50 hover:border-rose-500 transition-all flex items-center space-x-1.5 disabled:opacity-50"
+                  >
+                    {submittingIds[req.requestId] === 'deny' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <XCircle className="w-3.5 h-3.5" />
+                    )}
+                    <span>Deny</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleAction(req.requestId, 'approve', req.requiresSudo)}
+                    disabled={isSubmitting}
+                    className="px-5 py-2 text-xs font-bold rounded bg-emerald-600 hover:bg-emerald-500 text-slate-950 hover:text-black border border-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.4)] transition-all flex items-center space-x-1.5 disabled:opacity-50"
+                  >
+                    {submittingIds[req.requestId] === 'approve' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                    )}
+                    <span>Approve &amp; Execute</span>
+                  </button>
+                </>
+              )}
             </div>
           </div>
         );

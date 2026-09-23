@@ -1,8 +1,11 @@
+import logging
 import os
 from dotenv import load_dotenv
 
 # Load .env file explicitly
 load_dotenv(dotenv_path=".env", override=True)
+
+logger = logging.getLogger("forge.config")
 
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -76,6 +79,17 @@ try:
         # Set to 0 for non-blocking / immediate resume. Default: 30 seconds.
         CHECKPOINT_TIMEOUT_SECONDS: int = 30
 
+        # Per-command operator-approval mode for PRIVILEGED/DANGEROUS commands.
+        #   "manual" (default) — every PRIVILEGED/DANGEROUS command waits (with no
+        #                        timeout) for an explicit operator approve/deny.
+        #   "auto"            — those commands run unattended; the ONLY thing that
+        #                        still halts execution is a command that literally
+        #                        needs `sudo`, which waits (no timeout) for the
+        #                        password only, not a yes/no decision.
+        # Defaults to the safer "manual" so an unconfigured deployment keeps asking.
+        # NOTE: this is NOT the cycle-level HITL checkpoint timeout above.
+        FORGE_APPROVAL_MODE: str = "manual"
+
         # Default flag-pattern string shown in the challenge form and baked into
         # agent prompts.  Users may override this per-challenge at start time.
         # Pipe-separated list of regex prefixes; the agent uses this as a
@@ -146,6 +160,9 @@ except ImportError:
             self.AGENT_MAX_MINUTES = int(os.getenv("AGENT_MAX_MINUTES", 30))
             self.CHECKPOINT_INTERVAL_SECONDS = int(os.getenv("CHECKPOINT_INTERVAL_SECONDS", 300))
             self.CHECKPOINT_TIMEOUT_SECONDS = int(os.getenv("CHECKPOINT_TIMEOUT_SECONDS", 30))
+            # Per-command operator-approval mode: "manual" (ask, no timeout) or "auto"
+            # (run unattended; only a literal `sudo` command waits, for the password).
+            self.FORGE_APPROVAL_MODE = os.getenv("FORGE_APPROVAL_MODE", "manual").strip().lower()
             self.DEFAULT_FLAG_PATTERNS = os.getenv(
                 "DEFAULT_FLAG_PATTERNS",
                 "picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}"
@@ -156,3 +173,18 @@ except ImportError:
             self.INSTANCE_WINDDOWN_BUFFER_SECONDS = int(os.getenv("INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
 
 settings = Settings()
+
+# Fail-closed validation of the operator approval mode, applied to BOTH Settings
+# definitions above (pydantic and the plain-attribute fallback). Anything that is not
+# exactly "auto" or "manual" — a typo, wrong case, stray whitespace, empty string —
+# logs a warning and falls back to "manual", the safer mode, which always asks before
+# executing rather than silently switching to unattended auto-run.
+_resolved_approval_mode = str(getattr(settings, "FORGE_APPROVAL_MODE", "manual") or "").strip().lower()
+if _resolved_approval_mode not in ("auto", "manual"):
+    logger.warning(
+        "Invalid FORGE_APPROVAL_MODE=%r; falling back to 'manual' "
+        "(expected exactly 'auto' or 'manual').",
+        getattr(settings, "FORGE_APPROVAL_MODE", None),
+    )
+    _resolved_approval_mode = "manual"
+settings.FORGE_APPROVAL_MODE = _resolved_approval_mode

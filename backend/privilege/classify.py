@@ -17,19 +17,37 @@ DANGEROUS_PATTERNS = [
     re.compile(r"\buserdel\b|\bpasswd\b", re.IGNORECASE),
 ]
 
+# Interpreters that run an operator/agent-authored SCRIPT.  `python3 exploit.py` is
+# FORGE's ordinary automation path, not a privileged side effect, so these are treated
+# exactly like an already-registered SAFE tool instead of falling through to the
+# PRIVILEGED fail-closed default (which still covers genuinely unknown binaries:
+# sqlmap, hydra, nc, socat, and anything else unregistered).
+#
+# SECURITY — ordering is load-bearing: this allowlist is consulted AFTER the
+# DANGEROUS_PATTERNS scan above it in classify_command_privilege(), so it can never
+# launder a destructive command.  `python3 -c "import os; os.system('rm -rf /')"`
+# still classifies DANGEROUS, because the pattern scan reads the ENTIRE command string
+# including text inside a `-c` argument.  Do not move the check above the scan.
+AUTOMATION_SAFE_BINARIES = {"python", "python3", "bash", "sh", "node", "perl", "ruby", "php"}
+
 
 def classify_command_privilege(cmd: str, bin_name: str) -> str:
     """Classify the privilege level required for a command.
 
     Priority order:
     1. If bin_name is in tool_registry.tools, return its privilege_requirement.
-    2. Else, check cmd against dangerous regex patterns -> 'DANGEROUS'.
-    3. Otherwise, return 'PRIVILEGED' (fail-closed).
+    2. Else, check cmd against dangerous regex patterns -> 'DANGEROUS'.  Runs BEFORE
+       rule 3 so no allowlist can hide a destructive command.
+    3. Else, if bin_name is a common script interpreter -> 'SAFE' (automation).
+    4. Otherwise, return 'PRIVILEGED' (fail-closed).
     """
     if bin_name and bin_name in tool_registry.tools:
         return tool_registry.tools[bin_name].privilege_requirement
 
     if any(pattern.search(cmd) for pattern in DANGEROUS_PATTERNS):
         return "DANGEROUS"
+
+    if bin_name and bin_name in AUTOMATION_SAFE_BINARIES:
+        return "SAFE"
 
     return "PRIVILEGED"

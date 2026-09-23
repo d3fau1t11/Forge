@@ -591,6 +591,9 @@ export default function App() {
                   command: data.command,
                   privilegeLevel: data.privilege_level || 'PRIVILEGED',
                   requiresSudo: !!data.requires_sudo,
+                  // false only in auto-approval mode, where this payload is a sudo
+                  // credential prompt rather than an approve/deny decision.
+                  decisionRequired: data.decision_required !== false,
                   timestamp: new Date().toLocaleTimeString()
                 }
               ]);

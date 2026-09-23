@@ -6,10 +6,24 @@ lifted out of ``SwarmOrchestrator._agent_worker`` so the swarm path and every ot
 caller share ONE implementation — a copy-pasted fork across five files would drift,
 and the drifted copy is exactly where an agent gets to run ``rm -rf`` unapproved.
 
+Two operator-configured modes (``settings.FORGE_APPROVAL_MODE``), chosen globally,
+never per-command:
+
+  * ``"manual"`` (default, safer) — every PRIVILEGED / DANGEROUS command broadcasts an
+    ``APPROVAL_REQUIRED`` event and waits **indefinitely** for the operator's explicit
+    approve or deny.  There is no timeout to fall back on: silence is not consent, it
+    is simply still-waiting.
+  * ``"auto"`` — PRIVILEGED / DANGEROUS commands run unattended.  The ONE thing that
+    still halts execution is a command that literally requires ``sudo``: that waits
+    (again, indefinitely) for the operator to supply the password, which is a
+    credential prompt, not a yes/no decision.
+
 Fail-closed by construction:
-  * SAFE                   -> auto-approved (no operator round-trip).
-  * PRIVILEGED / DANGEROUS -> require an explicit operator ``approve`` response.
-  * timeout / no decision / broadcast failure / ANY exception during the wait
+  * SAFE                   -> auto-approved (no operator round-trip).  Note that
+                              common script interpreters (python/bash/node/...) are
+                              SAFE by classification.
+  * PRIVILEGED / DANGEROUS -> gated per the mode above.
+  * no decision / broadcast failure / ANY exception during the wait
                            -> DENY.
 
 There is no default-allow branch anywhere in this module.
@@ -39,17 +53,40 @@ logger = logging.getLogger("forge.privilege")
 # per-board dict and are unaffected.
 SHARED_PENDING_APPROVALS: Dict[str, Dict[str, Any]] = {}
 
-# Matches the swarm gate's long-standing behaviour (settings.CHECKPOINT_TIMEOUT_SECONDS
-# with a 30s fallback).  Kept as a named constant so the DANGEROUS clamp below can
-# refer to "the default window" without re-reading settings twice.
-_DEFAULT_APPROVAL_TIMEOUT = 30.0
+# Operator-approval modes.  Anything else resolves to MANUAL — the mode that always
+# asks — so a misconfigured value can never silently widen execution.
+_MODE_AUTO = "auto"
+_MODE_MANUAL = "manual"
 
 
-def _resolve_timeout(timeout_seconds: Optional[float]) -> float:
-    """Resolve the approval window, falling back to the configured default."""
-    if timeout_seconds is not None:
-        return float(timeout_seconds)
-    return float(getattr(settings, "CHECKPOINT_TIMEOUT_SECONDS", _DEFAULT_APPROVAL_TIMEOUT))
+def _resolve_approval_mode() -> str:
+    """Read the operator-configured approval mode, fail-closed on anything unknown.
+
+    ``backend/config.py`` already validates the value at import time; re-checking here
+    keeps the gate safe on its own (and for tests that swap ``settings`` wholesale).
+    """
+    mode = str(getattr(settings, "FORGE_APPROVAL_MODE", _MODE_MANUAL) or "").strip().lower()
+    return mode if mode in (_MODE_AUTO, _MODE_MANUAL) else _MODE_MANUAL
+
+
+def _reconcile_audit(audit_log_id: Optional[str], approved: bool) -> None:
+    """Reconcile the classification-time AuditLogModel row with the FINAL outcome.
+
+    approve / auto-approve -> flips the row's ``approved=False`` to True.
+    deny / no-decision     -> the row is already False; the manager confirms it without
+                              rewriting.  A missing id is a safe no-op, and any failure
+                              is swallowed so audit reconciliation can never abort a run.
+    """
+    if not audit_log_id:
+        return
+    try:
+        _db = SessionLocal()
+        try:
+            privilege_manager.record_privilege_decision(audit_log_id, approved, _db)
+        finally:
+            _db.close()
+    except Exception as _ae:
+        logger.debug(f"[privilege.gate] Audit reconcile skip: {_ae}")
 
 
 async def require_approval(
@@ -59,16 +96,20 @@ async def require_approval(
     broadcast_fn: Callable[[Dict[str, Any]], Any],
     challenge_id: Optional[str],
     run_id: Optional[str] = None,
-    timeout_seconds: Optional[float] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
-    """Classify ``cmd`` and gate its execution behind explicit operator approval.
+    """Classify ``cmd`` and gate its execution behind operator authorization.
+
+    Whether the operator is asked at all — and what they are asked FOR — depends on the
+    configured approval mode (see the module docstring).  There is no timeout in either
+    mode; the wait ends when the operator responds or the task is cancelled.
 
     Returns ``(approved, decision, sudo_password)``:
-      * ``approved``      — True only for a SAFE command or an explicit operator
-                            "approve".  False for deny, timeout, a missing decision,
-                            or any failure while broadcasting/waiting.
-      * ``decision``      — ``"approve"`` / ``"deny"`` / None (no decision arrived).
-                            None means the caller should treat it as a TIMEOUT.
+      * ``approved``      — True for a SAFE command, an auto-mode approval, or an
+                            explicit operator "approve".  False for deny, a missing
+                            decision, or any failure while broadcasting/waiting.
+      * ``decision``      — ``"approve"`` / ``"deny"`` / ``"auto-approved"`` / None.
+                            None means no decision ever arrived (e.g. the broadcast
+                            failed) and must be treated as a denial.
       * ``sudo_password`` — the single-use operator-supplied password, returned ONLY
                             when the command was approved; None otherwise.
 
@@ -106,11 +147,27 @@ async def require_approval(
     if approved:
         return True, None, None
 
-    # ── Operator approval wait gate (per-request) ────────────────────────────────
-    req_id = str(uuid.uuid4())
+    mode = _resolve_approval_mode()
     req_sudo = bool(re.search(r"\bsudo\b", cmd))
+
+    # ── AUTO mode, no sudo: run unattended, ask nobody anything ──────────────────
+    if mode == _MODE_AUTO and not req_sudo:
+        # AUTO MODE TRADEOFF (deliberate, operator-requested): a DANGEROUS command that
+        # does not literally contain "sudo" — `rm -rf ./workdir/scratch`, `dd`, a fork
+        # bomb, `curl | sh` — executes here with NO operator interaction whatsoever.
+        # Auto mode means auto: there is deliberately no extra confirmation net below
+        # this line.  If you want a gate on those commands, run FORGE_APPROVAL_MODE=manual.
+        _reconcile_audit(audit_log_id, True)
+        return True, "auto-approved", None
+
+    # ── Operator interaction required (manual mode, or auto + sudo credential) ────
+    # auto_sudo_only: the operator is shown a password prompt instead of Approve/Deny,
+    # because the only thing blocking execution is the missing credential.
+    auto_sudo_only = mode == _MODE_AUTO and req_sudo
+
+    req_id = str(uuid.uuid4())
     approval_event = asyncio.Event()
-    pending_approvals[req_id] = {
+    entry: Dict[str, Any] = {
         "event": approval_event,
         "decision": None,
         "command": cmd,
@@ -119,15 +176,11 @@ async def require_approval(
         "requires_sudo": req_sudo,
         "sudo_password": None,
     }
-
-    wait_timeout = _resolve_timeout(timeout_seconds)
-    if priv_level == "DANGEROUS":
-        # HARD RULE: a DANGEROUS command's approval window is never extended, never
-        # defaulted away, and never bypassed — no code path may widen it.  The clamp
-        # below can only ever SHORTEN the window, never lengthen it.  Combined with
-        # the "no decision == deny" resolution at the end, a DANGEROUS command with no
-        # operator response within the window always returns approved=False.
-        wait_timeout = min(wait_timeout, _resolve_timeout(None))
+    if auto_sudo_only:
+        # Lets the operator UI (and any other observer of the pending registry) tell
+        # this apart from a genuine approve/deny request.
+        entry["auto_mode_sudo_only"] = True
+    pending_approvals[req_id] = entry
 
     try:
         await broadcast_fn({
@@ -139,10 +192,17 @@ async def require_approval(
             "command": cmd,
             "privilege_level": priv_level,
             "requires_sudo": req_sudo,
+            # False only in auto mode, where the payload is a credential prompt and the
+            # UI must NOT offer approve/deny buttons — just the password + cancel.
+            "decision_required": not auto_sudo_only,
         })
-        await asyncio.wait_for(approval_event.wait(), timeout=wait_timeout)
-    except asyncio.TimeoutError:
-        pass
+        # NO timeout, in either mode.  Manual mode waits indefinitely for an explicit
+        # approve/deny; auto+sudo waits indefinitely for the credential.  Note that
+        # `except Exception` below deliberately does NOT catch asyncio.CancelledError
+        # (a BaseException since Python 3.8; this project targets 3.10+), so a
+        # kill-switch cancellation of the parent task still propagates and the run
+        # really stops instead of being swallowed as a denial.
+        await approval_event.wait()
     except Exception as e:
         # A broken WebSocket (or any other failure) must DENY.  Critically, it must
         # neither propagate as an unhandled crash that some outer `except: pass`
@@ -158,23 +218,31 @@ async def require_approval(
         pending_approvals[req_id]["sudo_password"] = None
     pending_approvals.pop(req_id, None)
 
-    # Only an explicit "approve" allows execution.  A timeout or any other value is a DENY.
-    approved = decision == "approve"
+    if auto_sudo_only:
+        # The operator was asked for a CREDENTIAL, not a yes/no.  A non-empty password
+        # IS the approval; an explicit Cancel, and equally an approve submitted with a
+        # blank/missing password, is a DENY — an empty submission must never be read as
+        # permission to run a sudo command.
+        if decision == "deny":
+            approved = False
+        elif sudo_pw and sudo_pw.strip():
+            approved = True
+            decision = "approve"
+        else:
+            approved = False
+            # A still-None decision means the wait produced nothing at all (e.g. the
+            # broadcast failed) and is left as None so callers can report it as such.
+            decision = "deny" if decision == "approve" else decision
+    else:
+        # Only an explicit "approve" allows execution.  No decision is a DENY.
+        approved = decision == "approve"
+
     if not approved:
         sudo_pw = None
 
     # Reconcile the AuditLogModel row written at classification time (approved=False)
-    # so the audit trail reflects what actually happened.  approve -> flips
-    # False->True; deny/timeout -> already False, so record_privilege_decision confirms
-    # it without rewriting.  Runs on BOTH branches; a missing id is a safe no-op.
-    if audit_log_id:
-        try:
-            _adb = SessionLocal()
-            try:
-                privilege_manager.record_privilege_decision(audit_log_id, approved, _adb)
-            finally:
-                _adb.close()
-        except Exception as _ae:
-            logger.debug(f"[privilege.gate] Audit reconcile skip: {_ae}")
+    # so the audit trail reflects what actually happened.  Runs on BOTH branches; a
+    # missing id is a safe no-op.
+    _reconcile_audit(audit_log_id, approved)
 
     return approved, decision, sudo_pw
