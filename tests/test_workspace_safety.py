@@ -62,7 +62,7 @@ def test_resolve_safe_working_dir_keeps_valid_path():
 def test_safe_delete_refuses_project_root(tmp_path):
     # End-to-end: the routes helper must not remove a sentinel placed at the
     # project root when handed ".".
-    from backend.api import routes
+    from backend.api.routes import challenges as routes
 
     sentinel = os.path.join(PROJECT_ROOT, ".delete_guard_sentinel")
     with open(sentinel, "w") as f:

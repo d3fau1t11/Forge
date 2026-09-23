@@ -12,7 +12,7 @@ from backend.agents.swarm_orchestrator import (
     swarm_orchestrator,
 )
 from backend.agents.swarm_state import SwarmBlackboard
-from backend.api.routes import ApprovalRespondRequest, respond_approval
+from backend.api.routes.privilege_and_approvals import ApprovalRespondRequest, respond_approval
 from fastapi import HTTPException
 
 

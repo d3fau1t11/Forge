@@ -606,8 +606,8 @@ class TestExecutionStatusEndpoint(unittest.TestCase):
         _multipart_available(),
         "backend.api.routes needs python-multipart (Form/UploadFile endpoints)")
     def test_status_and_terminal_handlers(self):
-        from backend.api import routes
-        from backend.api.routes import (
+        from backend.api.routes import execution as routes
+        from backend.api.routes.execution import (
             TerminalExecuteRequest, get_execution_status, execute_terminal_command)
         from backend.execution.base import ExecutionResult
 

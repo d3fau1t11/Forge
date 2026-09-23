@@ -792,12 +792,12 @@ class TestToolsExecuteRouteIsGated(_GateTestBase):
         """`execute_capability('interactive_open', target=<cmd>)` reaches the shell, so
         the route must gate it. A denied request must not touch the tool manager."""
         from fastapi import HTTPException
-        from backend.api.routes import ExecuteToolRequest, execute_tool
+        from backend.api.routes.execution import ExecuteToolRequest, execute_tool
 
         req = ExecuteToolRequest(capability="interactive_open", target=DANGEROUS_CMD)
 
-        with patch("backend.api.routes.tool_manager") as mock_tm, \
-             patch("backend.api.routes.ws_manager.broadcast", AsyncMock()), \
+        with patch("backend.api.routes.execution.tool_manager") as mock_tm, \
+             patch("backend.api.routes.execution.ws_manager.broadcast", AsyncMock()), \
              _manual_mode():
             mock_tm.execute_capability = AsyncMock()
             task = asyncio.create_task(execute_tool(req))
@@ -812,11 +812,11 @@ class TestToolsExecuteRouteIsGated(_GateTestBase):
 
     async def test_approved_capability_still_runs(self):
         """Regression guard: a SAFE/approved capability is not blocked by the route gate."""
-        from backend.api.routes import ExecuteToolRequest, execute_tool
+        from backend.api.routes.execution import ExecuteToolRequest, execute_tool
 
         req = ExecuteToolRequest(capability="nmap", target="127.0.0.1")
 
-        with patch("backend.api.routes.tool_manager") as mock_tm:
+        with patch("backend.api.routes.execution.tool_manager") as mock_tm:
             mock_tm.execute_capability = AsyncMock(return_value={"status": "SUCCESS"})
             result = await execute_tool(req)
 
