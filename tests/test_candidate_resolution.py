@@ -34,7 +34,8 @@ from backend.agent_runtime.verifier import (
     VerifierAgent,
     infer_expected_answer_type,
 )
-from backend.agents.swarm_orchestrator import SwarmBlackboard, SwarmOrchestrator
+from backend.agents.swarm_orchestrator import SwarmOrchestrator
+from backend.agents.swarm_state import SwarmBlackboard
 from backend.database.models import ChallengeModel, EvidenceModel, RunModel
 from backend.database.session import SessionLocal, init_db
 from backend.swarm.coordinator import SwarmCoordinator

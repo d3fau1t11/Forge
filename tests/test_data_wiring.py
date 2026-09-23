@@ -63,7 +63,8 @@ class TestDataWiringEndpoints(unittest.TestCase):
         # 2. Simulate an actual _agent_worker turn to test real pipeline persistence
         import asyncio
         from unittest.mock import AsyncMock, patch
-        from backend.agents.swarm_orchestrator import SwarmOrchestrator, SwarmBlackboard
+        from backend.agents.swarm_orchestrator import SwarmOrchestrator
+        from backend.agents.swarm_state import SwarmBlackboard
 
         board = SwarmBlackboard("ch-test-wiring-1", "run-wiring-1", "http://target.local")
         board.env_info = {"os": "windows", "tools": {}, "cpu_cores": 2}

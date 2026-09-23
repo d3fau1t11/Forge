@@ -277,7 +277,7 @@ class TestCoordinatorResumeReconciliation(Phase7Base):
 class TestBlackboardReconcile(Phase7Base):
 
     def _board(self, target):
-        from backend.agents.swarm_orchestrator import SwarmBlackboard
+        from backend.agents.swarm_state import SwarmBlackboard
         b = SwarmBlackboard("c7", "r7", target)
         b.discovered_endpoints = {f"{target}/login", "/status", f"{target}/api"}
         return b

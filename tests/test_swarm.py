@@ -7,13 +7,9 @@ import os
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
 from backend.engine.keep_awake import keep_awake_manager
-from backend.agents.swarm_orchestrator import (
-    SwarmBlackboard,
-    SwarmTask,
-    SwarmOrchestrator,
-    _is_meaningful_header,
-    _decode_artifacts,
-)
+from backend.agents.swarm_orchestrator import SwarmOrchestrator
+from backend.agents.swarm_state import SwarmBlackboard, SwarmTask
+from backend.agents.swarm_helpers import _is_meaningful_header, _decode_artifacts
 from backend.providers.quota_manager import quota_manager
 
 class TestSwarmEngine(unittest.TestCase):

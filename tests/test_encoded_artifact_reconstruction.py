@@ -33,10 +33,8 @@ from backend.agents.artifact_reconstruction import (
     detect_ascii_bitmap,
     _bits_to_bytes,
 )
-from backend.agents.swarm_orchestrator import (
-    SwarmBlackboard,
-    SwarmOrchestrator,
-)
+from backend.agents.swarm_orchestrator import SwarmOrchestrator
+from backend.agents.swarm_state import SwarmBlackboard
 
 
 # --------------------------------------------------------------------------- #

@@ -19,11 +19,8 @@ import os
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
 from backend.recon.web_forms import describe_form, extract_forms, verify_template_probe
-from backend.agents.swarm_orchestrator import (
-    SwarmBlackboard,
-    _decode_artifacts,
-    _english_score,
-)
+from backend.agents.swarm_state import SwarmBlackboard
+from backend.agents.swarm_helpers import _decode_artifacts, _english_score
 
 # ── Real fixtures, captured verbatim from the SSTI1 incident ──────────────────
 # The captured page (log line 22). Note name="content" — the field the agent

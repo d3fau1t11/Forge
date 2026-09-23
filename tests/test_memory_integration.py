@@ -42,7 +42,8 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 # isolated test database.
 from backend.database.session import init_db, SessionLocal
 from backend.database.models import ExperienceModel, ExperienceAttemptModel, MemoryUsageModel
-from backend.agents.swarm_orchestrator import SwarmBlackboard, swarm_orchestrator
+from backend.agents.swarm_orchestrator import swarm_orchestrator
+from backend.agents.swarm_state import SwarmBlackboard
 from backend.knowledge.experience_memory import experience_memory
 from backend.knowledge.memory_retriever import memory_retriever
 from backend.knowledge.experience_extractor import experience_extractor

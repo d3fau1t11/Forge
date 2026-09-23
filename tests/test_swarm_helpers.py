@@ -9,7 +9,8 @@ import unittest
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
-from backend.agents.swarm_orchestrator import _effective_elapsed_minutes, SwarmBlackboard
+from backend.agents.swarm_helpers import _effective_elapsed_minutes
+from backend.agents.swarm_state import SwarmBlackboard
 
 
 class TestEffectiveElapsedMinutes(unittest.TestCase):

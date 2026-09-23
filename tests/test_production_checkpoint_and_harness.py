@@ -16,10 +16,10 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 from backend.database.session import init_db, SessionLocal
 from backend.database.models import ChallengeModel, RunModel, CheckpointModel
 from backend.agents.swarm_orchestrator import (
-    SwarmBlackboard,
     SwarmOrchestrator,
     swarm_orchestrator,
 )
+from backend.agents.swarm_state import SwarmBlackboard
 from backend.api.runner import workflow_runner
 from backend.config import settings
 

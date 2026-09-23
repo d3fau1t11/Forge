@@ -11,7 +11,7 @@ from backend.agents.response_profiler import (
     _tokenize_structure,
 )
 from backend.agent_runtime.observation import ObservationEngine
-from backend.agents.swarm_orchestrator import SwarmBlackboard
+from backend.agents.swarm_state import SwarmBlackboard
 
 
 def test_endpoint_baseline_statistical_and_status_anomaly():

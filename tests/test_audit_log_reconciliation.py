@@ -26,7 +26,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
-from backend.agents.swarm_orchestrator import SwarmBlackboard, SwarmOrchestrator
+from backend.agents.swarm_orchestrator import SwarmOrchestrator
+from backend.agents.swarm_state import SwarmBlackboard
 from backend.database.models import AuditLogModel, ToolExecutionModel
 from backend.database.session import SessionLocal, init_db
 from backend.privilege.classify import classify_command_privilege

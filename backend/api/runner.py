@@ -147,7 +147,7 @@ class WorkflowRunner:
                     logger.error(f"Run task {run_id} crashed with unhandled exception: {exc}\n{''.join(tb.format_exception(type(exc), exc, exc.__traceback__))}")
                     # Write to challenge log file for visibility
                     try:
-                        from backend.agents.swarm_orchestrator import _append_to_challenge_log
+                        from backend.agents.swarm_helpers import _append_to_challenge_log
                         _append_to_challenge_log(challenge_id, "runner", f"FATAL: {exc}")
                     except Exception:
                         pass

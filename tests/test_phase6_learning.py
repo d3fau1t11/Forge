@@ -42,7 +42,8 @@ from backend.knowledge.memory_models import ExperienceRecord
 from backend.knowledge.experience_memory import experience_memory
 from backend.knowledge.memory_retriever import memory_retriever
 from backend.knowledge.playbook_vault import PlaybookVault
-from backend.agents.swarm_orchestrator import SwarmBlackboard, swarm_orchestrator
+from backend.agents.swarm_orchestrator import swarm_orchestrator
+from backend.agents.swarm_state import SwarmBlackboard
 
 from backend.swarm import (
     CandidateGenerator, CandidateAction, ActionScorer, SharedMissionState, Supervisor,

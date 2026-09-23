@@ -11,7 +11,8 @@ from backend.providers.real_providers import GeminiProvider, _detect_mime_type
 from backend.providers.router import ModelRouter, model_router
 from backend.tools.manager import tool_manager
 from backend.tools.registry import tool_registry
-from backend.agents.swarm_orchestrator import SwarmOrchestrator, SwarmBlackboard
+from backend.agents.swarm_orchestrator import SwarmOrchestrator
+from backend.agents.swarm_state import SwarmBlackboard
 
 
 class TestVisionCapability(unittest.IsolatedAsyncioTestCase):

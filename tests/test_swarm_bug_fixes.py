@@ -5,11 +5,11 @@ import asyncio
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from backend.agents.swarm_orchestrator import (
+from backend.agents.swarm_helpers import (
     _normalize_recon_target,
     _normalize_failure_signature,
-    SwarmBlackboard,
 )
+from backend.agents.swarm_state import SwarmBlackboard
 from backend.tools.manager import classify_tool_execution
 
 
@@ -133,7 +133,8 @@ class TestSwarmBugFixes(unittest.TestCase):
         3. Runs command a 4th time and asserts it is skipped via pre-check (execute_tool not called).
         """
         from unittest.mock import AsyncMock, patch
-        from backend.agents.swarm_orchestrator import SwarmOrchestrator, _normalize_command_shape
+        from backend.agents.swarm_orchestrator import SwarmOrchestrator
+        from backend.agents.swarm_helpers import _normalize_command_shape
 
         board = SwarmBlackboard("chal-int-1", "run-int-1", "http://target.local")
         orchestrator = SwarmOrchestrator()
@@ -186,7 +187,7 @@ class TestSwarmBugFixes(unittest.TestCase):
             forget_challenge_log_path,
             logs_base,
         )
-        from backend.agents.swarm_orchestrator import _append_to_challenge_log
+        from backend.agents.swarm_helpers import _append_to_challenge_log
 
         ch_id = f"test_race_{uuid.uuid4().hex[:8]}"
 

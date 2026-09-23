@@ -16,10 +16,10 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
 from backend.agents.swarm_orchestrator import (
-    SwarmBlackboard,
     SwarmOrchestrator,
     swarm_orchestrator,
 )
+from backend.agents.swarm_state import SwarmBlackboard
 from backend.api.routes import ApprovalRespondRequest, respond_approval
 
 
