@@ -1,7 +1,10 @@
 import asyncio
+import os
 import httpx
 
-key = "ad44572166msh97ae7a96445fec2p15ff9ejsn80829c13468b"
+# Supplied at run time, never hardcoded — set RAPIDAPI_KEY in your shell or .env
+# before running this script (e.g. `RAPIDAPI_KEY=... py tests/test_rapidapi.py`).
+key = os.environ.get("RAPIDAPI_KEY", "")
 
 endpoints = [
     {
@@ -58,6 +61,9 @@ async def run_rapidapi_tests():
         await asyncio.sleep(0.5)
 
 def test_all():
+    if not key:
+        print("RAPIDAPI_KEY is not set — skipping live RapidAPI smoke test.")
+        return
     asyncio.run(run_rapidapi_tests())
 
 if __name__ == "__main__":

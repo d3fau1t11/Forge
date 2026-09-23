@@ -10,7 +10,7 @@ invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
 stream = True
 
 headers = {
-    "Authorization": "Bearer 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",
+    "Authorization": "Bearer nvapi-EXAMPLEKEY0000000000000000000000000000000000",
     "Accept": "text/event-stream" if stream else "application/json",
 }
 
@@ -29,7 +29,7 @@ payload = {
     res = SnippetParser.parse_snippet(snippet)
     print("Parsed:", res)
     assert res["success"] is True
-    assert res["api_key"] == "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"
+    assert res["api_key"] == "nvapi-EXAMPLEKEY0000000000000000000000000000000000"
     assert res["model"] == "moonshotai/kimi-k3"
     assert res["base_url"] == "https://integrate.api.nvidia.com/v1"
     assert res["provider_name"] == "nvidia"
@@ -61,7 +61,7 @@ curl --request POST \
 	--url https://gpt-5-5.p.rapidapi.com/chat/completions \
 	--header 'Content-Type: application/json' \
 	--header 'x-rapidapi-host: gpt-5-5.p.rapidapi.com' \
-	--header 'x-rapidapi-key: ad44572166msh97ae7a96445fec2p15ff9ejsn80829c13468b' \
+	--header 'x-rapidapi-key: FAKErapidapikey0000000000000000' \
 	--data '{"model":"GPT-5.5","messages":[{"role":"user","content":"Hi"}]}'
 '''
     res = SnippetParser.parse_snippet(curl)
@@ -69,7 +69,7 @@ curl --request POST \
     assert res["success"] is True
     assert res["provider_name"] == "rapidapi"
     assert res["model"] == "GPT-5.5"
-    assert res["api_key"] == "ad44572166msh97ae7a96445fec2p15ff9ejsn80829c13468b"
+    assert res["api_key"] == "FAKErapidapikey0000000000000000"
     assert res["extra_headers"]["x-rapidapi-host"] == "gpt-5-5.p.rapidapi.com"
     print("[OK] RapidAPI snippet test passed!")
 

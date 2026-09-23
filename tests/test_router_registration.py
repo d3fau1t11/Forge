@@ -11,7 +11,7 @@ invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
 stream = True
 
 headers = {
-    "Authorization": "Bearer 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",
+    "Authorization": "Bearer nvapi-EXAMPLEKEY0000000000000000000000000000000000",
     "Accept": "text/event-stream" if stream else "application/json",
 }
 
