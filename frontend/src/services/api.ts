@@ -161,6 +161,50 @@ export class ApiService {
     return await res.json();
   }
 
+  // ------------------------------------------------------------------
+  // CHAT-DRIVEN CHALLENGE CREATION
+  // ------------------------------------------------------------------
+
+  /** Start a new two-turn chat session. Returns { session_id, step, bot_message }. */
+  public async startChatSession(): Promise<{ session_id: string; step: number; bot_message: string }> {
+    const res = await apiFetch(`${API_BASE_URL}/challenges/chat-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  /**
+   * Send the next message in a chat session.
+   * On step==1 (turn 1) supply challenge_name / platform_name / challenge_type.
+   * On step==2 (turn 2) supply description and optional target_address / attached_file_paths.
+   * Returns { session_id, step, bot_message, challenge? } — challenge is present on the final turn.
+   */
+  public async sendChatMessage(
+    sessionId: string,
+    payload: {
+      challenge_name?: string;
+      platform_name?: string;
+      challenge_type?: string;
+      target_address?: string;
+      description?: string;
+      attached_file_paths?: string[];
+    }
+  ): Promise<{ session_id: string; step: number | string; bot_message: string; challenge?: any }> {
+    const res = await apiFetch(`${API_BASE_URL}/challenges/chat-session/${sessionId}/message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return await res.json();
+  }
+
   public async getCheckpoint(challengeId: string) {
     const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);

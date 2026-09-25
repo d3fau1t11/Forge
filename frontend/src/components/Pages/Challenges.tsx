@@ -10,9 +10,10 @@ import {
   ChevronRight,
   Filter,
   Folder,
-  Trash2
+  Trash2,
+  MessageSquare
 } from 'lucide-react';
-import { Challenge } from '../../types';
+import { Challenge, NavTab } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
 import { DirectoryBrowserModal } from './DirectoryBrowserModal';
 import { apiService } from '../../services/api';
@@ -24,6 +25,7 @@ interface ChallengesProps {
   onToggleStatus: (id: string) => void;
   onDeleteChallenge?: (id: string) => void;
   onDeleteAllChallenges?: () => void;
+  onNavigateTab?: (tab: NavTab) => void;
 }
 
 export const Challenges: React.FC<ChallengesProps> = ({
@@ -32,7 +34,8 @@ export const Challenges: React.FC<ChallengesProps> = ({
   onCreateChallenge,
   onToggleStatus,
   onDeleteChallenge,
-  onDeleteAllChallenges
+  onDeleteAllChallenges,
+  onNavigateTab
 }) => {
   const [showModal, setShowModal] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
@@ -206,6 +209,20 @@ export const Challenges: React.FC<ChallengesProps> = ({
             </button>
           )}
 
+          {onNavigateTab && (
+            <button
+              onClick={() => {
+                soundEngine.playClick();
+                onNavigateTab('new_challenge_chat');
+              }}
+              className="px-4 py-2.5 rounded-lg bg-obsidian-900 hover:bg-cyan-950/70 border border-cyber-cyan/50 text-cyber-cyan hover:text-cyan-300 font-display font-bold text-xs flex items-center justify-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.2)] hover:scale-105 transition-all uppercase tracking-wider shrink-0"
+              title="Launch chat-driven challenge setup"
+            >
+              <MessageSquare className="w-4 h-4 text-cyber-cyan" />
+              <span>[ CHAT SETUP ]</span>
+            </button>
+          )}
+
           <button
             onClick={() => { soundEngine.playClick(); setShowModal(true); }}
             className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center justify-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] hover:scale-105 transition-all uppercase tracking-wider shrink-0"
@@ -225,13 +242,24 @@ export const Challenges: React.FC<ChallengesProps> = ({
               <h3 className="text-sm font-display font-bold text-slate-200 uppercase tracking-wider">NO ACTIVE CTF CHALLENGES</h3>
               <p className="text-slate-400 max-w-md">No CTF challenges found in current database scope. Click below to initialize a real CTF target.</p>
             </div>
-            <button
-              onClick={() => { soundEngine.playClick(); setShowModal(true); }}
-              className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] transition-all uppercase tracking-wider"
-            >
-              <Plus className="w-4 h-4" />
-              <span>INITIALIZE NEW CHALLENGE</span>
-            </button>
+            <div className="flex items-center space-x-3 pt-2">
+              {onNavigateTab && (
+                <button
+                  onClick={() => { soundEngine.playClick(); onNavigateTab('new_challenge_chat'); }}
+                  className="px-5 py-2.5 rounded-lg bg-obsidian-900 hover:bg-cyan-950/70 border border-cyber-cyan/60 text-cyber-cyan font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.25)] transition-all uppercase tracking-wider"
+                >
+                  <MessageSquare className="w-4 h-4 text-cyber-cyan" />
+                  <span>START WITH CHAT</span>
+                </button>
+              )}
+              <button
+                onClick={() => { soundEngine.playClick(); setShowModal(true); }}
+                className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] transition-all uppercase tracking-wider"
+              >
+                <Plus className="w-4 h-4" />
+                <span>FORM SETUP</span>
+              </button>
+            </div>
           </div>
         ) : (
           filteredChallenges.map((ch) => (

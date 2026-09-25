@@ -1,6 +1,7 @@
 export type NavTab = 
   | 'command' 
-  | 'challenges' 
+  | 'challenges'
+  | 'new_challenge_chat'
   | 'targets' 
   | 'agents' 
   | 'tools' 

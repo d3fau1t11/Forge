@@ -37,6 +37,7 @@ import { SystemView } from './components/Pages/SystemView';
 import { ChallengeWorkspace } from './components/Pages/ChallengeWorkspace';
 import { KnowledgeCoverage } from './components/Pages/KnowledgeCoverage';
 import { ExperienceMemory } from './components/Pages/ExperienceMemory';
+import { NewChallengeChat } from './components/Pages/NewChallengeChat';
 import { apiService, apiFetch } from './services/api';
 import { AlertTriangle, X } from 'lucide-react';
 import { soundEngine } from './utils/soundEngine';
@@ -1159,6 +1160,15 @@ export default function App() {
                   onToggleStatus={handleToggleChallengeStatus}
                   onDeleteChallenge={handleDeleteChallenge}
                   onDeleteAllChallenges={handleDeleteAllChallenges}
+                  onNavigateTab={(tab) => setActiveTab(tab)}
+                />
+              )}
+
+              {activeTab === 'new_challenge_chat' && (
+                <NewChallengeChat
+                  onOpenWorkspace={handleOpenChallengeWorkspace}
+                  onRefreshBackendData={fetchBackendData}
+                  setActiveTab={setActiveTab}
                 />
               )}
 

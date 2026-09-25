@@ -6,8 +6,9 @@ import logging
 import os
 import re
 import shutil
+import uuid as _uuid_mod
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -28,6 +29,14 @@ from backend.websocket.manager import ws_manager
 
 router = APIRouter()
 logger = logging.getLogger("forge.routes")
+
+# ---------------------------------------------------------------------------
+# CHAT-SESSION STATE (in-memory, per-process, keyed by session_id)
+# Each entry lives only until the session commits or is garbage-collected.
+# Structure: { session_id: { "name": str, "platform": str, "type": str,
+#              "step": 1|2, "uploaded_paths": [str] } }
+# ---------------------------------------------------------------------------
+_CHAT_SESSIONS: Dict[str, dict] = {}
 
 
 def _safe_delete_working_dir(working_dir: str):
@@ -142,6 +151,166 @@ class SaveWriteupRequest(BaseModel):
     # The operator-confirmed markdown to persist. When omitted, the backend
     # regenerates a deterministic writeup from the challenge's real telemetry.
     content: Optional[str] = None
+
+
+# Chat-session request / response models
+class ChatSessionStartRequest(BaseModel):
+    """Body for POST /challenges/chat-session — starts a new two-turn session."""
+    # No required fields: the first bot message is always the same fixed prompt.
+    pass
+
+
+class ChatSessionMessageRequest(BaseModel):
+    """Body for POST /challenges/chat-session/{session_id}/message."""
+    # Turn-1 fields (required on step == 1)
+    challenge_name: Optional[str] = None
+    platform_name: Optional[str] = None
+    challenge_type: Optional[str] = None
+    # Turn-2 fields (required on step == 2)
+    target_address: Optional[str] = None
+    description: Optional[str] = None
+    # Paths returned by POST /challenges/upload — already staged on disk
+    attached_file_paths: Optional[List[str]] = None
+
+
+# ----------------------------------------------------
+# CHAT-DRIVEN CHALLENGE CREATION
+# ----------------------------------------------------
+
+@router.post("/challenges/chat-session")
+async def start_chat_session(_req: ChatSessionStartRequest = None):
+    """Open a new two-turn chat session.
+
+    Returns a session_id the client must carry through the second turn, plus
+    the first bot prompt the UI should display in the chat window.
+    """
+    session_id = _uuid_mod.uuid4().hex
+    _CHAT_SESSIONS[session_id] = {
+        "step": 1,
+        "name": None,
+        "platform": None,
+        "type": None,
+        "uploaded_paths": [],
+    }
+    return {
+        "session_id": session_id,
+        "step": 1,
+        "bot_message": (
+            "Let's set up your challenge.\n\n"
+            "Please tell me:\n"
+            "1. **Challenge name** — what is this challenge called?\n"
+            "2. **Platform / event name** — e.g. PicoCTF, HackTheBox, DEF CON, …\n"
+            "3. **Challenge type** — e.g. Web, Pwn, Crypto, Forensics, Rev, or anything you like.\n\n"
+            "You can answer all three in one message."
+        ),
+    }
+
+
+@router.post("/challenges/chat-session/{session_id}/message")
+async def send_chat_message(
+    session_id: str,
+    req: ChatSessionMessageRequest,
+    db: Session = Depends(get_db),
+):
+    """Advance a chat session by one turn.
+
+    * **Turn 1** (step==1): expects challenge_name, platform_name, challenge_type.
+      Stores them and returns the step-2 prompt.
+    * **Turn 2** (step==2): expects description (required) plus optional
+      target_address and attached_file_paths.  Commits by calling the existing
+      create_challenge() logic and returns the new challenge row.
+    """
+    session = _CHAT_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Chat session not found or already committed")
+
+    step = session["step"]
+
+    # ------------------------------------------------------------------
+    # TURN 1: collect the three required fields
+    # ------------------------------------------------------------------
+    if step == 1:
+        name = (req.challenge_name or "").strip()
+        platform = (req.platform_name or "").strip()
+        challenge_type = (req.challenge_type or "").strip()
+
+        if not name or not platform or not challenge_type:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Please provide all three fields: challenge_name, "
+                    "platform_name, and challenge_type."
+                ),
+            )
+
+        session["name"] = name
+        session["platform"] = platform
+        session["type"] = challenge_type
+        session["step"] = 2
+
+        return {
+            "session_id": session_id,
+            "step": 2,
+            "bot_message": (
+                f"Got it — **{name}** on **{platform}** ({challenge_type}).\n\n"
+                "Now, optionally:\n"
+                "• Paste a **target address** (IP, URL, or `nc host port`) if you have one.\n"
+                "• Attach a **challenge file** using the upload button.\n\n"
+                "And in one sentence or more: **what is your goal for this challenge?** "
+                "(This becomes the challenge description.)\n\n"
+                "Send your message when ready — the challenge will be created immediately."
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # TURN 2: collect optional target / files / goal, then create
+    # ------------------------------------------------------------------
+    if step == 2:
+        description = (req.description or "").strip()
+        if not description:
+            raise HTTPException(
+                status_code=422,
+                detail="Please include a description / goal for the challenge.",
+            )
+
+        # Merge any file paths uploaded before this turn (via /challenges/upload)
+        extra_paths = [p for p in (req.attached_file_paths or []) if p and os.path.isfile(p)]
+        all_paths = session.get("uploaded_paths", []) + extra_paths
+
+        # Build the same request object the form path uses
+        creation_req = CreateChallengeRequest(
+            name=session["name"],
+            category=session["type"],          # stored verbatim, no coercion
+            difficulty="MEDIUM",               # sensible default; user can change via form later
+            description=description,
+            target_address=(req.target_address or "").strip(),
+            working_directory="",
+            platform_name=session["platform"],
+            requires_root=False,
+            flag_pattern="",
+            max_iterations=0,
+            max_minutes=0,
+            instance_expiry_minutes=0,
+            attached_file_paths=all_paths or None,
+        )
+
+        # Delegate entirely to the existing creation endpoint so logic is never forked.
+        # Remove session before awaiting to avoid double-commit on retry.
+        _CHAT_SESSIONS.pop(session_id, None)
+
+        challenge_row = await create_challenge(creation_req, db)
+        return {
+            "session_id": session_id,
+            "step": "committed",
+            "bot_message": (
+                f"Challenge **{challenge_row.name}** created successfully! "
+                f"Redirecting you to the challenges list…"
+            ),
+            "challenge": challenge_row,
+        }
+
+    # Should never reach here
+    raise HTTPException(status_code=400, detail="Invalid session state")
 
 
 # ----------------------------------------------------
