@@ -11,6 +11,13 @@ from backend.agents.swarm_helpers import (
 )
 from backend.agents.swarm_state import SwarmBlackboard
 from backend.tools.manager import classify_tool_execution
+# backend.config calls load_dotenv(dotenv_path=".env", override=True) at import,
+# which would reset DATABASE_URL to the production value from .env. Import it here so
+# that override happens now -- once -- then pin DATABASE_URL at the isolated test
+# database. Never point this at forge.db: other modules' tearDowns delete real rows.
+import backend.config  # noqa: F401
+os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
+
 
 
 class TestSwarmBugFixes(unittest.TestCase):

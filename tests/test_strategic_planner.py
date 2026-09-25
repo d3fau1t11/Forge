@@ -7,6 +7,13 @@ from unittest.mock import patch, MagicMock
 # Ensure backend can be imported and isolated test database is used per Rule 5
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
+# backend.config calls load_dotenv(dotenv_path=".env", override=True) at import,
+# which would reset DATABASE_URL to the production value from .env. Import it here so
+# that override happens now -- once -- then pin DATABASE_URL at the isolated test
+# database. Never point this at forge.db: other modules' tearDowns delete real rows.
+import backend.config  # noqa: F401
+os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
+
 
 from backend.agents.strategic_planner import StrategicPlanner, strategic_planner
 
