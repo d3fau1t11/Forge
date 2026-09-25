@@ -104,6 +104,7 @@ class MissionState:
     commands_attempted: List[str] = field(default_factory=list)
     successful_techniques: List[str] = field(default_factory=list)
     failed_techniques: List[str] = field(default_factory=list)   # ["approach :: reason"]
+    capability_gaps: List[Dict[str, Any]] = field(default_factory=list)
     dead_ends: List[str] = field(default_factory=list)
     current_hypotheses: List[str] = field(default_factory=list)
 
@@ -192,6 +193,18 @@ class MissionState:
         if entry:
             _add_unique(self.failed_techniques, entry)
             self._touch()
+
+    def record_capability_gap(self, action: str, capability: str = "", target: str = "", reason: str = "", privilege_level: str = "PRIVILEGED") -> None:
+        entry = {
+            "action": action.strip(),
+            "capability": capability.strip(),
+            "target": target.strip(),
+            "reason": reason.strip(),
+            "privilege_level": privilege_level.strip(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.capability_gaps.append(entry)
+        self._touch()
 
     def record_dead_end(self, note: str) -> None:
         if note:

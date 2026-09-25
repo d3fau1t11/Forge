@@ -201,6 +201,8 @@ class Supervisor:
 
         if status == "CANCELLED":
             return "cancelled"
+        if cat in ("CAPABILITY_GAP", "PRIVILEGE_DENIED") or "capability_gap" in reason or "privilege_denied" in reason or ("privilege" in reason and "denied" in reason):
+            return "capability_gap"
         # Phase 4.x — a capability that is unavailable-and-not-acquirable, or a target of
         # the wrong KIND, must NOT be retried: retrying cannot change the outcome and only
         # burns the mission budget. Classify them so decide_recovery abandons immediately.
@@ -227,6 +229,10 @@ class Supervisor:
 
         if category == "cancelled":
             return RecoveryDecision("abandon", "Task cancelled by global stop.")
+
+        if category == "capability_gap":
+            return RecoveryDecision(
+                "retry", "Capability gap (privilege denied); request privilege escalation via approval pipeline.")
 
         # Phase 4.x — impossible-as-specified failures: retrying is futile. Abandon so the
         # mission records a dead end and moves on instead of re-dispatching (§15, §22).

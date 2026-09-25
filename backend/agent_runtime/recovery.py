@@ -30,6 +30,7 @@ class FailureCategory(str, Enum):
     INVALID_URL = "INVALID_URL"
     INTERPRETER_ASSUMPTION = "INTERPRETER_ASSUMPTION"
     PERMISSION_FAILURE = "PERMISSION_FAILURE"
+    CAPABILITY_GAP = "CAPABILITY_GAP"
     NETWORK_FAILURE = "NETWORK_FAILURE"
     REPEATED_ACTION = "REPEATED_ACTION"
     NO_PROGRESS = "NO_PROGRESS"
@@ -110,6 +111,7 @@ class RecoveryEngine:
         stdout = (getattr(exec_result, "stdout", "") or "") if exec_result else ""
         status = getattr(exec_result, "status", "SUCCESS") if exec_result else "SUCCESS"
         failure_cat = getattr(exec_result, "failure_category", None) if exec_result else None
+        reason = (getattr(exec_result, "reason", "") or "") if exec_result else ""
         combined = f"{stdout}\n{stderr}"
         cmd = command or (getattr(exec_result, "command", "") if exec_result else "")
 
@@ -194,6 +196,16 @@ class RecoveryEngine:
                 f"The tool '{tool}' is not installed on this host. Use an installed "
                 f"alternative (check the environment tool list) or install it first.",
                 reasons=[f"Tool not found: {tool}"],
+            )
+
+        if (failure_cat in ("CAPABILITY_GAP", "PRIVILEGE_DENIED") or status == "CAPABILITY_GAP"
+                or "capability_gap" in reason.lower() or "privilege_denied" in reason.lower()
+                or ("privilege" in reason.lower() and "denied" in reason.lower())):
+            return RecoveryPlan(
+                FailureCategory.CAPABILITY_GAP, RecoveryStrategy.ESCALATE_PRIVILEGE,
+                "The requested action was denied due to privilege/capability restrictions (capability gap). "
+                "Escalate privilege through the approval pipeline or select an alternative unprivileged approach.",
+                escalate=True, reasons=["Privilege requirement denied (capability gap)."],
             )
 
         if "permission denied" in combined.lower() or "operation not permitted" in combined.lower():

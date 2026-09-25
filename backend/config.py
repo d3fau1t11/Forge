@@ -89,6 +89,7 @@ try:
         # Defaults to the safer "manual" so an unconfigured deployment keeps asking.
         # NOTE: this is NOT the cycle-level HITL checkpoint timeout above.
         FORGE_APPROVAL_MODE: str = "manual"
+        AUTO_APPROVE_PRIVILEGED: bool = False
 
         # Default flag-pattern string shown in the challenge form and baked into
         # agent prompts.  Users may override this per-challenge at start time.

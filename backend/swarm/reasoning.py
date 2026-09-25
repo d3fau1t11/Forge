@@ -198,6 +198,7 @@ class FailureClass(str, Enum):
 
     TOOL_FAILURE = "TOOL_FAILURE"
     CAPABILITY_FAILURE = "CAPABILITY_FAILURE"
+    CAPABILITY_GAP = "CAPABILITY_GAP"
     TARGET_MISMATCH = "TARGET_MISMATCH"
     NETWORK_FAILURE = "NETWORK_FAILURE"
     AUTH_FAILURE = "AUTH_FAILURE"
@@ -226,6 +227,7 @@ class RecoveryHint(str, Enum):
 _FAILURE_RECOVERY: Dict[FailureClass, RecoveryHint] = {
     FailureClass.TOOL_FAILURE: RecoveryHint.ALTERNATIVE_METHOD,
     FailureClass.CAPABILITY_FAILURE: RecoveryHint.RECOVER_CAPABILITY,
+    FailureClass.CAPABILITY_GAP: RecoveryHint.RECOVER_CAPABILITY,
     FailureClass.TARGET_MISMATCH: RecoveryHint.FIX_TARGET,
     FailureClass.NETWORK_FAILURE: RecoveryHint.RETRY,
     FailureClass.AUTH_FAILURE: RecoveryHint.ALTERNATIVE_METHOD,
@@ -257,6 +259,8 @@ def classify_failure(result: Any) -> FailureClass:
 
     if status == "CANCELLED":
         return FailureClass.CANCELLED
+    if cat in ("CAPABILITY_GAP", "PRIVILEGE_DENIED") or "capability_gap" in reason or "privilege_denied" in reason or ("privilege" in reason and "denied" in reason):
+        return FailureClass.CAPABILITY_GAP
     if cat == "BLOCKED_CAPABILITY" or "blocked_capability" in reason:
         return FailureClass.CAPABILITY_FAILURE
     if cat == "TARGET_MISMATCH" or "target_mismatch" in reason:

@@ -279,12 +279,11 @@ class RealToolExecutor:
             stderr=(
                 f"[PRIVILEGE DENIED] Operator did not approve this command "
                 f"({'no response before the approval window closed' if timed_out else 'denied'}). "
-                f"The command was NOT executed. Pivot to an approach that does not require "
-                f"privilege elevation."
+                f"The command was NOT executed (capability gap). Preserving original intent for privilege escalation."
             ),
             exit_code=-1,
             execution_failure=True,
-            failure_category="PRIVILEGE_DENIED",
+            failure_category="CAPABILITY_GAP",
         )
 
     async def execute(self, action: Action, *, cwd: Optional[str] = None,
@@ -742,6 +741,15 @@ class AgentRuntime:
                              decision_summary=plan.directive, strategy=plan.strategy.value)
                 if not exec_result.succeeded:
                     state.record_failure(action.display(), plan.category.value)
+                if exec_result.failure_category == "CAPABILITY_GAP":
+                    cap_name = action.capability or action.tool_name or (action.command.split()[0] if action.command else "")
+                    state.record_capability_gap(
+                        action=action.display(),
+                        capability=cap_name,
+                        target=state.target,
+                        reason=exec_result.stderr[:200] if exec_result.stderr else "Privilege denial (capability gap)",
+                        privilege_level="PRIVILEGED",
+                    )
                 recovery_directive = plan.directive
 
             # ── Persist state every turn; checkpoint periodically (crash-safe resume) ──

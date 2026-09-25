@@ -190,6 +190,8 @@ class SwarmBlackboard:
 
         # ── Command Privilege Approvals (Per-Request HITL Gate) ────────────────
         self.pending_approvals: Dict[str, Dict[str, Any]] = {}
+        # Preserved intent for capability gaps (privilege denials)
+        self.capability_gaps: List[Dict[str, Any]] = []
 
     async def add_task(self, category: str, description: str, priority: int = 1, metadata: Optional[Dict] = None) -> SwarmTask:
         async with self._lock:
@@ -338,6 +340,11 @@ class SwarmBlackboard:
             logger.info(f"[SwarmBlackboard] 🎯 Candidate verified/resolved: {verdict.candidate} via {source}")
             await self.record_flag(verdict.candidate, worker_id)
 
+    def record_capability_gap(self, intent: Dict[str, Any]) -> None:
+        """Preserve original intent when an action/capability is denied for privilege reasons."""
+        if isinstance(intent, dict):
+            self.capability_gaps.append(dict(intent))
+
     async def register_derived_artifact(self, outcome, derived_path: Optional[str],
                                         worker_id: str) -> bool:
         """Preserve a reconstructed artifact as shared evidence and escalate it.
@@ -436,6 +443,10 @@ class SwarmBlackboard:
         )
         return True
 
+    def save_snapshot(self) -> Dict[str, Any]:
+        """Convenience alias for _build_mission_plan()."""
+        return self._build_mission_plan()
+
     def _build_mission_plan(self) -> Dict[str, Any]:
         """Build the current mission plan for UI + DB persist.
 
@@ -530,6 +541,7 @@ class SwarmBlackboard:
                 "reviewed_pivot_strategies": list(self.reviewed_pivot_strategies),
                 "response_profiler": self.response_profiler.to_dict(),
                 "actionable_preemptions": [dict(p) for p in self.actionable_preemptions[-30:]],
+                "capability_gaps": [dict(g) for g in self.capability_gaps[-50:]],
             },
         }
 
@@ -548,6 +560,10 @@ class SwarmBlackboard:
         counts = {"endpoints": 0, "headers": 0, "commands": 0, "completed_tasks": 0,
                   "pending_tasks": 0, "transcript_lines": 0}
         snapshot = snapshot or {}
+
+        for g in (snapshot.get("capability_gaps") or []):
+            if isinstance(g, dict):
+                self.capability_gaps.append(dict(g))
 
         for k, v in (snapshot.get("recon_cache") or {}).items():
             self.recon_cache[k] = v

@@ -696,7 +696,7 @@ class TestRealToolExecutorIsGated(_GateTestBase):
         executor.tool_manager.execute_raw_command.assert_not_called()
         self.assertEqual(res.status, "FAILED")
         self.assertTrue(res.execution_failure)
-        self.assertEqual(res.failure_category, "PRIVILEGE_DENIED")
+        self.assertIn(res.failure_category, ("PRIVILEGE_DENIED", "CAPABILITY_GAP"))
         self.assertIn("PRIVILEGE DENIED", res.stderr)
 
     async def test_denied_python_script_never_executes(self):
@@ -722,7 +722,7 @@ class TestRealToolExecutorIsGated(_GateTestBase):
         self.assertTrue(denied, "the script gate never registered a pending approval")
         executor.tool_manager.execute_raw_command.assert_not_called()
         self.assertEqual(res.status, "FAILED")
-        self.assertEqual(res.failure_category, "PRIVILEGE_DENIED")
+        self.assertIn(res.failure_category, ("PRIVILEGE_DENIED", "CAPABILITY_GAP"))
 
     async def test_automation_python_command_is_not_gated(self):
         """Regression guard for the new classification: `python3 solve.py` runs with no
@@ -763,7 +763,7 @@ class TestRealToolExecutorIsGated(_GateTestBase):
         self.assertTrue(denied, "the capability gate never registered a pending approval")
         executor.tool_manager.execute_capability.assert_not_called()
         self.assertEqual(res.status, "FAILED")
-        self.assertEqual(res.failure_category, "PRIVILEGE_DENIED")
+        self.assertIn(res.failure_category, ("PRIVILEGE_DENIED", "CAPABILITY_GAP"))
 
     async def test_approved_command_still_executes(self):
         """Regression guard: the gate must not block an approved command."""

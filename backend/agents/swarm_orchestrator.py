@@ -766,10 +766,26 @@ class SwarmOrchestrator:
                 if not approved:
                     _sudo_pw_for_exec = None  # discard on deny/timeout
                     status_str = "timed out" if decision is None else "denied"
+                    intent = {
+                        "agent_id": agent_id,
+                        "capability": bin_name or (cmd.split()[0] if cmd.strip() else ""),
+                        "target": board.target_scope,
+                        "command": cmd,
+                        "privilege_level": priv_level,
+                        "strategy": strategy_label,
+                        "decision": decision,
+                        "reason": f"Privilege check {status_str} ({priv_level})",
+                    }
+                    board.record_capability_gap(intent)
                     _append_to_challenge_log(
                         board.challenge_id,
                         agent_id,
-                        f"[PRIVILEGE {status_str.upper()}] level={priv_level} cmd={cmd[:150]}"
+                        f"[CAPABILITY_GAP] Privilege {status_str.upper()} (level={priv_level}) for capability '{intent['capability']}' on target '{intent['target']}'. Intent preserved."
+                    )
+                    board.record_agent_step(
+                        agent_id,
+                        command=cmd,
+                        note=f"[CAPABILITY_GAP] Privilege {status_str.upper()} for '{intent['capability']}'. Preserving intent for approval escalation.",
                     )
                     await asyncio.sleep(0.5)
                     continue
