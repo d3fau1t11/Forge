@@ -78,6 +78,7 @@ MIGRATIONS = [
     (18, "ALTER TABLE targets ADD COLUMN technologies JSON"),
     (19, "ALTER TABLE targets ADD COLUMN address_history JSON"),
     (20, "ALTER TABLE targets ADD COLUMN discovery_method VARCHAR DEFAULT 'FORGE Auto Ingest'"),
+    (21, "ALTER TABLE challenges ADD COLUMN approval_mode VARCHAR DEFAULT NULL"),
 ]
 
 # SQLite's exact wording for ADD COLUMN on a column that already exists

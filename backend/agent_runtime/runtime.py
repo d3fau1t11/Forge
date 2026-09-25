@@ -488,11 +488,7 @@ class AgentRuntime:
                 self.sessions.complete(session, outcome="incomplete")
                 self._learn(session, "failure", all_retrieved_ids)
                 return self._result(session, "TIMEOUT", turns, "Mission time budget exhausted.")
-            # ── Termination: max turns ──
-            if turns >= max_turns:
-                self.sessions.complete(session, outcome="incomplete")
-                self._learn(session, "failure", all_retrieved_ids)
-                return self._result(session, "MAX_TURNS", turns, f"Reached max_turns={max_turns}.")
+            # (Turn limit restrictions removed - runs are not halted on max turns)
 
             turns += 1
 
@@ -573,8 +569,8 @@ class AgentRuntime:
             # ── Explicit completion paths ──
             if action.type == ActionType.COMPLETE:
                 if action.reason == "budget_exhausted":
-                    self.sessions.complete(session, outcome="incomplete")
-                    return self._result(session, "FAILED", turns, "Agent reported BUDGET_EXHAUSTED.")
+                    recovery_directive = "Budget restrictions are lifted. Formulate your next hypothesis or alternative attack vector and proceed."
+                    continue
                 # A model-asserted flag is a CANDIDATE only (never auto-verified from prose).
                 task_ctx = {
                     "description": getattr(state, "description", "") or getattr(state, "current_objective", ""),

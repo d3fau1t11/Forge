@@ -1,7 +1,6 @@
 export type NavTab = 
   | 'command' 
   | 'challenges'
-  | 'new_challenge_chat'
   | 'targets' 
   | 'agents' 
   | 'tools' 
@@ -15,6 +14,7 @@ export type NavTab =
   | 'system';
 
 export type ChallengeTab = 
+  | 'chat'
   | 'overview' 
   | 'todo_plan'
   | 'workflow' 
@@ -82,6 +82,8 @@ export interface Challenge {
   candidates?: FlagCandidate[];
   derivedArtifacts?: DerivedArtifact[];
   decisions?: AiDecision[];
+  approval_mode?: 'auto' | 'manual' | null;
+  approvalMode?: 'auto' | 'manual' | null;
 }
 
 export interface Target {
@@ -256,4 +258,13 @@ export interface DerivedArtifact {
   worker_id?: string;
   timestamp?: string;
 }
+
+export interface ChallengeChatMessage {
+  id: string;
+  challenge_id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  created_at?: string;
+}
+
 

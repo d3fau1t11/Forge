@@ -59,14 +59,33 @@ _MODE_AUTO = "auto"
 _MODE_MANUAL = "manual"
 
 
-def _resolve_approval_mode() -> str:
-    """Read the operator-configured approval mode, fail-closed on anything unknown.
+def _resolve_approval_mode(challenge_id: Optional[str] = None) -> str:
+    """Read approval mode: per-challenge runtime setting first, fallback to global settings.
 
-    ``backend/config.py`` already validates the value at import time; re-checking here
-    keeps the gate safe on its own (and for tests that swap ``settings`` wholesale).
+    1. Checks the specific challenge's `approval_mode` ('auto' or 'manual') if challenge_id is provided.
+    2. Falls back to global `AUTO_APPROVE_PRIVILEGED` or `FORGE_APPROVAL_MODE` if unset.
     """
+    if challenge_id:
+        try:
+            db = SessionLocal()
+            try:
+                from backend.database.models import ChallengeModel
+                ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+                if ch and ch.approval_mode:
+                    c_mode = str(ch.approval_mode).strip().lower()
+                    if c_mode in (_MODE_AUTO, _MODE_MANUAL):
+                        return c_mode
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug(f"[privilege.gate] Could not read challenge approval_mode: {e}")
+
+    if getattr(settings, "AUTO_APPROVE_PRIVILEGED", False):
+        return _MODE_AUTO
+
     mode = str(getattr(settings, "FORGE_APPROVAL_MODE", _MODE_MANUAL) or "").strip().lower()
     return mode if mode in (_MODE_AUTO, _MODE_MANUAL) else _MODE_MANUAL
+
 
 
 def _reconcile_audit(audit_log_id: Optional[str], approved: bool) -> None:
@@ -134,7 +153,7 @@ async def require_approval(
         db = SessionLocal()
         try:
             approved, audit_log_id = privilege_manager.evaluate_privilege_ex(
-                agent=agent_id, tool_name=bin_name, privilege_level=priv_level, db=db
+                agent=agent_id, tool_name=bin_name, privilege_level=priv_level, db=db, challenge_id=challenge_id
             )
         finally:
             db.close()
@@ -147,7 +166,7 @@ async def require_approval(
     if approved:
         return True, None, None
 
-    mode = _resolve_approval_mode()
+    mode = _resolve_approval_mode(challenge_id)
     req_sudo = bool(re.search(r"\bsudo\b", cmd))
 
     # ── AUTO mode, no sudo: run unattended, ask nobody anything ──────────────────

@@ -227,7 +227,7 @@ class AutonomousOrchestrator:
 
         history_summary = []
         normalized_history = []
-        max_turns = 20
+        max_turns = 1000  # Restrictions removed; runs continue until flag capture or operator stop
         
         # Structured State Memory Object
         state_memory = {

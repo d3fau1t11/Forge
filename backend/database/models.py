@@ -54,6 +54,7 @@ class ChallengeModel(Base):
     completed_at = Column(DateTime, nullable=True)
     duration_seconds = Column(Integer, default=0)
     mission_plan = Column(JSON, default=dict)
+    approval_mode = Column(String, nullable=True, default=None) # 'auto', 'manual', or None (inherit global)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -61,6 +62,7 @@ class ChallengeModel(Base):
     runs = relationship("RunModel", back_populates="challenge", cascade="all, delete-orphan")
     evidence = relationship("EvidenceModel", back_populates="challenge", cascade="all, delete-orphan")
     findings = relationship("FindingModel", back_populates="challenge", cascade="all, delete-orphan")
+    messages = relationship("ChatMessageModel", back_populates="challenge", cascade="all, delete-orphan")
 
 class TargetProfileModel(Base):
     __tablename__ = "targets"
@@ -210,6 +212,19 @@ class AuditLogModel(Base):
     approved = Column(Boolean, default=True)
     details = Column(JSON, default=dict)
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
+class ChatMessageModel(Base):
+    """Stores persistent chat turns scoped to a challenge."""
+    __tablename__ = "chat_messages"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    challenge_id = Column(String, ForeignKey("challenges.id"), nullable=False, index=True)
+    role = Column(String, nullable=False)  # user, assistant, system
+    content = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    challenge = relationship("ChallengeModel", back_populates="messages")
 
 
 # =============================================================================

@@ -417,10 +417,7 @@ class ModelRouter:
                     logger.warning(f"Provider {provider_name} rejected: Paid models disabled.")
                     paid_rejected = True
                     continue
-                if self.current_spent_usd >= self.daily_budget_usd:
-                    logger.warning(f"Provider {provider_name} rejected: Daily budget ${self.daily_budget_usd} exceeded.")
-                    budget_rejected = True
-                    continue
+                # Note: Budget restrictions removed - cost is tracked for telemetry without halting runs.
 
             if await provider.is_available():
                 try:

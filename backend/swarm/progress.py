@@ -120,19 +120,7 @@ class MissionBudget:
         return self.pressure() >= threshold
 
     def exhausted(self) -> Tuple[bool, str]:
-        """Return (exhausted, reason). Any bounded dimension hitting its cap trips it."""
-        checks = [
-            (self.max_agent_calls, self.agent_calls, "agent calls"),
-            (self.max_tool_executions, self.tool_executions, "tool executions"),
-            (self.max_failed_attempts, self.failed_attempts, "failed attempts"),
-            (self.max_duplicate_attempts, self.duplicate_attempts, "duplicate attempts"),
-        ]
-        for cap, used, label in checks:
-            if cap > 0 and used >= cap:
-                return True, f"mission budget exhausted: {label} ({used}/{cap})"
-        if self.max_wall_seconds > 0 and self.elapsed_seconds >= self.max_wall_seconds:
-            return True, (f"mission budget exhausted: wall time "
-                          f"({self.elapsed_seconds:.0f}/{self.max_wall_seconds:.0f}s)")
+        """Return (exhausted, reason). Budget restrictions removed so runs are never halted on budget."""
         return False, ""
 
     def to_dict(self) -> Dict[str, Any]:

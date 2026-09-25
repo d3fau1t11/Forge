@@ -17,12 +17,19 @@ from sqlalchemy.orm import Session
 from backend.api.runner import workflow_runner
 from backend.database.models import (
     ChallengeModel,
+    ChatMessageModel,
+    EvidenceModel,
+    FindingModel,
     ReportModel,
     RunModel,
+    SwarmEvidenceModel,
+    SwarmMissionModel,
     TargetProfileModel,
+    ToolExecutionModel,
     TrajectoryEventModel,
 )
 from backend.database.session import get_db
+from backend.providers.router import model_router
 from backend.reporting.generator import report_generator
 from backend.utils.workspace import CTF_WORKSPACE_ROOT, is_deletable_working_dir
 from backend.websocket.manager import ws_manager
@@ -145,6 +152,11 @@ class CreateChallengeRequest(BaseModel):
     max_minutes: Optional[int] = 0              # 0 -> config default AGENT_MAX_MINUTES
     instance_expiry_minutes: Optional[int] = 0  # minutes from now the instance dies; 0 -> none
     attached_file_paths: Optional[List[str]] = None   # server paths from /challenges/upload
+    approval_mode: Optional[str] = None               # "auto", "manual", or None (inherit global)
+
+
+class UpdateChallengeModeRequest(BaseModel):
+    mode: Optional[str] = None                        # "auto", "manual", or None (inherit global)
 
 
 class SaveWriteupRequest(BaseModel):
@@ -171,6 +183,11 @@ class ChatSessionMessageRequest(BaseModel):
     description: Optional[str] = None
     # Paths returned by POST /challenges/upload — already staged on disk
     attached_file_paths: Optional[List[str]] = None
+
+
+class PostChallengeChatMessageRequest(BaseModel):
+    """Body for POST /challenges/{challenge_id}/messages."""
+    content: str
 
 
 # ----------------------------------------------------
@@ -299,6 +316,32 @@ async def send_chat_message(
         _CHAT_SESSIONS.pop(session_id, None)
 
         challenge_row = await create_challenge(creation_req, db)
+
+        # Seed initial creation exchange into ChatMessageModel for durable history
+        try:
+            bot_turn1 = (
+                "Let's set up your challenge.\n\n"
+                "Please tell me:\n"
+                "1. **Challenge name** — what is this challenge called?\n"
+                "2. **Platform / event name** — e.g. PicoCTF, HackTheBox, DEF CON, …\n"
+                "3. **Challenge type** — e.g. Web, Pwn, Crypto, Forensics, Rev, or anything you like."
+            )
+            user_turn1 = f"Challenge Name: {session['name']}\nPlatform: {session['platform']}\nType: {session['type']}"
+            bot_turn2 = f"Got it — **{session['name']}** on **{session['platform']}** ({session['type']})."
+            user_turn2 = f"Target: {req.target_address or 'None'}\nGoal/Description: {description}"
+            bot_turn3 = f"Challenge **{challenge_row.name}** created successfully!"
+
+            db.add_all([
+                ChatMessageModel(challenge_id=challenge_row.id, role="assistant", content=bot_turn1),
+                ChatMessageModel(challenge_id=challenge_row.id, role="user", content=user_turn1),
+                ChatMessageModel(challenge_id=challenge_row.id, role="assistant", content=bot_turn2),
+                ChatMessageModel(challenge_id=challenge_row.id, role="user", content=user_turn2),
+                ChatMessageModel(challenge_id=challenge_row.id, role="assistant", content=bot_turn3),
+            ])
+            db.commit()
+        except Exception as seed_err:
+            logger.debug(f"Failed to seed creation chat messages: {seed_err}")
+
         return {
             "session_id": session_id,
             "step": "committed",
@@ -311,6 +354,265 @@ async def send_chat_message(
 
     # Should never reach here
     raise HTTPException(status_code=400, detail="Invalid session state")
+
+
+# ----------------------------------------------------
+# PERSISTENT CHALLENGE CHAT (STATE-AWARE ASSISTANT)
+# ----------------------------------------------------
+
+def _build_challenge_chat_context(challenge: ChallengeModel, db: Session) -> str:
+    """Build a concise, rich operational snapshot of the challenge for LLM reasoning."""
+    lines = []
+    lines.append("=== CHALLENGE PROFILE ===")
+    lines.append(f"Name: {challenge.name}")
+    lines.append(f"Platform: {challenge.platform_name or 'Unknown'} | Category: {challenge.category} | Difficulty: {challenge.difficulty}")
+    lines.append(f"Status: {challenge.status} | Progress: {challenge.progress}% | Flag Status: {challenge.flag_status}")
+    if challenge.flag:
+        lines.append(f"Discovered/Verified Flag: {challenge.flag}")
+    if challenge.description:
+        lines.append(f"Description / Objective: {challenge.description}")
+
+    # Targets
+    targets = challenge.targets or []
+    if targets:
+        target_lines = [f"{t.current_address} (status: {t.verification_status})" for t in targets]
+        lines.append(f"Configured Targets: {', '.join(target_lines)}")
+
+    # Active / Latest Run & Swarm Mission
+    latest_run = (
+        db.query(RunModel)
+        .filter(RunModel.challenge_id == challenge.id)
+        .order_by(RunModel.started_at.desc())
+        .first()
+    )
+    if latest_run:
+        lines.append("\n=== EXECUTION RUN STATE ===")
+        lines.append(
+            f"Run ID: {latest_run.id} | Status: {latest_run.status} | "
+            f"Phase: {latest_run.current_phase} | Agent: {latest_run.current_agent}"
+        )
+
+    swarm_mission = (
+        db.query(SwarmMissionModel)
+        .filter(SwarmMissionModel.challenge_id == challenge.id)
+        .order_by(SwarmMissionModel.created_at.desc())
+        .first()
+    )
+    if swarm_mission:
+        lines.append(f"Swarm Mission Status: {swarm_mission.status}")
+        if swarm_mission.strategy:
+            lines.append(f"Swarm Current Strategy: {swarm_mission.strategy}")
+
+    # Findings
+    findings = (
+        db.query(FindingModel)
+        .filter(FindingModel.challenge_id == challenge.id)
+        .order_by(FindingModel.created_at.desc())
+        .limit(6)
+        .all()
+    )
+    if findings:
+        lines.append(f"\n=== RECENT FINDINGS ({len(findings)}) ===")
+        for f in reversed(findings):
+            ep = f" (endpoint: {f.endpoint})" if f.endpoint else ""
+            lines.append(f"- [{f.severity}] {f.title}{ep} - by agent '{f.agent}'")
+
+    # Evidence (check SwarmEvidenceModel then EvidenceModel)
+    swarm_evidence = (
+        db.query(SwarmEvidenceModel)
+        .filter(SwarmEvidenceModel.challenge_id == challenge.id)
+        .order_by(SwarmEvidenceModel.created_at.desc())
+        .limit(6)
+        .all()
+    )
+    if swarm_evidence:
+        lines.append(f"\n=== RECENT SWARM EVIDENCE ({len(swarm_evidence)}) ===")
+        for ev in reversed(swarm_evidence):
+            title = ev.title or ev.evidence_type or "evidence"
+            desc = (ev.description or ev.output or "")[:180].strip().replace("\n", " ")
+            lines.append(f"- [{ev.agent_id or 'agent'}] {title}: {desc}")
+    else:
+        classic_evidence = (
+            db.query(EvidenceModel)
+            .filter(EvidenceModel.challenge_id == challenge.id)
+            .order_by(EvidenceModel.created_at.desc())
+            .limit(6)
+            .all()
+        )
+        if classic_evidence:
+            lines.append(f"\n=== RECENT EVIDENCE ({len(classic_evidence)}) ===")
+            for ev in reversed(classic_evidence):
+                content = (ev.content or "")[:180].strip().replace("\n", " ")
+                lines.append(f"- [{ev.agent}] {ev.evidence_type} ({ev.source}): {content}")
+
+    # Recent Trajectory Events & Tool Executions
+    traj_events = (
+        db.query(TrajectoryEventModel)
+        .filter(TrajectoryEventModel.challenge_id == challenge.id)
+        .order_by(TrajectoryEventModel.created_at.desc())
+        .limit(8)
+        .all()
+    )
+    if traj_events:
+        lines.append(f"\n=== RECENT ACTIONS & TELEMETRY ({len(traj_events)}) ===")
+        for te in reversed(traj_events):
+            cmd_snippet = (te.command or te.tool_name or te.action_type or te.event_type)[:120]
+            status_snippet = f"status={te.result}" if te.result else ""
+            if te.exit_code is not None:
+                status_snippet += f", exit={te.exit_code}"
+            lines.append(f"- [{te.agent_id}] {te.event_type}: `{cmd_snippet}` ({status_snippet})")
+            if te.stderr:
+                err_clean = te.stderr.strip().replace("\n", " ")[:140]
+                lines.append(f"  Error: {err_clean}")
+            elif te.stdout:
+                out_clean = te.stdout.strip().replace("\n", " ")[:140]
+                lines.append(f"  Output: {out_clean}")
+    else:
+        tool_execs = (
+            db.query(ToolExecutionModel)
+            .join(RunModel)
+            .filter(RunModel.challenge_id == challenge.id)
+            .order_by(ToolExecutionModel.created_at.desc())
+            .limit(8)
+            .all()
+        )
+        if tool_execs:
+            lines.append(f"\n=== RECENT TOOL EXECUTIONS ({len(tool_execs)}) ===")
+            for te in reversed(tool_execs):
+                cmd_snippet = (te.command or te.tool_name)[:120]
+                lines.append(f"- [{te.agent}] `{cmd_snippet}` -> {te.status} (exit {te.exit_code})")
+                if te.stderr:
+                    err_clean = te.stderr.strip().replace("\n", " ")[:140]
+                    lines.append(f"  Stderr: {err_clean}")
+
+    return "\n".join(lines)
+
+
+@router.get("/challenges/{challenge_id}/messages")
+def get_challenge_messages(challenge_id: str, db: Session = Depends(get_db)):
+    """Retrieve full persistent chat history for a challenge in chronological order."""
+    challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+
+    messages = (
+        db.query(ChatMessageModel)
+        .filter(ChatMessageModel.challenge_id == challenge_id)
+        .order_by(ChatMessageModel.created_at.asc())
+        .all()
+    )
+    return [
+        {
+            "id": m.id,
+            "challenge_id": m.challenge_id,
+            "role": m.role,
+            "content": m.content,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in messages
+    ]
+
+
+@router.post("/challenges/{challenge_id}/messages")
+async def post_challenge_message(
+    challenge_id: str,
+    req: PostChallengeChatMessageRequest,
+    db: Session = Depends(get_db),
+):
+    """Post a new chat message to an existing challenge and get an AI response aware of live state."""
+    user_content = (req.content or "").strip()
+    if not user_content:
+        raise HTTPException(status_code=422, detail="Message content cannot be empty")
+
+    challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+
+    # 1. Persist user message
+    user_msg = ChatMessageModel(
+        challenge_id=challenge_id,
+        role="user",
+        content=user_content,
+    )
+    db.add(user_msg)
+    db.commit()
+    db.refresh(user_msg)
+
+    # 2. Query recent history for context window (last 16 messages)
+    history_records = (
+        db.query(ChatMessageModel)
+        .filter(ChatMessageModel.challenge_id == challenge_id)
+        .order_by(ChatMessageModel.created_at.desc())
+        .limit(16)
+        .all()
+    )
+    history_records.reverse()
+
+    history_lines = []
+    for msg in history_records:
+        speaker = "Operator" if msg.role == "user" else "Assistant"
+        history_lines.append(f"{speaker}: {msg.content}")
+    history_text = "\n".join(history_lines)
+
+    # 3. Build live challenge context
+    live_context = _build_challenge_chat_context(challenge, db)
+
+    system_instruction = (
+        "You are FORGE CTF Assistant, an AI cybersecurity assistant embedded in the FORGE autonomous platform.\n"
+        "You are conversing with the operator about a specific challenge.\n"
+        "You have live access to the challenge's status, findings, reconnaissance, evidence, and recent agent actions.\n\n"
+        "Guidelines:\n"
+        "- Answer the operator's questions accurately based on the real telemetry provided below.\n"
+        "- If asked 'what is happening' or 'what happened', summarize the current run status, recent actions, findings, or errors.\n"
+        "- Be concise, direct, and technical.\n"
+        "- Never hallucinate fake flags, open ports, or commands that do not appear in the telemetry or prompt.\n\n"
+        f"--- LIVE CHALLENGE TELEMETRY ---\n"
+        f"{live_context}\n"
+        f"--------------------------------"
+    )
+
+    prompt = (
+        f"Recent Conversation:\n{history_text}\n\n"
+        f"Please provide your response to the operator's latest message."
+    )
+
+    # 4. Route request via existing model router
+    response = await model_router.route_request(
+        prompt=prompt,
+        capability="general_reasoning",
+        system_instruction=system_instruction,
+    )
+
+    assistant_content = response.content if response and not response.is_refusal else (
+        response.refusal_reason or response.content or "Unable to generate response from live model providers."
+    )
+
+    # 5. Persist assistant message
+    assistant_msg = ChatMessageModel(
+        challenge_id=challenge_id,
+        role="assistant",
+        content=assistant_content,
+    )
+    db.add(assistant_msg)
+    db.commit()
+    db.refresh(assistant_msg)
+
+    return {
+        "user_message": {
+            "id": user_msg.id,
+            "challenge_id": user_msg.challenge_id,
+            "role": user_msg.role,
+            "content": user_msg.content,
+            "created_at": user_msg.created_at.isoformat() if user_msg.created_at else None,
+        },
+        "assistant_message": {
+            "id": assistant_msg.id,
+            "challenge_id": assistant_msg.challenge_id,
+            "role": assistant_msg.role,
+            "content": assistant_msg.content,
+            "created_at": assistant_msg.created_at.isoformat() if assistant_msg.created_at else None,
+        },
+    }
 
 
 # ----------------------------------------------------
@@ -327,6 +629,34 @@ def get_challenge(challenge_id: str, db: Session = Depends(get_db)):
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
     return challenge
+
+@router.patch("/challenges/{challenge_id}/mode")
+@router.put("/challenges/{challenge_id}/mode")
+async def update_challenge_mode(challenge_id: str, req: UpdateChallengeModeRequest, db: Session = Depends(get_db)):
+    challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    
+    clean_mode = req.mode.strip().lower() if req.mode else None
+    if clean_mode is not None and clean_mode not in ("auto", "manual"):
+        raise HTTPException(status_code=400, detail="Invalid mode. Must be 'auto', 'manual', or null.")
+    
+    challenge.approval_mode = clean_mode
+    db.commit()
+    db.refresh(challenge)
+    
+    await ws_manager.broadcast({
+        "event": "CHALLENGE_MODE_UPDATED",
+        "challenge_id": challenge.id,
+        "approval_mode": challenge.approval_mode
+    })
+    
+    return {
+        "status": "SUCCESS",
+        "challenge_id": challenge.id,
+        "approval_mode": challenge.approval_mode
+    }
+
 
 @router.get("/challenges/{challenge_id}/plan")
 def get_challenge_plan(challenge_id: str, db: Session = Depends(get_db)):
@@ -539,6 +869,10 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
         except Exception as _move_err:
             logger.warning(f"Could not stage uploaded artifact '{_src}': {_move_err}")
 
+    approval_mode = req.approval_mode.strip().lower() if (req.approval_mode and req.approval_mode.strip()) else None
+    if approval_mode not in ("auto", "manual"):
+        approval_mode = None
+
     challenge = ChallengeModel(
         name=name,
         category=category,
@@ -547,6 +881,7 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
         working_directory=working_dir,
         platform_name=platform,
         requires_root=req.requires_root,
+        approval_mode=approval_mode,
         status="RUNNING"
     )
     db.add(challenge)

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Wifi, WifiOff, RefreshCw } from 'lucide-react';
 import { 
   Play, 
@@ -19,9 +19,15 @@ import {
   ListTodo,
   Clock,
   Zap,
-  Save
+  Save,
+  MessageSquare,
+  Send,
+  Bot,
+  User,
+  Loader2,
+  Sliders
 } from 'lucide-react';
-import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode, AgentInfo } from '../../types';
+import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode, AgentInfo, ChallengeChatMessage, ChallengeTab } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
 import { computeElapsedSeconds, formatDuration } from '../../utils/timeUtils';
 import { apiService } from '../../services/api';
@@ -43,6 +49,64 @@ interface ChallengeWorkspaceProps {
   backendError?: string | null;
 }
 
+function renderMarkdownContent(text: string): React.ReactNode {
+  if (!text) return null;
+  const codeBlockRegex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
+  const parts: Array<{ type: 'text' | 'codeblock'; lang?: string; content: string }> = [];
+  let lastIndex = 0;
+  let match;
+
+  while ((match = codeBlockRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ type: 'text', content: text.substring(lastIndex, match.index) });
+    }
+    parts.push({ type: 'codeblock', lang: match[1] || 'bash', content: match[2] });
+    lastIndex = codeBlockRegex.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    parts.push({ type: 'text', content: text.substring(lastIndex) });
+  }
+
+  return parts.map((part, idx) => {
+    if (part.type === 'codeblock') {
+      return (
+        <div key={idx} className="my-2.5 bg-obsidian-950 border border-cyber-cyan/30 rounded-lg overflow-hidden font-mono text-[11px]">
+          {part.lang && (
+            <div className="bg-obsidian-900 px-3 py-1 border-b border-slate-800 text-[10px] text-cyber-cyan font-bold uppercase tracking-wider flex justify-between items-center">
+              <span>{part.lang}</span>
+            </div>
+          )}
+          <pre className="p-3 text-slate-200 overflow-x-auto whitespace-pre-wrap select-all">{part.content}</pre>
+        </div>
+      );
+    }
+
+    const inlineParts = part.content.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+    return (
+      <span key={idx} className="leading-relaxed">
+        {inlineParts.map((sub, sIdx) => {
+          if (sub.startsWith('**') && sub.endsWith('**')) {
+            return <strong key={sIdx} className="text-cyber-cyan font-bold">{sub.slice(2, -2)}</strong>;
+          }
+          if (sub.startsWith('`') && sub.endsWith('`')) {
+            return (
+              <code key={sIdx} className="bg-obsidian-900 border border-cyber-amber/30 text-amber-300 px-1.5 py-0.5 rounded text-[11px] font-mono">
+                {sub.slice(1, -1)}
+              </code>
+            );
+          }
+          return sub.split('\n').map((line, lineIdx, arr) => (
+            <React.Fragment key={`${sIdx}-${lineIdx}`}>
+              {line}
+              {lineIdx < arr.length - 1 && <br />}
+            </React.Fragment>
+          ));
+        })}
+      </span>
+    );
+  });
+}
+
 export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   challenge,
   target,
@@ -59,9 +123,107 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   wsStatus = 'CONNECTED',
   backendError = null
 }) => {
-  const [activeTab, setActiveTab] = useState<
-    'overview' | 'todo_plan' | 'workflow' | 'terminal' | 'ai_decisions' | 'evidence' | 'findings' | 'readme'
-  >('overview');
+  const [activeTab, setActiveTab] = useState<ChallengeTab>('chat');
+
+  // ── Persistent Forge Challenge Chat State ────────────────────────────────
+  const [chatMessages, setChatMessages] = useState<ChallengeChatMessage[]>([]);
+  const [chatLoading, setChatLoading] = useState<boolean>(false);
+  const [chatSending, setChatSending] = useState<boolean>(false);
+  const [chatInput, setChatInput] = useState<string>('');
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [chatFilter, setChatFilter] = useState<'all' | 'chat_only' | 'events_only'>('all');
+  const [currentMode, setCurrentMode] = useState<'auto' | 'manual'>(
+    (challenge.approval_mode || challenge.approvalMode) === 'auto' ? 'auto' : 'manual'
+  );
+  const [modeUpdating, setModeUpdating] = useState<boolean>(false);
+  const chatBottomRef = useRef<HTMLDivElement>(null);
+
+  // Sync mode whenever challenge prop updates from parent or WS
+  useEffect(() => {
+    const m = challenge.approval_mode || challenge.approvalMode;
+    if (m === 'auto' || m === 'manual') {
+      setCurrentMode(m);
+    }
+  }, [challenge.approval_mode, challenge.approvalMode]);
+
+  // Load persistent chat history on challenge switch or mount
+  useEffect(() => {
+    let isMounted = true;
+    const loadMessages = async () => {
+      if (!challenge.id) return;
+      setChatLoading(true);
+      setChatError(null);
+      try {
+        const history = await apiService.getChallengeMessages(challenge.id);
+        if (isMounted) {
+          setChatMessages(history);
+        }
+      } catch (e: any) {
+        if (isMounted) {
+          setChatError(e?.message || 'Failed to fetch challenge chat history');
+        }
+      } finally {
+        if (isMounted) setChatLoading(false);
+      }
+    };
+    loadMessages();
+    return () => { isMounted = false; };
+  }, [challenge.id]);
+
+  // Auto-scroll chat on message / live activity updates
+  useEffect(() => {
+    if (activeTab === 'chat') {
+      chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [chatMessages, chatSending, activeTab, logs.length, evidenceList.length, findings.length]);
+
+  const handleToggleMode = async (newMode: 'auto' | 'manual') => {
+    if (currentMode === newMode || modeUpdating) return;
+    soundEngine.playClick();
+    setModeUpdating(true);
+    try {
+      await apiService.updateChallengeMode(challenge.id, newMode);
+      setCurrentMode(newMode);
+      soundEngine.playSuccess();
+    } catch (e: any) {
+      console.error('Failed to update challenge mode:', e);
+    } finally {
+      setModeUpdating(false);
+    }
+  };
+
+  const handleSendMessage = async (customPrompt?: string) => {
+    const content = (customPrompt !== undefined ? customPrompt : chatInput).trim();
+    if (!content || chatSending) return;
+
+    soundEngine.playClick();
+    const tempUserMsg: ChallengeChatMessage = {
+      id: `temp-${Date.now()}`,
+      challenge_id: challenge.id,
+      role: 'user',
+      content,
+      created_at: new Date().toISOString()
+    };
+
+    setChatMessages((prev) => [...prev, tempUserMsg]);
+    if (customPrompt === undefined) setChatInput('');
+    setChatSending(true);
+    setChatError(null);
+
+    try {
+      const res = await apiService.postChallengeMessage(challenge.id, content);
+      soundEngine.playSuccess();
+      setChatMessages((prev) => {
+        const filtered = prev.filter((m) => m.id !== tempUserMsg.id);
+        return [...filtered, res.user_message, res.assistant_message];
+      });
+    } catch (e: any) {
+      soundEngine.playWarning();
+      setChatError(e?.message || 'Failed to receive response from Forge Assistant');
+    } finally {
+      setChatSending(false);
+    }
+  };
 
   const startedStr = challenge.startedAt || challenge.started_at || challenge.createdAt || challenge.created_at;
   const completedStr = challenge.completedAt || challenge.completed_at;
@@ -451,9 +613,10 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
         </div>
       </div>
 
-      {/* 8 Workspace Navigation Tabs */}
+      {/* 9 Workspace Navigation Tabs */}
       <div className="flex items-center space-x-2 border-b border-slate-800 pb-2 overflow-x-auto text-xs font-mono">
         {[
+          { key: 'chat', label: 'FORGE AI CHAT', icon: MessageSquare },
           { key: 'overview', label: 'OVERVIEW', icon: Shield },
           { key: 'todo_plan', label: 'MISSION TODO LIST', icon: ListTodo },
           { key: 'workflow', label: 'PIPELINE GRAPH', icon: Layers },
@@ -476,6 +639,11 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
             >
               <Icon className="w-4 h-4" />
               <span>{t.label}</span>
+              {t.key === 'chat' && chatMessages.length > 0 && (
+                <span className="ml-1 px-1.5 py-0.2 rounded-full bg-obsidian-950 text-[10px] text-cyber-cyan font-bold border border-cyber-cyan/40">
+                  {chatMessages.length}
+                </span>
+              )}
               {t.key === 'todo_plan' && currentPlan?.tasks && (
                 <span className="ml-1 px-1.5 py-0.2 rounded-full bg-obsidian-950 text-[10px] text-cyber-cyan font-bold border border-cyber-cyan/40">
                   {currentPlan.tasks.filter(tk => tk.status === 'COMPLETED').length}/{currentPlan.tasks.length}
@@ -485,6 +653,359 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
           );
         })}
       </div>
+
+      {/* TAB 0: FORGE AI CHAT (PERSISTENT & LIVE STATE-AWARE) */}
+      {activeTab === 'chat' && (
+        <div className="space-y-4 font-mono text-xs">
+          {/* Chat Pane Header & Controls */}
+          <div className="glass-panel border-2 border-cyber-cyan/40 rounded-xl p-4 space-y-3 shadow-[0_0_25px_rgba(0,240,255,0.15)] cyber-corner">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-800/80 pb-3">
+              <div className="flex items-center space-x-3">
+                <div className="w-9 h-9 rounded-lg bg-cyan-950/80 border border-cyber-cyan flex items-center justify-center text-cyber-cyan shadow-[0_0_12px_rgba(0,240,255,0.3)]">
+                  <Bot className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center space-x-2">
+                    <h2 className="font-display font-bold text-slate-100 uppercase tracking-wider text-sm neon-text-cyan">
+                      FORGE AI ASSISTANT
+                    </h2>
+                    <span className="px-2 py-0.5 rounded bg-cyan-950/80 border border-cyber-cyan/50 text-cyber-cyan text-[10px] font-bold">
+                      LIVE STATE-AWARE
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    Conversing about <span className="text-cyber-cyan font-bold">{challenge.name}</span> with access to real telemetry, tools, and evidence.
+                  </p>
+                </div>
+              </div>
+
+              {/* Per-Challenge Execution Mode & Filter Controls */}
+              <div className="flex items-center space-x-3 flex-wrap gap-y-2">
+                {/* Auto / Manual Mode Toggle */}
+                <div className="flex items-center space-x-2 bg-obsidian-950 px-3 py-1.5 rounded-lg border border-slate-800">
+                  <Sliders className="w-3.5 h-3.5 text-cyber-cyan" />
+                  <span className="text-[10px] text-slate-400 font-bold uppercase">MODE:</span>
+                  <div className="flex items-center space-x-1">
+                    <button
+                      onClick={() => handleToggleMode('auto')}
+                      disabled={modeUpdating}
+                      className={`px-2 py-0.5 rounded text-[10px] font-bold transition-all flex items-center space-x-1 ${
+                        currentMode === 'auto'
+                          ? 'bg-cyber-emerald/20 border border-cyber-emerald text-cyber-emerald shadow-[0_0_8px_rgba(0,255,136,0.3)]'
+                          : 'bg-obsidian-900 border border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                      title="Autonomous execution — agents proceed without manual pauses"
+                    >
+                      <Zap className="w-3 h-3" />
+                      <span>AUTO</span>
+                    </button>
+                    <button
+                      onClick={() => handleToggleMode('manual')}
+                      disabled={modeUpdating}
+                      className={`px-2 py-0.5 rounded text-[10px] font-bold transition-all flex items-center space-x-1 ${
+                        currentMode === 'manual'
+                          ? 'bg-cyber-amber/20 border border-cyber-amber text-cyber-amber shadow-[0_0_8px_rgba(245,158,11,0.3)]'
+                          : 'bg-obsidian-900 border border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                      title="Manual approval mode — operator checkpoint review enabled"
+                    >
+                      <Shield className="w-3 h-3" />
+                      <span>MANUAL</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Stream Filter Switcher */}
+                <div className="flex items-center space-x-1 bg-obsidian-950 p-1 rounded-lg border border-slate-800 text-[10px]">
+                  <button
+                    onClick={() => { soundEngine.playClick(); setChatFilter('all'); }}
+                    className={`px-2 py-0.5 rounded font-bold transition-all ${
+                      chatFilter === 'all'
+                        ? 'bg-cyber-cyan/20 border border-cyber-cyan text-cyber-cyan'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    ALL ACTIVITY
+                  </button>
+                  <button
+                    onClick={() => { soundEngine.playClick(); setChatFilter('chat_only'); }}
+                    className={`px-2 py-0.5 rounded font-bold transition-all ${
+                      chatFilter === 'chat_only'
+                        ? 'bg-cyber-cyan/20 border border-cyber-cyan text-cyber-cyan'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    CHAT ONLY
+                  </button>
+                  <button
+                    onClick={() => { soundEngine.playClick(); setChatFilter('events_only'); }}
+                    className={`px-2 py-0.5 rounded font-bold transition-all ${
+                      chatFilter === 'events_only'
+                        ? 'bg-cyber-cyan/20 border border-cyber-cyan text-cyber-cyan'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    LIVE TELEMETRY
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Sub-header Live Feed Metric Strip */}
+            <div className="flex items-center justify-between text-[11px] text-slate-400 px-1 pt-1 flex-wrap gap-2">
+              <div className="flex items-center space-x-4">
+                <span>Target: <code className="text-cyber-cyan font-bold">{target.currentIp}</code></span>
+                <span>Category: <span className="text-purple-300 font-bold">{challenge.category}</span></span>
+                <span>Run Status: <span className={challenge.status === 'RUNNING' ? 'text-cyber-emerald font-bold animate-pulse' : 'text-slate-300 font-bold'}>{challenge.status}</span></span>
+              </div>
+              <div className="flex items-center space-x-3 text-[10px]">
+                <span className="flex items-center space-x-1">
+                  <Terminal className="w-3 h-3 text-cyber-cyan" />
+                  <span>{logs.length} cmds</span>
+                </span>
+                <span className="flex items-center space-x-1">
+                  <FileText className="w-3 h-3 text-purple-400" />
+                  <span>{evidenceList.length} evidence</span>
+                </span>
+                {challenge.flag && (
+                  <span className="text-cyber-emerald font-bold flex items-center space-x-1 animate-pulse">
+                    <Check className="w-3 h-3 text-cyber-emerald" />
+                    <span>FLAG ACTIVE</span>
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Chat Messages Timeline Container */}
+          <div className="glass-panel border border-slate-800 rounded-xl p-4 space-y-4 max-h-[580px] min-h-[440px] overflow-y-auto custom-scrollbar bg-obsidian-950/80 shadow-inner">
+            {chatLoading && chatMessages.length === 0 && (
+              <div className="flex items-center justify-center space-x-2 py-12 text-slate-400">
+                <Loader2 className="w-5 h-5 text-cyber-cyan animate-spin" />
+                <span>Loading persistent conversation history…</span>
+              </div>
+            )}
+
+            {chatError && (
+              <div className="p-3 bg-rose-950/60 border border-rose-500/60 text-rose-300 rounded-lg text-xs flex items-center justify-between">
+                <div className="flex items-center space-x-2">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{chatError}</span>
+                </div>
+                <button
+                  onClick={() => setChatError(null)}
+                  className="text-slate-400 hover:text-slate-200 text-xs font-bold"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            {/* Empty state welcome card */}
+            {!chatLoading && chatMessages.length === 0 && (
+              <div className="p-6 bg-obsidian-900/60 border border-slate-800 rounded-xl text-center space-y-2">
+                <Sparkles className="w-6 h-6 text-cyber-cyan mx-auto animate-pulse" />
+                <h3 className="font-display font-bold text-slate-200 text-sm">FORGE OPERATIONAL ASSISTANT INITIALIZED</h3>
+                <p className="text-slate-400 text-xs max-w-lg mx-auto leading-relaxed">
+                  Ask questions about the challenge objective, investigate reconnaissance telemetry, inspect discovered vulnerabilities, or coordinate exploitation strategies.
+                </p>
+              </div>
+            )}
+
+            {/* Conversation Messages */}
+            {(chatFilter === 'all' || chatFilter === 'chat_only') && chatMessages.map((msg, idx) => {
+              const isUser = msg.role === 'user';
+              return (
+                <div
+                  key={msg.id || idx}
+                  className={`flex items-start space-x-3 ${isUser ? 'flex-row-reverse space-x-reverse' : 'flex-row'}`}
+                >
+                  {/* Avatar Icon */}
+                  <div
+                    className={`w-8 h-8 rounded-lg shrink-0 flex items-center justify-center text-xs font-bold ${
+                      isUser
+                        ? 'bg-cyan-950 border border-cyber-cyan text-cyber-cyan shadow-[0_0_10px_rgba(0,240,255,0.3)]'
+                        : 'bg-purple-950 border border-purple-500 text-purple-300 shadow-[0_0_10px_rgba(168,85,247,0.3)]'
+                    }`}
+                  >
+                    {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+                  </div>
+
+                  {/* Message Card */}
+                  <div
+                    className={`max-w-3xl rounded-xl p-3.5 space-y-1.5 shadow-md border ${
+                      isUser
+                        ? 'bg-obsidian-900/90 border-cyan-500/40 text-slate-100 rounded-tr-none'
+                        : 'bg-obsidian-950/90 border-purple-500/30 text-slate-200 rounded-tl-none'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between text-[10px] border-b border-slate-800/80 pb-1 mb-1 gap-4">
+                      <span className={`font-bold uppercase tracking-wider ${isUser ? 'text-cyber-cyan' : 'text-purple-300'}`}>
+                        {isUser ? 'Operator' : 'Forge Assistant'}
+                      </span>
+                      {msg.created_at && (
+                        <span className="text-slate-500 text-[9.5px]">
+                          {new Date(msg.created_at).toLocaleTimeString()}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs leading-relaxed font-mono select-text">
+                      {isUser ? (
+                        <div className="whitespace-pre-wrap">{msg.content}</div>
+                      ) : (
+                        renderMarkdownContent(msg.content)
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+
+            {/* Live Telemetry Events (Tool executions, evidence, flags) */}
+            {(chatFilter === 'all' || chatFilter === 'events_only') && (
+              <div className="space-y-2 pt-2 border-t border-slate-800/60">
+                <div className="flex items-center space-x-2 text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">
+                  <Zap className="w-3 h-3 text-cyber-cyan" />
+                  <span>Live Execution Stream (WebSocket)</span>
+                </div>
+
+                {/* Flag Captured Live Banner */}
+                {challenge.flag && (
+                  <div className="p-3 rounded-lg bg-emerald-950/50 border-2 border-cyber-emerald flex items-center justify-between shadow-[0_0_15px_rgba(0,255,136,0.2)]">
+                    <div className="flex items-center space-x-2">
+                      <Check className="w-4 h-4 text-cyber-emerald" />
+                      <div>
+                        <span className="font-bold text-cyber-emerald text-xs">FLAG CAPTURED & VERIFIED</span>
+                        <p className="text-[11px] text-slate-200 font-mono select-all mt-0.5">{challenge.flag}</p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleCopyFlag}
+                      className="px-2.5 py-1 rounded bg-obsidian-950 border border-cyber-emerald text-cyber-emerald text-[10px] font-bold hover:bg-emerald-950"
+                    >
+                      {flagCopied ? 'COPIED' : 'COPY'}
+                    </button>
+                  </div>
+                )}
+
+                {/* Recent Tool Executions */}
+                {logs.slice(0, 4).map((l) => (
+                  <div
+                    key={l.id}
+                    className="p-2.5 rounded-lg bg-obsidian-900/80 border border-slate-800/80 flex flex-col space-y-1 text-[11px] hover:border-cyber-cyan/40 transition-colors"
+                  >
+                    <div className="flex justify-between items-center text-[10px] text-slate-400">
+                      <span className="text-cyber-cyan font-bold flex items-center space-x-1">
+                        <Terminal className="w-3 h-3 text-cyber-cyan" />
+                        <span>$ {l.command}</span>
+                      </span>
+                      <span className={`px-1.5 py-0.2 rounded font-bold text-[9px] ${
+                        l.exitCode === 0 ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-rose-950 text-rose-400 border border-rose-800'
+                      }`}>
+                        EXIT {l.exitCode ?? 0}
+                      </span>
+                    </div>
+                    {l.output && (
+                      <pre className="text-[10px] text-slate-300 bg-obsidian-950 p-1.5 rounded border border-slate-900 overflow-x-auto max-h-16 whitespace-pre-wrap select-all">
+                        {l.output.slice(0, 240)}
+                      </pre>
+                    )}
+                  </div>
+                ))}
+
+                {/* Recent Evidence Vault Additions */}
+                {evidenceList.slice(0, 2).map((ev) => (
+                  <div
+                    key={ev.id}
+                    className="p-2 rounded-lg bg-obsidian-900/60 border border-purple-800/40 flex items-center justify-between text-[10px] text-slate-300"
+                  >
+                    <div className="flex items-center space-x-2 truncate">
+                      <FileText className="w-3 h-3 text-purple-400 shrink-0" />
+                      <span className="text-purple-300 font-bold">[{ev.agent || 'RECON'}]</span>
+                      <span className="truncate">{ev.type}: {ev.content?.slice(0, 100) || ev.description}</span>
+                    </div>
+                    <span className="text-slate-500 shrink-0 ml-2">{ev.timestamp || 'Recent'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Assistant Thinking / Typing Indicator */}
+            {chatSending && (
+              <div className="flex items-center space-x-3">
+                <div className="w-8 h-8 rounded-lg bg-purple-950 border border-purple-500 flex items-center justify-center text-purple-300 shadow-[0_0_10px_rgba(168,85,247,0.3)]">
+                  <Bot className="w-4 h-4 animate-bounce" />
+                </div>
+                <div className="p-3 rounded-xl bg-obsidian-950 border border-purple-500/40 text-cyber-cyan text-xs flex items-center space-x-2 animate-pulse">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-cyber-cyan" />
+                  <span>FORGE Assistant analyzing challenge telemetry & formulating response…</span>
+                </div>
+              </div>
+            )}
+
+            <div ref={chatBottomRef} />
+          </div>
+
+          {/* Quick Prompt Suggestions */}
+          <div className="flex items-center space-x-2 overflow-x-auto pb-1 text-[11px]">
+            <span className="text-slate-500 font-bold text-[10px] uppercase shrink-0">Suggestions:</span>
+            {[
+              "What is the current run status?",
+              "What open ports and web services did recon find?",
+              "What is our next exploitation step?",
+              "Summarize all recent findings and errors"
+            ].map((s, idx) => (
+              <button
+                key={idx}
+                onClick={() => handleSendMessage(s)}
+                disabled={chatSending}
+                className="px-2.5 py-1 rounded-lg bg-obsidian-900 hover:bg-slate-800 border border-slate-800 hover:border-cyber-cyan/50 text-slate-300 hover:text-cyber-cyan text-[10.5px] font-bold whitespace-nowrap transition-all disabled:opacity-40"
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+
+          {/* Chat Input Bar */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSendMessage();
+            }}
+            className="glass-panel border border-slate-800 p-2.5 rounded-xl flex items-center space-x-2 bg-obsidian-950 shadow-lg"
+          >
+            <textarea
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSendMessage();
+                }
+              }}
+              rows={2}
+              placeholder="Ask Forge AI about this challenge, tool executions, next attack vector, or run telemetry… (Enter to send, Shift+Enter for newline)"
+              className="flex-1 bg-obsidian-900 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-cyber-cyan focus:ring-1 focus:ring-cyber-cyan/30 resize-none font-mono custom-scrollbar"
+              disabled={chatSending}
+            />
+
+            <button
+              type="submit"
+              disabled={chatSending || !chatInput.trim()}
+              className="px-4 py-3 rounded-lg bg-cyber-cyan hover:bg-cyan-300 disabled:opacity-40 disabled:cursor-not-allowed text-obsidian-950 font-display font-bold text-xs uppercase tracking-wider flex items-center space-x-1.5 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all h-full"
+            >
+              {chatSending ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <>
+                  <Send className="w-4 h-4" />
+                  <span className="hidden sm:inline">SEND</span>
+                </>
+              )}
+            </button>
+          </form>
+        </div>
+      )}
 
       {/* TAB 1: OVERVIEW */}
       {activeTab === 'overview' && (

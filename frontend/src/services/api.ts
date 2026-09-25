@@ -1,4 +1,4 @@
-// API Service Client connecting FORGE Frontend to FastAPI REST Endpoints & WebSockets
+import { ChallengeChatMessage } from '../types';
 
 // Operator API key for the backend's X-Forge-Key gate. Empty in local dev, where the
 // backend runs with FORGE_API_KEY unset and accepts unauthenticated calls.
@@ -197,6 +197,53 @@ export class ApiService {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return await res.json();
+  }
+
+  // ------------------------------------------------------------------
+  // PERSISTENT CHALLENGE CHAT & OPERATIONAL MODE
+  // ------------------------------------------------------------------
+
+  public async getChallengeMessages(challengeId: string): Promise<ChallengeChatMessage[]> {
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/messages`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      console.warn(`Failed to fetch chat messages for challenge ${challengeId}:`, e);
+      return [];
+    }
+  }
+
+  public async postChallengeMessage(
+    challengeId: string,
+    content: string
+  ): Promise<{ user_message: ChallengeChatMessage; assistant_message: ChallengeChatMessage }> {
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return await res.json();
+  }
+
+  public async updateChallengeMode(
+    challengeId: string,
+    mode: 'auto' | 'manual' | null
+  ): Promise<{ status: string; challenge_id: string; mode: string | null }> {
+    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/mode`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode })
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));

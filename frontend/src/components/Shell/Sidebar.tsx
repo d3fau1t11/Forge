@@ -18,8 +18,7 @@ import {
   Volume2,
   VolumeX,
   PanelLeftClose,
-  PanelLeftOpen,
-  MessageCircle
+  PanelLeftOpen
 } from 'lucide-react';
 import { NavTab } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
@@ -156,18 +155,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
               >
                 <Shield className="w-4 h-4 shrink-0" />
                 {!isCollapsed && <span>Challenges</span>}
-              </button>
-              <button
-                onClick={() => handleNav('new_challenge_chat')}
-                title="New Challenge (Chat)"
-                className={`w-full flex items-center ${isCollapsed ? 'justify-center' : 'space-x-2.5 px-3'} py-2 rounded text-xs transition-all ${
-                  activeTab === 'new_challenge_chat' && !activeChallengeId
-                    ? 'bg-cyber-violet/15 text-cyber-violet border border-cyber-violet/60 shadow-[0_0_15px_rgba(139,92,246,0.2)] font-bold'
-                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent'
-                }`}
-              >
-                <MessageCircle className="w-4 h-4 shrink-0" />
-                {!isCollapsed && <span>New Challenge</span>}
               </button>
               <button
                 onClick={() => handleNav('targets')}

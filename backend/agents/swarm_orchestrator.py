@@ -539,22 +539,12 @@ class SwarmOrchestrator:
                         board.stall_reason = "Platform instance expiry reached"
                     break
 
-            # Budget gate — N iterations OR M working-minutes, whichever first. Working-minutes
-            # exclude checkpoint-pause idle time (see agent_paused_seconds / #3).
+            # Telemetry tracking for iterations and working minutes (restrictions removed)
             elapsed_min = _effective_elapsed_minutes(
                 board.agent_started_ts[agent_id], time.time(),
                 board.agent_paused_seconds.get(agent_id, 0.0),
             )
             iters = board.agent_iterations.get(agent_id, 0)
-            if iters >= board.max_iterations or elapsed_min >= board.max_minutes:
-                reason = (f"BUDGET_EXHAUSTED (iterations={iters}/{board.max_iterations}, "
-                          f"minutes={elapsed_min:.1f}/{board.max_minutes})")
-                board.record_agent_step(agent_id, note=reason)
-                _append_to_challenge_log(board.challenge_id, agent_id, reason)
-                await board.update_worker_state(agent_id, status="DONE", current_task=reason)
-                if not board.stall_reason:
-                    board.stall_reason = "Agents exhausted their iteration/time budget without a verified flag"
-                break
 
             try:
                 ctx = self._build_agent_context(board, workdir, agent_id)

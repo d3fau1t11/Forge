@@ -37,7 +37,6 @@ import { SystemView } from './components/Pages/SystemView';
 import { ChallengeWorkspace } from './components/Pages/ChallengeWorkspace';
 import { KnowledgeCoverage } from './components/Pages/KnowledgeCoverage';
 import { ExperienceMemory } from './components/Pages/ExperienceMemory';
-import { NewChallengeChat } from './components/Pages/NewChallengeChat';
 import { apiService, apiFetch } from './services/api';
 import { AlertTriangle, X } from 'lucide-react';
 import { soundEngine } from './utils/soundEngine';
@@ -610,6 +609,19 @@ export default function App() {
               setTimeout(() => setFallbackNotice(null), 8000);
             } else if (data.event === 'KNOWLEDGE_UPDATED' || data.event === 'KNOWLEDGE_BULK_INGESTED') {
               setKnowledgeRefreshTrigger((prev) => prev + 1);
+            } else if (data.event === 'CHALLENGE_MODE_UPDATED') {
+              setChallenges((prev) =>
+                prev.map((c) =>
+                  c.id === data.challenge_id
+                    ? { ...c, approval_mode: data.mode, approvalMode: data.mode }
+                    : c
+                )
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id
+                  ? { ...prev, approval_mode: data.mode, approvalMode: data.mode }
+                  : prev
+              );
             }
           } catch (err) {
             console.error('WS Parse Error', err);
@@ -1156,21 +1168,13 @@ export default function App() {
                 <Challenges
                   challenges={challenges}
                   onSelectChallenge={handleOpenChallengeWorkspace}
-                  onCreateChallenge={handleCreateChallenge}
                   onToggleStatus={handleToggleChallengeStatus}
                   onDeleteChallenge={handleDeleteChallenge}
                   onDeleteAllChallenges={handleDeleteAllChallenges}
-                  onNavigateTab={(tab) => setActiveTab(tab)}
+                  onRefreshBackendData={fetchBackendData}
                 />
               )}
 
-              {activeTab === 'new_challenge_chat' && (
-                <NewChallengeChat
-                  onOpenWorkspace={handleOpenChallengeWorkspace}
-                  onRefreshBackendData={fetchBackendData}
-                  setActiveTab={setActiveTab}
-                />
-              )}
 
               {activeTab === 'targets' && (
                 <Targets

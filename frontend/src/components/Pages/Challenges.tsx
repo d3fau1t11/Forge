@@ -1,161 +1,67 @@
-import React, { useState } from 'react';
-import { 
-  Shield, 
-  Plus, 
-  Play, 
-  Pause, 
-  CheckCircle2, 
+﻿import React, { useState } from 'react';
+import {
+  Shield,
+  Plus,
+  Play,
+  Pause,
+  CheckCircle2,
   Target as TargetIcon,
   Search,
   ChevronRight,
   Filter,
   Folder,
   Trash2,
-  MessageSquare
+  X,
 } from 'lucide-react';
-import { Challenge, NavTab } from '../../types';
+import { Challenge } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
-import { DirectoryBrowserModal } from './DirectoryBrowserModal';
-import { apiService } from '../../services/api';
+import { NewChallengeChat } from './NewChallengeChat';
 
 interface ChallengesProps {
   challenges: Challenge[];
   onSelectChallenge: (challenge: Challenge) => void;
-  onCreateChallenge: (newCh: { name: string; category: any; difficulty: any; target: string; description: string; workingDirectory?: string; platformName?: string; requiresRoot?: boolean; flagPattern?: string; maxIterations?: number; maxMinutes?: number; instanceExpiryMinutes?: number; attachedFilePaths?: string[] }) => void;
   onToggleStatus: (id: string) => void;
   onDeleteChallenge?: (id: string) => void;
   onDeleteAllChallenges?: () => void;
-  onNavigateTab?: (tab: NavTab) => void;
+  onRefreshBackendData?: () => Promise<void> | void;
 }
 
 export const Challenges: React.FC<ChallengesProps> = ({
   challenges,
   onSelectChallenge,
-  onCreateChallenge,
   onToggleStatus,
   onDeleteChallenge,
   onDeleteAllChallenges,
-  onNavigateTab
+  onRefreshBackendData,
 }) => {
-  const [showModal, setShowModal] = useState(false);
-  const [showDirBrowser, setShowDirBrowser] = useState(false);
+  const [showChatModal, setShowChatModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('ALL');
 
-  // Form states
-  const [name, setName] = useState('');
-  const [platformName, setPlatformName] = useState('PicoCTF');
-  const [category, setCategory] = useState<string>('WEB');
-  const [difficulty, setDifficulty] = useState<'EASY' | 'MEDIUM' | 'HARD' | 'INSANE'>('MEDIUM');
-  const [description, setDescription] = useState('');
-  const [customTargetOverride, setCustomTargetOverride] = useState('');
-  const [showTargetOverride, setShowTargetOverride] = useState(false);
-  const [workingDirectory, setWorkingDirectory] = useState('');
-  const [requiresRoot, setRequiresRoot] = useState(false);
-  // Flexible-agent engine config + artifact upload.
-  const [flagPattern, setFlagPattern] = useState('');
-  const [maxIterations, setMaxIterations] = useState<number>(40);
-  const [maxMinutes, setMaxMinutes] = useState<number>(30);
-  const [instanceExpiryMinutes, setInstanceExpiryMinutes] = useState<number>(0);
-  const [uploadedFiles, setUploadedFiles] = useState<{ name: string; path: string; size: number }[]>([]);
-  const [uploading, setUploading] = useState(false);
-
-  const handleFileUpload = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
-    setUploading(true);
-    try {
-      for (let i = 0; i < files.length; i++) {
-        const uploaded = await apiService.uploadArtifact(files[i]);
-        setUploadedFiles((prev) => [...prev, { name: uploaded.filename, path: uploaded.path, size: uploaded.size }]);
-      }
-      soundEngine.playSuccess();
-    } catch (e) {
-      console.warn('Artifact upload failed:', e);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const extractFolderName = (pathStr: string): string => {
-    if (!pathStr) return '';
-    const parts = pathStr.split(/[/\\]/).filter(Boolean);
-    return parts.length > 0 ? parts[parts.length - 1] : pathStr;
-  };
-
-  const extractTargetFromText = (text: string): string => {
-    if (!text) return '';
-    // Match URL
-    const urlMatch = text.match(/https?:\/\/[^\s]+/i);
-    if (urlMatch) return urlMatch[0].replace(/[.,;)"'>]+$/, '');
-    // Match nc <host> <port>
-    const ncMatch = text.match(/nc\s+([a-zA-Z0-9.\-_]+)\s+(\d+)/i);
-    if (ncMatch) return `${ncMatch[1]}:${ncMatch[2]}`;
-    // Match IP:port or IP
-    const ipMatch = text.match(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/);
-    if (ipMatch) return ipMatch[0];
-    // Match hostname:port
-    const hostPortMatch = text.match(/\b([a-zA-Z0-9-]+\.[a-zA-Z0-9.\-]+:\d+)\b/);
-    if (hostPortMatch) return hostPortMatch[0];
-    // Match file path
-    const fileMatch = text.match(/(?:[a-zA-Z]:[\\/]|(?:\/|~\/|\.\/))[^\s]+?\.(?:pcap|zip|bin|elf|tar|gz|py|c|exe|txt|raw)/i);
-    if (fileMatch) return fileMatch[0];
-    return '';
-  };
-
-  const detectedTarget = extractTargetFromText(description);
-  const effectiveTarget = customTargetOverride.trim() || detectedTarget || (name.trim() ? `${name.trim().toLowerCase().replace(/\s+/g, '_')}.ctf` : '127.0.0.1');
-
-  const handleWorkingDirectoryChange = (val: string) => {
-    setWorkingDirectory(val);
-    const derived = extractFolderName(val);
-    if (derived) {
-      setName(derived);
-    }
-  };
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const folderName = extractFolderName(workingDirectory);
-    const finalName = name.trim() || folderName || 'NEW_CHALLENGE';
-    const targetToUse = effectiveTarget;
-    soundEngine.playSuccess();
-    onCreateChallenge({
-      name: finalName,
-      category,
-      difficulty,
-      target: targetToUse,
-      description,
-      workingDirectory,
-      platformName: platformName.trim() || 'PicoCTF',
-      requiresRoot,
-      flagPattern: flagPattern.trim(),
-      maxIterations,
-      maxMinutes,
-      instanceExpiryMinutes,
-      attachedFilePaths: uploadedFiles.map((f) => f.path)
-    });
-    setName('');
-    setPlatformName('PicoCTF');
-    setDescription('');
-    setCustomTargetOverride('');
-    setShowTargetOverride(false);
-    setWorkingDirectory('');
-    setRequiresRoot(false);
-    setFlagPattern('');
-    setMaxIterations(40);
-    setMaxMinutes(30);
-    setInstanceExpiryMinutes(0);
-    setUploadedFiles([]);
-    setShowModal(false);
-  };
-
   const filteredChallenges = challenges.filter((c) => {
-    const matchesSearch = c.name.toLowerCase().includes(searchTerm.toLowerCase()) || c.target.includes(searchTerm);
+    const matchesSearch =
+      c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      c.target.includes(searchTerm);
     const matchesCat = categoryFilter === 'ALL' || c.category === categoryFilter;
     return matchesSearch && matchesCat;
   });
 
   const categories = ['ALL', 'WEB', 'PWN', 'REV', 'CRYPTO', 'FORENSICS', 'RECON'];
+
+  const handleChatCreated = (challenge: Challenge) => {
+    setShowChatModal(false);
+    onSelectChallenge(challenge);
+  };
+
+  const handleOpenModal = () => {
+    soundEngine.playClick();
+    setShowChatModal(true);
+  };
+
+  const handleCloseModal = () => {
+    soundEngine.playClick();
+    setShowChatModal(false);
+  };
 
   return (
     <div className="space-y-6 font-mono text-slate-100 pb-10">
@@ -197,7 +103,7 @@ export const Challenges: React.FC<ChallengesProps> = ({
           {challenges.length > 0 && onDeleteAllChallenges && (
             <button
               onClick={() => {
-                if (window.confirm("Are you sure you want to clear ALL challenges from database?")) {
+                if (window.confirm('Are you sure you want to clear ALL challenges from database?')) {
                   soundEngine.playAlarm();
                   onDeleteAllChallenges();
                 }
@@ -209,22 +115,9 @@ export const Challenges: React.FC<ChallengesProps> = ({
             </button>
           )}
 
-          {onNavigateTab && (
-            <button
-              onClick={() => {
-                soundEngine.playClick();
-                onNavigateTab('new_challenge_chat');
-              }}
-              className="px-4 py-2.5 rounded-lg bg-obsidian-900 hover:bg-cyan-950/70 border border-cyber-cyan/50 text-cyber-cyan hover:text-cyan-300 font-display font-bold text-xs flex items-center justify-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.2)] hover:scale-105 transition-all uppercase tracking-wider shrink-0"
-              title="Launch chat-driven challenge setup"
-            >
-              <MessageSquare className="w-4 h-4 text-cyber-cyan" />
-              <span>[ CHAT SETUP ]</span>
-            </button>
-          )}
-
           <button
-            onClick={() => { soundEngine.playClick(); setShowModal(true); }}
+            id="new-challenge-btn"
+            onClick={handleOpenModal}
             className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center justify-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] hover:scale-105 transition-all uppercase tracking-wider shrink-0"
           >
             <Plus className="w-4 h-4" />
@@ -239,27 +132,20 @@ export const Challenges: React.FC<ChallengesProps> = ({
           <div className="col-span-full glass-panel border border-slate-800 rounded-xl p-10 flex flex-col items-center justify-center text-center space-y-4 text-xs font-mono">
             <Shield className="w-12 h-12 text-cyber-cyan/40 animate-pulse" />
             <div className="space-y-1">
-              <h3 className="text-sm font-display font-bold text-slate-200 uppercase tracking-wider">NO ACTIVE CTF CHALLENGES</h3>
-              <p className="text-slate-400 max-w-md">No CTF challenges found in current database scope. Click below to initialize a real CTF target.</p>
+              <h3 className="text-sm font-display font-bold text-slate-200 uppercase tracking-wider">
+                NO ACTIVE CTF CHALLENGES
+              </h3>
+              <p className="text-slate-400 max-w-md">
+                No CTF challenges found in current database scope. Click below to initialize a real CTF target.
+              </p>
             </div>
-            <div className="flex items-center space-x-3 pt-2">
-              {onNavigateTab && (
-                <button
-                  onClick={() => { soundEngine.playClick(); onNavigateTab('new_challenge_chat'); }}
-                  className="px-5 py-2.5 rounded-lg bg-obsidian-900 hover:bg-cyan-950/70 border border-cyber-cyan/60 text-cyber-cyan font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.25)] transition-all uppercase tracking-wider"
-                >
-                  <MessageSquare className="w-4 h-4 text-cyber-cyan" />
-                  <span>START WITH CHAT</span>
-                </button>
-              )}
-              <button
-                onClick={() => { soundEngine.playClick(); setShowModal(true); }}
-                className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] transition-all uppercase tracking-wider"
-              >
-                <Plus className="w-4 h-4" />
-                <span>FORM SETUP</span>
-              </button>
-            </div>
+            <button
+              onClick={handleOpenModal}
+              className="mt-2 px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] transition-all uppercase tracking-wider hover:scale-105"
+            >
+              <Plus className="w-4 h-4" />
+              <span>NEW CHALLENGE</span>
+            </button>
           </div>
         ) : (
           filteredChallenges.map((ch) => (
@@ -317,8 +203,13 @@ export const Challenges: React.FC<ChallengesProps> = ({
                       <Folder className="w-3.5 h-3.5 text-cyber-cyan" />
                       <span>Workspace Dir:</span>
                     </span>
-                    <span className="font-bold text-slate-300 truncate max-w-[160px]" title={ch.workingDirectory || 'Default Workspace'}>
-                      {ch.workingDirectory ? ch.workingDirectory.split(/[/\\]/).pop() || ch.workingDirectory : 'Auto-created'}
+                    <span
+                      className="font-bold text-slate-300 truncate max-w-[160px]"
+                      title={ch.workingDirectory || 'Default Workspace'}
+                    >
+                      {ch.workingDirectory
+                        ? ch.workingDirectory.split(/[/\\]/).pop() || ch.workingDirectory
+                        : 'Auto-created'}
                     </span>
                   </div>
 
@@ -345,7 +236,7 @@ export const Challenges: React.FC<ChallengesProps> = ({
                     <div
                       className="h-full bg-cyber-cyan transition-all duration-500 shadow-[0_0_10px_#00f0ff]"
                       style={{ width: `${ch.progress}%` }}
-                    ></div>
+                    />
                   </div>
                 </div>
               </div>
@@ -403,277 +294,31 @@ export const Challenges: React.FC<ChallengesProps> = ({
         )}
       </div>
 
-      {/* New Challenge Modal Overlay */}
-      {showModal && (
+      {/* â”€â”€ New Challenge Chat Modal Overlay â”€â”€ */}
+      {showChatModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-fadeIn">
-          <div className="w-full max-w-xl max-h-[90vh] flex flex-col bg-obsidian-950 border-2 border-cyber-cyan/60 rounded-xl shadow-[0_0_60px_rgba(0,240,255,0.3)] cyber-corner overflow-hidden my-auto">
-            {/* Modal Header */}
-            <div className="p-5 border-b border-slate-800 flex items-center justify-between shrink-0 bg-obsidian-950">
-              <h2 className="text-base font-display font-bold tracking-wider text-slate-100 flex items-center space-x-2 neon-text-cyan">
-                <Shield className="w-5 h-5 text-cyber-cyan" />
-                <span>INITIALIZE NEW CTF OPERATION</span>
-              </h2>
+          <div className="w-full max-w-5xl max-h-[92vh] flex flex-col bg-obsidian-950 border-2 border-cyber-cyan/40 rounded-2xl shadow-[0_0_80px_rgba(0,240,255,0.2)] overflow-hidden">
+            {/* Thin close-button strip â€” chat content owns the real header */}
+            <div className="flex items-center justify-end px-4 pt-3 pb-1 shrink-0">
+              <button
+                onClick={handleCloseModal}
+                className="p-2 rounded-lg border border-slate-800 hover:border-cyber-rose/60 bg-obsidian-900 text-slate-400 hover:text-cyber-rose transition-colors"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
 
-            {/* Scrollable Form Body */}
-            <form onSubmit={handleSubmit} className="flex flex-col flex-1 min-h-0 overflow-hidden">
-              <div className="p-5 space-y-4 text-xs overflow-y-auto flex-1 custom-scrollbar">
-                {/* Mandatory System CTF Directory Path Preview */}
-                <div className="p-3.5 rounded-lg bg-obsidian-900 border border-cyber-cyan/40 space-y-1.5">
-                  <div className="flex items-center justify-between text-[11px] font-bold text-cyber-cyan uppercase">
-                    <span className="flex items-center space-x-1.5">
-                      <Folder className="w-3.5 h-3.5 text-cyber-cyan" />
-                      <span>MANDATORY CTF WORKSPACE DIRECTORY</span>
-                    </span>
-                    <span className="text-[10px] text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-800 font-mono">
-                      AUTO-ENFORCED
-                    </span>
-                  </div>
-                  <div className="font-mono text-[11px] text-slate-200 bg-obsidian-950 p-2 rounded border border-slate-800 break-all select-all font-bold">
-                    ~/Documents/CTF/
-                    <span className="text-cyber-cyan">{platformName.trim() || 'PicoCTF'}</span>/
-                    <span className="text-amber-400">{category.trim().toUpperCase() || 'WEB'}</span>/
-                    <span className="text-rose-400">{difficulty}</span>/
-                    <span className="text-emerald-400">{name.trim() || 'Challenge_Target'}</span>
-                  </div>
-                  <p className="text-[10px] text-slate-400">
-                    System directory access locked. Workspace is automatically initialized under system Documents/CTF structured hierarchy.
-                  </p>
-                </div>
-
-                <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
-                    <span>Challenge Name</span>
-                    <span className="text-[10px] text-cyber-cyan font-normal">(e.g. Dolphin Cove, Web CTF 1)</span>
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="Enter Challenge Name..."
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono font-bold"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-slate-400 uppercase mb-1 font-bold flex items-center justify-between">
-                    <span>Platform / Competition Name</span>
-                    <span className="text-[10px] text-cyber-cyan lowercase font-normal">(e.g. PicoCTF, HackTheBox)</span>
-                  </label>
-                  <input
-                    type="text"
-                    list="platform-suggestions"
-                    placeholder="e.g. PicoCTF, HackTheBox, TryHackMe, DEF CON"
-                    value={platformName}
-                    onChange={(e) => setPlatformName(e.target.value)}
-                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                  />
-                  <datalist id="platform-suggestions">
-                    <option value="PicoCTF" />
-                    <option value="HackTheBox" />
-                    <option value="TryHackMe" />
-                    <option value="DEF CON CTF" />
-                    <option value="CyberSpace CTF" />
-                  </datalist>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-slate-400 uppercase mb-1 font-bold">Category (Typeable)</label>
-                    <input
-                      type="text"
-                      list="category-suggestions"
-                      value={category}
-                      onChange={(e) => setCategory(e.target.value)}
-                      placeholder="e.g. WEB, PWN, OSINT, CLOUD..."
-                      className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono uppercase"
-                    />
-                    <datalist id="category-suggestions">
-                      <option value="WEB" />
-                      <option value="PWN" />
-                      <option value="REV" />
-                      <option value="CRYPTO" />
-                      <option value="FORENSICS" />
-                      <option value="RECON" />
-                      <option value="OSINT" />
-                      <option value="MISC" />
-                      <option value="CLOUD" />
-                      <option value="BLOCKCHAIN" />
-                    </datalist>
-                  </div>
-
-                  <div>
-                    <label className="block text-slate-400 uppercase mb-1 font-bold">Difficulty</label>
-                    <select
-                      value={difficulty}
-                      onChange={(e) => setDifficulty(e.target.value as any)}
-                      className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono"
-                    >
-                      <option value="EASY">EASY</option>
-                      <option value="MEDIUM">MEDIUM</option>
-                      <option value="HARD">HARD</option>
-                      <option value="INSANE">INSANE</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="text-slate-400 uppercase font-bold flex items-center space-x-1.5">
-                      <span>Challenge Brief, Targets & Files</span>
-                      <span className="text-[10px] text-cyber-cyan font-normal">(URLs, IPs, netcat ports, files, hints)</span>
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => setShowTargetOverride(!showTargetOverride)}
-                      className="text-[10px] text-cyber-cyan hover:underline"
-                    >
-                      {showTargetOverride ? 'Auto Target Mode' : 'Custom Target Override'}
-                    </button>
-                  </div>
-                  <textarea
-                    rows={4}
-                    required
-                    placeholder={`Paste the entire challenge brief or target details here:\n- Description / Story / Hints\n- Target URL (e.g. http://instance.picoctf.net:12345/ or nc host 1337)\n- Local or downloaded files (e.g. /home/user/downloads/chall.bin)`}
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    className="w-full bg-obsidian-900 border border-slate-800 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono text-xs leading-relaxed"
-                  ></textarea>
-
-                  {/* Auto-detected target display badge */}
-                  <div className="mt-2 flex items-center justify-between bg-obsidian-950 p-2.5 rounded border border-slate-800 text-[11px]">
-                    <span className="text-slate-400 flex items-center space-x-1.5">
-                      <TargetIcon className="w-3.5 h-3.5 text-cyber-cyan" />
-                      <span>RESOLVED TARGET SCOPE:</span>
-                    </span>
-                    <span className="font-bold font-mono text-cyber-cyan truncate max-w-[280px]">
-                      {effectiveTarget}
-                    </span>
-                  </div>
-
-                  {/* Optional Custom Target Override */}
-                  {showTargetOverride && (
-                    <div className="mt-2 p-2.5 rounded bg-obsidian-900 border border-cyber-cyan/30 space-y-1">
-                      <label className="block text-slate-400 text-[10px] uppercase font-bold">Manual Target Override (Optional)</label>
-                      <input
-                        type="text"
-                        placeholder="e.g. http://10.10.14.23:8000"
-                        value={customTargetOverride}
-                        onChange={(e) => setCustomTargetOverride(e.target.value)}
-                        className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan"
-                      />
-                    </div>
-                  )}
-
-                  {/* Agent Budget + Flag Validation (flexible-agent engine) */}
-                  <div className="mt-3 p-3 rounded-lg bg-obsidian-900 border border-slate-800 space-y-3">
-                    <div className="text-[11px] font-bold text-cyber-cyan uppercase">Agent Budget & Flag Validation</div>
-                    <div>
-                      <label className="block text-slate-400 text-[10px] uppercase font-bold mb-1">Expected Flag Format (validation filter only — never a construction target)</label>
-                      <input
-                        type="text"
-                        value={flagPattern}
-                        onChange={(e) => setFlagPattern(e.target.value)}
-                        placeholder="picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}"
-                        className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan"
-                      />
-                    </div>
-                    <div className="grid grid-cols-3 gap-3">
-                      <div>
-                        <label className="block text-slate-400 text-[10px] uppercase font-bold mb-1">Max Iterations</label>
-                        <input type="number" min={1} value={maxIterations} onChange={(e) => setMaxIterations(parseInt(e.target.value) || 0)}
-                          className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan" />
-                      </div>
-                      <div>
-                        <label className="block text-slate-400 text-[10px] uppercase font-bold mb-1">Max Minutes</label>
-                        <input type="number" min={1} value={maxMinutes} onChange={(e) => setMaxMinutes(parseInt(e.target.value) || 0)}
-                          className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan" />
-                      </div>
-                      <div>
-                        <label className="block text-slate-400 text-[10px] uppercase font-bold mb-1">Instance Expiry (min)</label>
-                        <input type="number" min={0} value={instanceExpiryMinutes} onChange={(e) => setInstanceExpiryMinutes(parseInt(e.target.value) || 0)}
-                          className="w-full bg-obsidian-950 border border-slate-800 rounded px-2 py-1.5 text-slate-100 text-xs font-mono focus:outline-none focus:border-cyber-cyan" />
-                      </div>
-                    </div>
-                    <p className="text-[10px] text-slate-500 leading-normal">Budget bounds each agent (N iterations OR M minutes, whichever first) to protect shared free-tier rate limits. Instance expiry 0 = none.</p>
-                  </div>
-
-                  {/* Downloadable Artifact Upload (byte-safe) */}
-                  <div className="mt-3 p-3 rounded-lg bg-obsidian-900 border border-slate-800 space-y-2">
-                    <label className="block text-[11px] font-bold text-cyber-cyan uppercase">Attach Challenge Files (optional)</label>
-                    <input
-                      type="file"
-                      multiple
-                      onChange={(e) => handleFileUpload(e.target.files)}
-                      className="block w-full text-[11px] text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:text-xs file:font-bold file:bg-cyber-cyan file:text-obsidian-950 hover:file:bg-cyan-300 cursor-pointer"
-                    />
-                    {uploading && <p className="text-[10px] text-cyber-amber">Uploading…</p>}
-                    {uploadedFiles.length > 0 && (
-                      <ul className="text-[10px] text-slate-400 space-y-0.5">
-                        {uploadedFiles.map((f, i) => (
-                          <li key={i} className="flex items-center justify-between">
-                            <span className="truncate max-w-[300px] text-cyber-emerald">{f.name}</span>
-                            <span className="text-slate-500">{f.size} B</span>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                    <p className="text-[10px] text-slate-500">Binary artifacts are handled byte-safely and routed to the binary-analysis workflow automatically.</p>
-                  </div>
-
-                  {/* Root / Elevated Privileges Toggle */}
-                  <div className="mt-3 p-3 rounded-lg bg-obsidian-900 border border-slate-800 hover:border-cyber-cyan/40 transition-colors flex items-center justify-between">
-                    <div className="space-y-0.5 pr-3">
-                      <div className="flex items-center space-x-2">
-                        <Shield className="w-3.5 h-3.5 text-cyber-amber" />
-                        <span className="text-[11px] font-bold text-slate-200">GRANT ROOT / SUDO PRIVILEGES</span>
-                      </div>
-                      <p className="text-[10px] text-slate-400 leading-normal">
-                        Permits the agent to automatically execute privileged system tools via sudo without interactive approval prompts.
-                      </p>
-                    </div>
-                    <label className="relative inline-flex items-center cursor-pointer shrink-0">
-                      <input
-                        type="checkbox"
-                        checked={requiresRoot}
-                        onChange={(e) => setRequiresRoot(e.target.checked)}
-                        className="sr-only peer"
-                      />
-                      <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-cyber-cyan"></div>
-                    </label>
-                  </div>
-                </div>
-              </div>
-
-              {/* Sticky Action Footer */}
-              <div className="p-4 bg-obsidian-950 border-t border-slate-800 flex items-center justify-end space-x-3 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setShowModal(false)}
-                  className="px-4 py-2 rounded-lg bg-obsidian-900 text-slate-400 hover:text-slate-200 text-xs font-bold transition-colors"
-                >
-                  CANCEL
-                </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs uppercase tracking-wider transition-all hover:scale-105 shadow-[0_0_15px_rgba(0,240,255,0.4)]"
-                >
-                  INITIALIZE CHALLENGE
-                </button>
-              </div>
-            </form>
+            {/* Chat component fills the remaining height */}
+            <div className="flex-1 overflow-hidden px-4 pb-4">
+              <NewChallengeChat
+                onOpenWorkspace={handleChatCreated}
+                onRefreshBackendData={onRefreshBackendData}
+                onClose={handleCloseModal}
+              />
+            </div>
           </div>
         </div>
-      )}
-
-      {/* Directory Browser Modal */}
-      {showDirBrowser && (
-        <DirectoryBrowserModal
-          initialPath={workingDirectory}
-          onSelect={(selectedPath) => handleWorkingDirectoryChange(selectedPath)}
-          onClose={() => setShowDirBrowser(false)}
-        />
       )}
     </div>
   );

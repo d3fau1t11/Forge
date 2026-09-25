@@ -8,12 +8,36 @@ logger = logging.getLogger("forge.privilege")
 class PrivilegeManager:
     """Evaluates privilege requirements and maintains tamper-evident audit logs."""
 
+    def get_approval_mode(self, challenge_id: Optional[str] = None, db: Optional[Session] = None) -> str:
+        """Resolve approval mode ('auto' or 'manual') for a challenge, falling back to global settings."""
+        from backend.config import settings
+        if challenge_id and db:
+            try:
+                from backend.database.models import ChallengeModel
+                ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+                if ch and ch.approval_mode:
+                    c_mode = str(ch.approval_mode).strip().lower()
+                    if c_mode in ("auto", "manual"):
+                        return c_mode
+            except Exception as e:
+                logger.debug(f"get_approval_mode lookup failed: {e}")
+
+        if getattr(settings, "AUTO_APPROVE_PRIVILEGED", False):
+            return "auto"
+        mode = str(getattr(settings, "FORGE_APPROVAL_MODE", "manual") or "").strip().lower()
+        return mode if mode in ("auto", "manual") else "manual"
+
+    def is_auto_approved(self, challenge_id: Optional[str] = None, db: Optional[Session] = None) -> bool:
+        """True if the effective approval mode for this challenge (or global fallback) is 'auto'."""
+        return self.get_approval_mode(challenge_id=challenge_id, db=db) == "auto"
+
     def evaluate_privilege(
         self,
         agent: str,
         tool_name: str,
         privilege_level: str,
-        db: Session
+        db: Session,
+        challenge_id: Optional[str] = None,
     ) -> bool:
         """Determines if execution is permitted under security policy.
 
@@ -25,7 +49,7 @@ class PrivilegeManager:
         ``record_privilege_decision()`` (to update it).
         """
         approved, _audit_log_id = self.evaluate_privilege_ex(
-            agent=agent, tool_name=tool_name, privilege_level=privilege_level, db=db
+            agent=agent, tool_name=tool_name, privilege_level=privilege_level, db=db, challenge_id=challenge_id
         )
         return approved
 
@@ -34,7 +58,8 @@ class PrivilegeManager:
         agent: str,
         tool_name: str,
         privilege_level: str,
-        db: Session
+        db: Session,
+        challenge_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
         """Like :meth:`evaluate_privilege`, but also returns the AuditLogModel row id.
 

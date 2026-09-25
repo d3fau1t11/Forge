@@ -58,7 +58,8 @@ interface UploadedFile {
 interface NewChallengeChatProps {
   onOpenWorkspace: (challenge: Challenge) => void;
   onRefreshBackendData?: () => Promise<void> | void;
-  setActiveTab: (tab: NavTab) => void;
+  setActiveTab?: (tab: NavTab) => void;
+  onClose?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +355,8 @@ const Turn2Form: React.FC<{
 export const NewChallengeChat: React.FC<NewChallengeChatProps> = ({
   onOpenWorkspace,
   onRefreshBackendData,
-  setActiveTab
+  setActiveTab,
+  onClose
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -571,7 +573,11 @@ export const NewChallengeChat: React.FC<NewChallengeChatProps> = ({
             id="chat-back-btn"
             onClick={() => {
               soundEngine.playClick();
-              setActiveTab('challenges');
+              if (onClose) {
+                onClose();
+              } else if (setActiveTab) {
+                setActiveTab('challenges');
+              }
             }}
             className="flex items-center space-x-2 text-xs text-slate-300 hover:text-cyber-cyan px-3.5 py-2 border border-slate-800 hover:border-cyber-cyan/40 rounded-lg bg-obsidian-900 transition-colors uppercase tracking-wider font-bold"
           >
