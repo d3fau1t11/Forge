@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import difflib
 from urllib.parse import urlparse
 import asyncio
@@ -14,6 +15,48 @@ from backend.environment.detector import environment_detector
 from backend.execution.service import execution_service
 
 logger = logging.getLogger("forge.tools")
+
+
+def refresh_environment_path() -> None:
+    """Refreshes standard binary directories in os.environ['PATH'] so newly installed tools are immediately found."""
+    current_path = os.environ.get("PATH", "")
+    paths = current_path.split(os.pathsep)
+    extra_dirs = []
+
+    # Python scripts directory
+    py_dir = os.path.dirname(sys.executable)
+    py_scripts = os.path.join(py_dir, "Scripts") if sys.platform == "win32" else os.path.join(py_dir, "bin")
+    if os.path.exists(py_scripts) and py_scripts not in paths:
+        extra_dirs.append(py_scripts)
+
+    # User local bin / cargo / go / npm dirs
+    home = os.path.expanduser("~")
+    user_candidates = [
+        os.path.join(home, ".local", "bin"),
+        os.path.join(home, ".cargo", "bin"),
+        os.path.join(home, "go", "bin"),
+        os.path.join(home, "AppData", "Roaming", "npm"),
+        os.path.join(home, "AppData", "Local", "Programs", "Python", f"Python{sys.version_info.major}{sys.version_info.minor}", "Scripts"),
+        "C:\\ProgramData\\chocolatey\\bin",
+    ]
+    for cand in user_candidates:
+        if os.path.exists(cand) and cand not in paths:
+            extra_dirs.append(cand)
+
+    if extra_dirs:
+        os.environ["PATH"] = os.pathsep.join(extra_dirs + paths)
+
+
+def find_tool_binary(binary_name: str) -> Optional[str]:
+    """Finds a tool binary on the host PATH, including platform-specific extensions."""
+    refresh_environment_path()
+    resolved = shutil.which(binary_name)
+    if not resolved and sys.platform == "win32":
+        for ext in [".exe", ".cmd", ".bat", ".ps1"]:
+            cand = shutil.which(f"{binary_name}{ext}")
+            if cand:
+                return cand
+    return resolved
 
 
 class ToolExecutionResult(BaseModel):
@@ -93,15 +136,6 @@ def classify_tool_execution(tool_name: str, exit_code: Optional[int], stdout: st
       These must NOT be retried identically — the caller aborts after a couple of hits
       (see LOCAL_EXEC_CATEGORIES) instead of burning the iteration/time budget.
     """
-    # A command that exited 0 CLEANLY SUCCEEDED — a bad invocation (file-not-found,
-    # syntax error, permission denied, missing dependency) or a transport failure
-    # (DNS/refused/timeout) always exits non-zero. So any failure-looking phrase in a
-    # zero-exit command's OUTPUT is data, not a diagnostic, and must not be flagged.
-    # Observed in production: a `curl … | strings | grep` pipeline that dumped an 11MB
-    # Node heap-dump (whose body literally contains "no such file or directory") exited
-    # 0 and captured the flag, yet was tagged FILE_NOT_FOUND — which feeds the swarm's
-    # "abort after 2 local failures" guard and the coordinated recovery logic. Guarding
-    # here also avoids lower-casing a multi-megabyte stdout on every successful command.
     if exit_code == 0:
         return {"execution_failure": False, "failure_category": None}
 
@@ -154,15 +188,156 @@ LOCAL_EXEC_CATEGORIES = frozenset({
 class ToolManager:
     """Resolves agent capability requests to concrete installed tool executions."""
 
+    async def request_tool_install(
+        self,
+        tool_or_capability: str,
+        preferred_pm: Optional[str] = None,
+        agent_id: str = "capability_manager",
+        challenge_id: Optional[str] = None,
+        run_id: Optional[str] = None
+    ) -> ToolExecutionResult:
+        """Dynamically plans and requests privilege-approved installation of a tool on the host."""
+        start_time = time.time()
+        from backend.execution.acquisition import acquisition_planner
+        plan = acquisition_planner.plan_for_tool_name(tool_or_capability, preferred_pm=preferred_pm)
+
+        if not plan.feasible or not plan.command:
+            elapsed_ms = (time.time() - start_time) * 1000
+            return ToolExecutionResult(
+                tool_name="package_installer",
+                capability="install_tool",
+                command="",
+                status="FAILED",
+                stderr=f"No feasible install recipe for '{tool_or_capability}': {plan.reason}",
+                exit_code=1,
+                duration_ms=elapsed_ms,
+                execution_failure=True,
+                failure_category="INSTALL_FAILED"
+            )
+
+        # Route through unified privilege approval gate
+        from backend.privilege.gate import require_approval, SHARED_PENDING_APPROVALS
+        from backend.websocket.manager import ws_manager
+
+        approved, decision, sudo_password = await require_approval(
+            cmd=plan.command,
+            agent_id=agent_id,
+            pending_approvals=SHARED_PENDING_APPROVALS,
+            broadcast_fn=ws_manager.broadcast,
+            challenge_id=challenge_id,
+            run_id=run_id
+        )
+
+        if not approved:
+            elapsed_ms = (time.time() - start_time) * 1000
+            return ToolExecutionResult(
+                tool_name="package_installer",
+                capability="install_tool",
+                command=plan.command,
+                status="FAILED",
+                stderr=f"[PRIVILEGE DENIED] Installation of '{tool_or_capability}' via '{plan.command}' was not approved.",
+                exit_code=-1,
+                duration_ms=elapsed_ms,
+                execution_failure=True,
+                failure_category="CAPABILITY_GAP"
+            )
+
+        logger.info(f"Approved tool installation executing: {plan.command}")
+        exec_res = await execution_service.run_command(
+            plan.command,
+            timeout_seconds=300,
+            capability="install_tool",
+            tool_name="installer"
+        )
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        if not exec_res.succeeded and exec_res.status != "SUCCESS":
+            return ToolExecutionResult(
+                tool_name="package_installer",
+                capability="install_tool",
+                command=plan.command,
+                status="FAILED",
+                stdout=exec_res.stdout,
+                stderr=f"Installation failed: {exec_res.stderr}",
+                exit_code=exec_res.exit_code or 1,
+                duration_ms=elapsed_ms,
+                execution_failure=True,
+                failure_category="INSTALL_FAILED"
+            )
+
+        # Refresh PATH and capability state
+        refresh_environment_path()
+        try:
+            from backend.execution.capabilities import capability_service
+            capability_service.refresh(tool_or_capability)
+        except Exception:
+            pass
+
+        resolved_bin = find_tool_binary(plan.provider)
+        if resolved_bin:
+            tool_registry.register_dynamic_tool(
+                tool_name=plan.provider,
+                binary=resolved_bin,
+                capabilities=[tool_or_capability, plan.provider],
+                installation_recipe=plan.command
+            )
+            logger.info(f"Successfully installed and registered tool '{plan.provider}' at {resolved_bin}")
+            return ToolExecutionResult(
+                tool_name=plan.provider,
+                capability="install_tool",
+                command=plan.command,
+                status="SUCCESS",
+                stdout=f"Successfully installed '{plan.provider}' at {resolved_bin}.\n{exec_res.stdout}",
+                stderr="",
+                exit_code=0,
+                duration_ms=elapsed_ms,
+                execution_failure=False,
+                failure_category=None
+            )
+        else:
+            warn_msg = f"Installation command succeeded, but binary '{plan.provider}' is not yet visible in host PATH. A process or terminal restart may be required to refresh system environment variables."
+            logger.warning(warn_msg)
+            tool_registry.register_dynamic_tool(
+                tool_name=plan.provider,
+                binary=plan.provider,
+                capabilities=[tool_or_capability, plan.provider],
+                installation_recipe=plan.command
+            )
+            return ToolExecutionResult(
+                tool_name=plan.provider,
+                capability="install_tool",
+                command=plan.command,
+                status="SUCCESS",
+                stdout=f"{exec_res.stdout}\n[WARNING] {warn_msg}",
+                stderr=warn_msg,
+                exit_code=0,
+                duration_ms=elapsed_ms,
+                execution_failure=False,
+                failure_category=None
+            )
+
     async def execute_capability(
         self,
         capability: str,
         target: str,
         extra_args: Optional[str] = None,
-        cwd: Optional[str] = None
+        cwd: Optional[str] = None,
+        agent_id: str = "agent",
+        challenge_id: Optional[str] = None,
+        run_id: Optional[str] = None
     ) -> ToolExecutionResult:
         start_time = time.time()
         parsed_target = target.replace("+", ",").split(",")[0].strip()
+
+        # Tool installation / acquisition capability
+        if capability in ("install_tool", "acquire_tool"):
+            tool_target = parsed_target or (extra_args or "").strip()
+            return await self.request_tool_install(
+                tool_or_capability=tool_target,
+                agent_id=agent_id,
+                challenge_id=challenge_id,
+                run_id=run_id
+            )
 
         # Direct model-powered capabilities like vision_read
         if capability == "vision_read":
@@ -417,31 +592,38 @@ class ToolManager:
         # 1. Resolve candidate tools for capability
         candidate_tools = tool_registry.get_tools_for_capability(capability)
         if not candidate_tools:
+            # Check dynamic acquisition plan for this capability/tool name
+            from backend.execution.acquisition import acquisition_planner
+            plan = acquisition_planner.plan_for_tool_name(capability)
+            recipe_hint = f" Resolved install recipe: `{plan.command}`" if plan.command else ""
             return ToolExecutionResult(
                 tool_name="none",
                 capability=capability,
                 command="",
                 status="MISSING_TOOL",
-                stderr=f"No approved tool registered for capability '{capability}'."
+                stderr=f"No approved tool registered for capability '{capability}'.{recipe_hint} Request installation with 'install_tool {capability}'."
             )
 
         # 2. Check host environment for installed tool
-        env_tools = environment_detector.detect_environment()["installed_tools"]
+        env_tools = environment_detector.detect_environment().get("installed_tools", {})
         selected_tool: Optional[ToolMetadata] = None
 
         for tool in candidate_tools:
-            if env_tools.get(tool.binary, {}).get("installed") or shutil.which(tool.binary):
+            if find_tool_binary(tool.binary) or env_tools.get(tool.binary, {}).get("installed"):
                 selected_tool = tool
                 break
 
         if not selected_tool:
             first_candidate = candidate_tools[0]
+            from backend.execution.acquisition import acquisition_planner
+            plan = acquisition_planner.plan_for_tool_name(first_candidate.tool_name)
+            recipe = plan.command or first_candidate.installation_recipe
             return ToolExecutionResult(
                 tool_name=first_candidate.tool_name,
                 capability=capability,
                 command="",
                 status="MISSING_TOOL",
-                stderr=f"Tool '{first_candidate.tool_name}' required for capability '{capability}' is not installed. Trusted install recipe: `{first_candidate.installation_recipe}`"
+                stderr=f"Tool '{first_candidate.tool_name}' required for capability '{capability}' is not installed. Trusted install recipe: `{recipe}`. Request installation with 'install_tool {first_candidate.tool_name}'."
             )
 
         # 3. Construct safe execution command string & sanitize target format for specific tools
@@ -550,9 +732,14 @@ class ToolManager:
             data_arg = parts[2] if len(parts) > 2 else ""
             return await self.execute_capability(capability="interactive_send_and_read", target=sess_key, extra_args=data_arg, cwd=cwd)
 
-        if raw_cmd.startswith("interactive_close ") or raw_cmd.startswith("interactive_close\t") or raw_cmd == "interactive_close":
-            sess_key = raw_cmd.split(None, 1)[1].strip() if " " in raw_cmd or "\t" in raw_cmd else ""
-            return await self.execute_capability(capability="interactive_close", target=sess_key, cwd=cwd)
+        # Tool installation / acquisition intercept
+        if raw_cmd.startswith("install_tool ") or raw_cmd.startswith("install_tool\t") or raw_cmd == "install_tool":
+            tool_arg = raw_cmd.split(None, 1)[1].strip() if " " in raw_cmd or "\t" in raw_cmd else ""
+            return await self.request_tool_install(tool_or_capability=tool_arg)
+
+        if raw_cmd.startswith("acquire_tool ") or raw_cmd.startswith("acquire_tool\t") or raw_cmd == "acquire_tool":
+            tool_arg = raw_cmd.split(None, 1)[1].strip() if " " in raw_cmd or "\t" in raw_cmd else ""
+            return await self.request_tool_install(tool_or_capability=tool_arg)
 
         # Delegate subprocess execution to ExecutionService (Phase 3). When *stdin* is
         # supplied it is fed to the process once (Tier-1 scripted interactive, Phase 4.x §4).

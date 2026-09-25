@@ -70,33 +70,8 @@ class EnvironmentDetector:
         ram_pass = info["ram_gb"] >= 4.0 or info["ram_gb"] == 0.0
         cpu_pass = info["cpu_cores"] >= 2
 
-        all_arsenal_tools = [
-            ("nmap", "sudo apt-get install nmap / choco install nmap"),
-            ("rustscan", "cargo install rustscan / choco install rustscan"),
-            ("masscan", "sudo apt-get install masscan"),
-            ("ffuf", "sudo apt-get install ffuf / go install github.com/ffuf/ffuf@latest"),
-            ("gobuster", "sudo apt-get install gobuster"),
-            ("feroxbuster", "sudo apt-get install feroxbuster"),
-            ("curl", "sudo apt-get install curl / choco install curl"),
-            ("httpx", "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"),
-            ("tshark", "sudo apt-get install tshark / choco install wireshark"),
-            ("tcpdump", "sudo apt-get install tcpdump"),
-            ("binwalk", "sudo apt-get install binwalk / pip install binwalk"),
-            ("ghidra", "sudo apt-get install ghidra / choco install ghidra"),
-            ("radare2", "sudo apt-get install radare2"),
-            ("gdb", "sudo apt-get install gdb / choco install gdb"),
-            ("sqlmap", "sudo apt-get install sqlmap / pip install sqlmap"),
-            ("john", "sudo apt-get install john / choco install john"),
-            ("hashcat", "sudo apt-get install hashcat / choco install hashcat"),
-            ("hydra", "sudo apt-get install hydra"),
-            ("volatility3", "pip install volatility3"),
-            ("searchsploit", "sudo apt-get install exploitdb"),
-            ("sublist3r", "sudo apt-get install sublist3r / pip install sublist3r"),
-            ("cyberchef", "npm install -g cyberchef-cli"),
-            ("python3", "sudo apt-get install python3 / python installer"),
-            ("claude", "npm install -g @anthropic-ai/claude-code"),
-            ("codex", "npm install -g @openai/codex-cli")
-        ]
+        from backend.tools.registry import tool_registry
+        all_arsenal_tools = tool_registry.get_all_arsenal_tools()
 
         tool_checks = []
         system_os = info["os"]
