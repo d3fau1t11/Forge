@@ -285,6 +285,32 @@ export class ApiService {
     return await res.json();
   }
 
+  /**
+   * Rebuild the pending-approval list from the backend registry.
+   *
+   * Pending approvals otherwise reach the UI only as APPROVAL_REQUIRED pushes, so a page
+   * load or a dropped socket would leave the operator console showing nothing while the
+   * backend is still waiting. Read-only: decisions still go through respondApproval().
+   */
+  public async getPendingApprovals(): Promise<any[]> {
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/approvals/pending`);
+      if (!res.ok) {
+        this.isOnline = false;
+        this.lastError = `HTTP ${res.status}`;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      this.isOnline = true;
+      this.lastError = null;
+      const data = await res.json();
+      return Array.isArray(data) ? data : [];
+    } catch (e: any) {
+      this.isOnline = false;
+      this.lastError = e?.message || 'Failed to fetch pending approvals';
+      return [];
+    }
+  }
+
   public async deleteChallenge(challengeId: string) {
     const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}`, { method: 'DELETE' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);

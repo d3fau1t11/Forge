@@ -108,6 +108,47 @@ def _reconcile_audit(audit_log_id: Optional[str], approved: bool) -> None:
         logger.debug(f"[privilege.gate] Audit reconcile skip: {_ae}")
 
 
+async def _broadcast_resolved(
+    broadcast_fn: Callable[[Dict[str, Any]], Any],
+    *,
+    request_id: str,
+    challenge_id: Optional[str],
+    run_id: Optional[str],
+    agent_id: str,
+    command: str,
+    privilege_level: str,
+    decision: Optional[str],
+    approved: bool,
+    context: Optional[Dict[str, Any]],
+) -> None:
+    """Announce the FINAL outcome of a gate decision so operator UIs can log it.
+
+    Fired on every branch that reached a decision — including the auto-approved path,
+    which otherwise asks nobody anything and so would leave the operator console with no
+    record that a PRIVILEGED command ran unattended.
+
+    Best-effort by construction: by the time this runs the decision is already made, so
+    a broken socket must never be allowed to change it.  ``decision`` is None when no
+    decision ever arrived (e.g. the request broadcast failed), which callers must read
+    as a denial — the same rule the wait itself applies.
+    """
+    try:
+        await broadcast_fn({
+            "event": "APPROVAL_RESOLVED",
+            "request_id": request_id,
+            "challenge_id": challenge_id,
+            "run_id": run_id,
+            "agent_id": agent_id,
+            "command": command,
+            "privilege_level": privilege_level,
+            "decision": decision,
+            "approved": bool(approved),
+            "context": context or {},
+        })
+    except Exception as e:
+        logger.debug(f"[privilege.gate] APPROVAL_RESOLVED broadcast skipped: {e}")
+
+
 async def require_approval(
     cmd: str,
     agent_id: str,
@@ -115,12 +156,21 @@ async def require_approval(
     broadcast_fn: Callable[[Dict[str, Any]], Any],
     challenge_id: Optional[str],
     run_id: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """Classify ``cmd`` and gate its execution behind operator authorization.
 
     Whether the operator is asked at all — and what they are asked FOR — depends on the
     configured approval mode (see the module docstring).  There is no timeout in either
     mode; the wait ends when the operator responds or the task is cancelled.
+
+    ``context`` is optional caller-supplied detail about WHY this command is being
+    requested (e.g. ``{"request_kind": "tool_install", "capability": "web_fuzzing",
+    "install_command": "apt-get install -y ffuf"}``).  It is carried verbatim into both
+    the ``APPROVAL_REQUIRED`` and ``APPROVAL_RESOLVED`` payloads and onto the pending
+    registry entry, so the operator console can render a decision-useful card instead of
+    a bare command line.  It is presentation metadata only: nothing in this module reads
+    it, and it can never widen execution.
 
     Returns ``(approved, decision, sudo_password)``:
       * ``approved``      — True for a SAFE command, an auto-mode approval, or an
@@ -177,6 +227,23 @@ async def require_approval(
         # Auto mode means auto: there is deliberately no extra confirmation net below
         # this line.  If you want a gate on those commands, run FORGE_APPROVAL_MODE=manual.
         _reconcile_audit(audit_log_id, True)
+        # Announce the unattended approval.  This is NOT a pending request — it is never
+        # registered in `pending_approvals` and never gets an APPROVAL_REQUIRED, so the
+        # operator UI can only ever render it as an already-resolved/logged entry.  It is
+        # emitted because a PRIVILEGED command running with nobody watching is precisely
+        # the thing the operator console must be able to account for afterwards.
+        await _broadcast_resolved(
+            broadcast_fn,
+            request_id=str(uuid.uuid4()),
+            challenge_id=challenge_id,
+            run_id=run_id,
+            agent_id=agent_id,
+            command=cmd,
+            privilege_level=priv_level,
+            decision="auto-approved",
+            approved=True,
+            context=context,
+        )
         return True, "auto-approved", None
 
     # ── Operator interaction required (manual mode, or auto + sudo credential) ────
@@ -194,6 +261,14 @@ async def require_approval(
         "agent_id": agent_id,
         "requires_sudo": req_sudo,
         "sudo_password": None,
+        # Carried so the pending-approvals listing endpoint can describe the request
+        # (which challenge/run it belongs to, and why it was raised) without re-deriving
+        # any of it.  `context` is copied so a caller mutating its dict later cannot
+        # retroactively alter what the operator was shown.
+        "challenge_id": challenge_id,
+        "run_id": run_id,
+        "context": dict(context) if context else {},
+        "decision_required": not auto_sudo_only,
     }
     if auto_sudo_only:
         # Lets the operator UI (and any other observer of the pending registry) tell
@@ -214,6 +289,7 @@ async def require_approval(
             # False only in auto mode, where the payload is a credential prompt and the
             # UI must NOT offer approve/deny buttons — just the password + cancel.
             "decision_required": not auto_sudo_only,
+            "context": context or {},
         })
         # NO timeout, in either mode.  Manual mode waits indefinitely for an explicit
         # approve/deny; auto+sudo waits indefinitely for the credential.  Note that
@@ -263,5 +339,21 @@ async def require_approval(
     # so the audit trail reflects what actually happened.  Runs on BOTH branches; a
     # missing id is a safe no-op.
     _reconcile_audit(audit_log_id, approved)
+
+    # Close the loop in the operator console: the pending card must resolve into a logged
+    # entry there exactly as it does here.  A None `decision` here means no decision ever
+    # arrived — reported as-is so the console shows "no decision" rather than inventing one.
+    await _broadcast_resolved(
+        broadcast_fn,
+        request_id=req_id,
+        challenge_id=challenge_id,
+        run_id=run_id,
+        agent_id=agent_id,
+        command=cmd,
+        privilege_level=priv_level,
+        decision=decision,
+        approved=approved,
+        context=context,
+    )
 
     return approved, decision, sudo_pw

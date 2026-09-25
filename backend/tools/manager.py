@@ -225,7 +225,18 @@ class ToolManager:
             pending_approvals=SHARED_PENDING_APPROVALS,
             broadcast_fn=ws_manager.broadcast,
             challenge_id=challenge_id,
-            run_id=run_id
+            run_id=run_id,
+            # Without this the operator sees only a bare `apt-get install -y ffuf` and
+            # cannot tell an acquire-on-demand install from any other privileged command.
+            # The plan already knows the capability and the provider, so surface them.
+            context={
+                "request_kind": "tool_install",
+                "capability": tool_or_capability,
+                "provider": plan.provider,
+                "method": plan.method.value,
+                "install_command": plan.command,
+                "reason": plan.reason,
+            },
         )
 
         if not approved:

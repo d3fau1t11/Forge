@@ -41,6 +41,65 @@ async def respond_approval(request_id: str, req: ApprovalRespondRequest, db: Ses
 
 
 # ----------------------------------------------------
+# PENDING APPROVALS (read-only listing)
+# ----------------------------------------------------
+
+# Fields safe to expose from a pending-approval registry entry.  This is an ALLOWLIST
+# rather than a denylist because the entry dicts hold two things that must never leave
+# the process: ``sudo_password`` (transient, single-use) and ``event`` (an asyncio.Event,
+# which is not even JSON-serializable).  A field added to a gate entry is therefore
+# invisible here until it is deliberately listed below.
+_PENDING_APPROVAL_FIELDS = (
+    "command", "agent_id", "privilege_level", "requires_sudo",
+    "challenge_id", "run_id", "context", "decision_required", "auto_mode_sudo_only",
+)
+
+
+def _public_pending_entry(request_id: str, entry: dict) -> dict:
+    out = {"request_id": request_id}
+    for field in _PENDING_APPROVAL_FIELDS:
+        if field in entry:
+            out[field] = entry[field]
+    return out
+
+
+@router.get("/approvals/pending")
+def list_pending_approvals():
+    """List privileged commands currently awaiting an operator decision.
+
+    The operator console otherwise learns about pending approvals only from the
+    APPROVAL_REQUIRED WebSocket push, so a page load (or a dropped socket) would leave it
+    showing nothing while the backend is still — indefinitely — waiting for an answer.
+    This lets the UI rebuild that list on demand.
+
+    READ-ONLY: decisions are still submitted exclusively through
+    ``POST /approvals/{request_id}/respond``.  This endpoint deliberately offers no second
+    way to resolve a request, and cannot influence any decision.
+    """
+    from backend.agents.swarm_orchestrator import swarm_orchestrator
+    from backend.privilege.gate import SHARED_PENDING_APPROVALS
+
+    pending = []
+    seen = set()
+    # Swarm runs own a per-board registry...
+    for board in list(swarm_orchestrator.active_swarms.values()):
+        for request_id, entry in list(board.pending_approvals.items()):
+            if request_id in seen:
+                continue
+            seen.add(request_id)
+            pending.append(_public_pending_entry(request_id, entry))
+    # ...and every non-swarm caller (legacy ReAct loop, agent_runtime, ToolManager) shares
+    # one global registry. Same uuid4 keyspace, so the `seen` guard is belt-and-suspenders
+    # rather than a real collision risk.
+    for request_id, entry in list(SHARED_PENDING_APPROVALS.items()):
+        if request_id in seen:
+            continue
+        seen.add(request_id)
+        pending.append(_public_pending_entry(request_id, entry))
+    return pending
+
+
+# ----------------------------------------------------
 # PRIVILEGE MANAGER
 # ----------------------------------------------------
 

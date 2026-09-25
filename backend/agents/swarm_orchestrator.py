@@ -87,6 +87,34 @@ from backend.agents.swarm_helpers import (
 from backend.agents.swarm_state import SwarmBlackboard, SwarmTask
 
 
+def _capability_gap_retry_context(
+    board: SwarmBlackboard, bin_name: str, priv_level: str
+) -> Optional[Dict[str, Any]]:
+    """Describe ``bin_name`` as a retry of an already-recorded capability gap, if it is one.
+
+    When the operator denies a command, the gate records a capability gap and the recovery
+    policy later re-issues the same command (``supervisor.decide_recovery`` returns "retry"
+    for ``capability_gap``).  Without this, that retry reaches the operator as a second,
+    context-free card for a request they already refused, indistinguishable from a new one.
+
+    Returns the context dict for the newest matching gap, or None when this command is not
+    a retry.  Presentation metadata only — it is never consulted when deciding anything.
+    """
+    if not bin_name:
+        return None
+    for gap in reversed(board.capability_gaps):
+        if gap.get("capability") == bin_name:
+            return {
+                "request_kind": "capability_gap_retry",
+                "capability": bin_name,
+                "target": gap.get("target", ""),
+                "denied_reason": gap.get("reason", ""),
+                "previous_decision": gap.get("decision"),
+                "privilege_level": gap.get("privilege_level", priv_level),
+            }
+    return None
+
+
 class SwarmOrchestrator:
     """Manages the lifecycle, workers, and blackboard of an active parallel swarm."""
 
@@ -750,6 +778,18 @@ class SwarmOrchestrator:
                 bin_name = os.path.basename(cmd.strip().split()[0]) if cmd.strip() else ""
                 priv_level = classify_command_privilege(cmd, bin_name)
 
+                # ── Capability-gap retry tagging ──────────────────────────────────────
+                # A denied command is recorded as a capability gap and later re-issued by
+                # the recovery policy (swarm/supervisor.decide_recovery returns "retry" for
+                # capability_gap).  That retry arrives here as an ordinary command, so the
+                # operator would be shown a second, context-free card for something they
+                # already refused — with no way to tell it apart from a fresh request.
+                # Attach the prior denial so the card can say what it is.  This is
+                # presentation metadata ONLY: the gate below classifies and decides the
+                # command exactly as it would without it, and `context` cannot widen
+                # execution (nothing in require_approval reads it).
+                _retry_context = _capability_gap_retry_context(board, bin_name, priv_level)
+
                 approved, decision, _sudo_pw_for_exec = await require_approval(
                     cmd=cmd,
                     agent_id=agent_id,
@@ -757,6 +797,7 @@ class SwarmOrchestrator:
                     broadcast_fn=ws_manager.broadcast,
                     challenge_id=board.challenge_id,
                     run_id=board.run_id,
+                    context=_retry_context,
                 )
                 # req_sudo is only consulted inside the sudo-stdin block below, which
                 # additionally requires a password the gate returns only on approval —

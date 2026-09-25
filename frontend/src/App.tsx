@@ -22,6 +22,11 @@ import { EmergencyStopModal } from './components/Shell/EmergencyStopModal';
 import { PackageInstallModal, PackageInstallRequest } from './components/Shell/PackageInstallModal';
 import { RootPermissionModal, RootPermissionRequest } from './components/Shell/RootPermissionModal';
 import { CommandApprovalModal, CommandApprovalRequest } from './components/Shell/CommandApprovalModal';
+import {
+  ResolvedApproval,
+  approvalFromPayload,
+  resolvedFromPayload,
+} from './components/Shell/ApprovalEntryCard';
 
 import { CommandCenter } from './components/Pages/CommandCenter';
 import { Challenges } from './components/Pages/Challenges';
@@ -120,6 +125,9 @@ export default function App() {
   const [packageRequests, setPackageRequests] = useState<PackageInstallRequest[]>([]);
   const [rootRequests, setRootRequests] = useState<RootPermissionRequest[]>([]);
   const [commandApprovals, setCommandApprovals] = useState<CommandApprovalRequest[]>([]);
+  // Decisions already made — including auto-mode ones the backend resolved without
+  // asking. Survives the pending list emptying, so /tools can show what happened.
+  const [resolvedApprovals, setResolvedApprovals] = useState<ResolvedApproval[]>([]);
   const [knowledgeRefreshTrigger, setKnowledgeRefreshTrigger] = useState(0);
 
   // Connectivity & Observability States
@@ -587,20 +595,18 @@ export default function App() {
             } else if (data.event === 'APPROVAL_REQUIRED') {
               setCommandApprovals((prev) => [
                 ...prev.filter((r) => r.requestId !== data.request_id),
-                {
-                  requestId: data.request_id,
-                  challengeId: data.challenge_id,
-                  runId: data.run_id,
-                  agentId: data.agent_id,
-                  command: data.command,
-                  privilegeLevel: data.privilege_level || 'PRIVILEGED',
-                  requiresSudo: !!data.requires_sudo,
-                  // false only in auto-approval mode, where this payload is a sudo
-                  // credential prompt rather than an approve/deny decision.
-                  decisionRequired: data.decision_required !== false,
-                  timestamp: new Date().toLocaleTimeString()
-                }
+                approvalFromPayload(data)
               ]);
+            } else if (data.event === 'APPROVAL_RESOLVED') {
+              // The gate reached a decision — approve, deny, or an auto-mode approval
+              // that asked nobody. Move the card out of the pending list and into the
+              // log. This is the ONLY signal that carries the outcome, so it must also
+              // cover the auto-approved case, which never had a pending card at all.
+              const resolved = resolvedFromPayload(data);
+              setCommandApprovals((prev) => prev.filter((r) => r.requestId !== data.request_id));
+              if (resolved.requestId) {
+                setResolvedApprovals((prev) => [resolved, ...prev].slice(0, 200));
+              }
             } else if (data.type === 'PROVIDER_FALLBACK_TRIGGERED' || data.event === 'PROVIDER_FALLBACK_TRIGGERED') {
               const fallbackData = data.data || data;
               setFallbackNotice({
@@ -781,6 +787,18 @@ export default function App() {
       }
     } catch (e: any) {
       anyError = anyError || e?.message || 'Failed to fetch tools';
+    }
+
+    // Rebuild the pending-approval list from the backend registry. APPROVAL_REQUIRED
+    // pushes are the only other source, so without this a reload (or a socket drop)
+    // would leave the operator console blank while the gate is still waiting on them.
+    try {
+      const pendingApprovals = await apiService.getPendingApprovals();
+      if (Array.isArray(pendingApprovals)) {
+        setCommandApprovals(pendingApprovals.map(approvalFromPayload));
+      }
+    } catch (e: any) {
+      anyError = anyError || e?.message || 'Failed to fetch pending approvals';
     }
 
     try {
@@ -1032,8 +1050,17 @@ export default function App() {
     try {
       const res = await apiService.respondApproval(requestId, decision, sudoPassword);
       if (!res.accepted) {
+        // Most often this means the request already resolved (the gate popped it), but it
+        // can also be a transient failure. Ask the registry which it was instead of
+        // guessing — it is authoritative, and dropping a still-pending request would
+        // strand the backend waiting on an answer the operator can no longer give.
         console.warn('Approval response not accepted:', res.reason);
+        const pending = await apiService.getPendingApprovals();
+        setCommandApprovals(pending.map(approvalFromPayload));
+        return;
       }
+      // The backend also broadcasts APPROVAL_RESOLVED, which files the logged entry; this
+      // is just the optimistic removal so the card does not linger for a round-trip.
       setCommandApprovals((prev) => prev.filter((r) => r.requestId !== requestId));
     } catch (e) {
       console.error('Failed to submit approval response:', e);
@@ -1042,7 +1069,11 @@ export default function App() {
   };
 
   const handleDismissCommandApproval = (requestId: string) => {
-    setCommandApprovals((prev) => prev.filter((r) => r.requestId !== requestId));
+    // Dismissing is an explicit DENY, not a local hide. The card is labelled "Deny and
+    // dismiss", and the gate that is waiting on this request has NO timeout — dropping
+    // the card without answering would leave the run parked forever on a question the
+    // operator believes they already closed.
+    void handleRespondCommandApproval(requestId, 'deny');
   };
 
   const handleOpenChallengeWorkspace = (ch: Challenge) => {
@@ -1213,7 +1244,13 @@ export default function App() {
               )}
 
               {activeTab === 'tools' && (
-                <Tools tools={tools} />
+                <Tools
+                  tools={tools}
+                  pendingApprovals={commandApprovals}
+                  resolvedApprovals={resolvedApprovals}
+                  onRespondApproval={handleRespondCommandApproval}
+                  onDismissApproval={handleDismissCommandApproval}
+                />
               )}
 
               {activeTab === 'ai_intelligence' && (

@@ -1,15 +1,30 @@
 import React from 'react';
-import { 
-  Wrench, 
-  Zap 
+import {
+  Wrench,
+  Zap
 } from 'lucide-react';
 import { ToolItem } from '../../types';
+import { CommandApprovalRequest, ResolvedApproval } from '../Shell/ApprovalEntryCard';
+import { OperatorApprovals } from './OperatorApprovals';
 
 interface ToolsProps {
   tools: ToolItem[];
+  /** Privileged actions waiting on the operator, including tool installs and
+   *  capability-gap retries raised by the agent runtime. */
+  pendingApprovals?: CommandApprovalRequest[];
+  /** Already-decided approvals, including anything a challenge's auto mode resolved. */
+  resolvedApprovals?: ResolvedApproval[];
+  onRespondApproval?: (requestId: string, decision: 'approve' | 'deny', sudoPassword?: string) => Promise<void>;
+  onDismissApproval?: (requestId: string) => void;
 }
 
-export const Tools: React.FC<ToolsProps> = ({ tools }) => {
+export const Tools: React.FC<ToolsProps> = ({
+  tools,
+  pendingApprovals = [],
+  resolvedApprovals = [],
+  onRespondApproval,
+  onDismissApproval,
+}) => {
   const categories = Array.from(new Set(tools.map((t) => t.capabilityCategory)));
 
   return (
@@ -33,6 +48,17 @@ export const Tools: React.FC<ToolsProps> = ({ tools }) => {
           </span>
         </div>
       </div>
+
+      {/* Operator Approvals — privileged actions needing a decision, plus the log of
+          decisions already made. Hidden only if the page is rendered without wiring. */}
+      {onRespondApproval && (
+        <OperatorApprovals
+          pending={pendingApprovals}
+          resolved={resolvedApprovals}
+          onRespond={onRespondApproval}
+          onDismiss={onDismissApproval}
+        />
+      )}
 
       {/* Tools Grouped by Capability */}
       <div className="space-y-6">
