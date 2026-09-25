@@ -387,16 +387,20 @@ export default function App() {
               setDecisions((prev) => [newDec, ...prev]);
             } else if (data.event === 'MEMORY_LEARNED') {
               setKnowledgeRefreshTrigger((prev) => prev + 1);
-            } else if (data.event === 'TARGET_CHANGED') {
-              const newAddr = data.command || data.target || data.current_address;
+            } else if (data.event === 'TARGET_CHANGED' || data.event === 'TARGET_ADDRESS_UPDATED') {
+              const newAddr = data.new_address || data.current_address || data.target || data.command;
+              const incomingHistory: string[] | undefined = data.address_history;
               if (newAddr) {
                 setTargets((prev) =>
                   prev.map((t) =>
-                    t.challengeId === data.challenge_id || t.currentIp === newAddr
+                    t.challengeId === data.challenge_id || t.id === data.target_id
                       ? {
                           ...t,
                           currentIp: newAddr,
-                          addressHistory: Array.from(new Set([...t.addressHistory, newAddr]))
+                          status: (data.status || t.status || 'ADDRESS_UPDATED').toUpperCase(),
+                          addressHistory: incomingHistory
+                            ? incomingHistory
+                            : Array.from(new Set([...t.addressHistory, newAddr]))
                         }
                       : t
                   )
@@ -1181,6 +1185,24 @@ export default function App() {
                   targets={targets}
                   onRediscover={(id) => apiService.rediscoverTarget(id)}
                   onVerify={(id) => apiService.verifyTarget(id)}
+                  onRebind={async (id, newAddress) => {
+                    // Optimistic UI update before API call
+                    setTargets((prev) =>
+                      prev.map((t) =>
+                        t.id === id
+                          ? {
+                              ...t,
+                              currentIp: newAddress,
+                              status: 'ADDRESS_UPDATED',
+                              addressHistory: Array.from(new Set([...t.addressHistory, newAddress]))
+                            }
+                          : t
+                      )
+                    );
+                    await apiService.updateTargetAddress(id, newAddress);
+                    // Resync full state from backend to get canonical lineage
+                    fetchBackendData();
+                  }}
                   onCreateTarget={handleCreateChallenge}
                   onNavigateTab={(tab) => setActiveTab(tab)}
                 />

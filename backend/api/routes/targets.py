@@ -85,22 +85,68 @@ async def rediscover_target(target_id: str, db: Session = Depends(get_db)):
     await ws_manager.broadcast({"event": "TARGET_REDISCOVERED", "target_id": target_id, "address": target.current_address})
     return target
 
+async def perform_target_rebind(target: TargetProfileModel, new_address: str, db: Session) -> TargetProfileModel:
+    """Execute dynamic address re-binding on a target identity while preserving past evidence and lineage."""
+    old_addr = target.current_address
+    new_addr = new_address.strip()
+    if not new_addr:
+        raise HTTPException(status_code=400, detail="New address cannot be empty")
+
+    existing_history = list(target.address_history or [])
+    if old_addr and old_addr not in existing_history:
+        existing_history.append(old_addr)
+    if new_addr not in existing_history:
+        existing_history.append(new_addr)
+    elif existing_history and existing_history[-1] != new_addr:
+        existing_history.remove(new_addr)
+        existing_history.append(new_addr)
+
+    target.current_address = new_addr
+    target.address_history = list(existing_history)
+    target.verification_status = "address_updated"
+    target.last_verified_at = datetime.utcnow()
+    db.commit()
+    db.refresh(target)
+
+    await ws_manager.broadcast({
+        "event": "TARGET_ADDRESS_UPDATED",
+        "target_id": target.id,
+        "challenge_id": target.challenge_id,
+        "old_address": old_addr,
+        "new_address": new_addr,
+        "address_history": target.address_history,
+        "status": target.verification_status,
+    })
+    await ws_manager.broadcast({
+        "event": "TARGET_CHANGED",
+        "target_id": target.id,
+        "challenge_id": target.challenge_id,
+        "current_address": new_addr,
+        "target": new_addr,
+        "address_history": target.address_history,
+    })
+    return target
+
+
 @router.put("/targets/{target_id}/address")
 async def update_target_address(target_id: str, req: UpdateTargetAddressRequest, db: Session = Depends(get_db)):
     target = db.query(TargetProfileModel).filter(TargetProfileModel.id == target_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="Target identity not found")
 
-    old_addr = target.current_address
-    target.current_address = req.new_address
-    target.verification_status = "address_updated"
-    target.last_verified_at = datetime.utcnow()
-    db.commit()
+    updated = await perform_target_rebind(target, req.new_address, db)
+    svcs = updated.expected_services or [{"port": 80, "proto": "tcp", "service": "HTTP", "version": "Target Server"}]
+    techs = updated.technologies or ["Linux", "HTTP"]
+    return {
+        "id": updated.id,
+        "challenge_id": updated.challenge_id,
+        "current_address": updated.current_address,
+        "hostname": updated.hostname or updated.current_address,
+        "expected_services": svcs,
+        "technologies": techs,
+        "address_history": updated.address_history,
+        "discovery_method": updated.discovery_method or "FORGE Auto Ingest",
+        "verification_status": updated.verification_status,
+        "last_verified_at": updated.last_verified_at.isoformat() if updated.last_verified_at else None,
+    }
 
-    await ws_manager.broadcast({
-        "event": "TARGET_ADDRESS_UPDATED",
-        "target_id": target_id,
-        "old_address": old_addr,
-        "new_address": req.new_address
-    })
-    return target

@@ -513,6 +513,26 @@ def get_challenge_messages(challenge_id: str, db: Session = Depends(get_db)):
     ]
 
 
+def _extract_rebind_address(text: str) -> Optional[str]:
+    """Detect if operator chat message is requesting a target address rebind."""
+    text_clean = text.strip()
+    slash_match = re.match(r"^/rebind(?:[_\-]target)?\s+(\S+)", text_clean, re.IGNORECASE)
+    if slash_match:
+        return slash_match.group(1).strip()
+
+    natural_match = re.search(
+        r"(?:rebind|update|change|switch)\s+(?:the\s+)?(?:target\s+)?(?:address|ip|domain|url|host)?\s*(?:to|as)\s+([^\s,;]+)",
+        text_clean,
+        re.IGNORECASE,
+    )
+    if natural_match:
+        val = natural_match.group(1).strip().strip("'\"`")
+        if val and not val.lower().startswith("what") and not val.lower().startswith("how"):
+            return val
+
+    return None
+
+
 @router.post("/challenges/{challenge_id}/messages")
 async def post_challenge_message(
     challenge_id: str,
@@ -537,6 +557,71 @@ async def post_challenge_message(
     db.add(user_msg)
     db.commit()
     db.refresh(user_msg)
+
+    # 1.1 Check if operator message is an address rebind instruction
+    rebind_address = _extract_rebind_address(user_content)
+    if rebind_address:
+        from backend.api.routes.targets import perform_target_rebind
+
+        target = (
+            db.query(TargetProfileModel)
+            .filter(TargetProfileModel.challenge_id == challenge_id)
+            .order_by(TargetProfileModel.last_verified_at.desc())
+            .first()
+        )
+        if not target:
+            target = TargetProfileModel(
+                challenge_id=challenge_id,
+                current_address=rebind_address,
+                hostname=rebind_address,
+                verification_status="address_updated",
+                address_history=[rebind_address],
+            )
+            db.add(target)
+            db.commit()
+            db.refresh(target)
+            old_addr = "none"
+            new_addr = rebind_address
+            history_display = f"[{new_addr}]"
+        else:
+            old_addr = target.current_address
+            target = await perform_target_rebind(target, rebind_address, db)
+            new_addr = target.current_address
+            history_display = " -> ".join(target.address_history or [new_addr])
+
+        assistant_content = (
+            f"🎯 **Target Address Re-bound Successfully**\n\n"
+            f"- **Previous Address:** `{old_addr}`\n"
+            f"- **Active Address:** `{new_addr}`\n"
+            f"- **Address History Lineage:** `{history_display}`\n\n"
+            f"All past evidence, captured telemetry, and execution runs remain fully preserved for challenge **{challenge.name}**."
+        )
+
+        assistant_msg = ChatMessageModel(
+            challenge_id=challenge_id,
+            role="assistant",
+            content=assistant_content,
+        )
+        db.add(assistant_msg)
+        db.commit()
+        db.refresh(assistant_msg)
+
+        return {
+            "user_message": {
+                "id": user_msg.id,
+                "challenge_id": user_msg.challenge_id,
+                "role": user_msg.role,
+                "content": user_msg.content,
+                "created_at": user_msg.created_at.isoformat() if user_msg.created_at else None,
+            },
+            "assistant_message": {
+                "id": assistant_msg.id,
+                "challenge_id": assistant_msg.challenge_id,
+                "role": assistant_msg.role,
+                "content": assistant_msg.content,
+                "created_at": assistant_msg.created_at.isoformat() if assistant_msg.created_at else None,
+            },
+        }
 
     # 2. Query recent history for context window (last 16 messages)
     history_records = (

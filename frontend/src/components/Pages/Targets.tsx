@@ -9,7 +9,8 @@ import {
   Plus,
   Shield,
   Search,
-  Activity
+  Activity,
+  Link2
 } from 'lucide-react';
 import { Target } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
@@ -18,6 +19,7 @@ interface TargetsProps {
   targets: Target[];
   onRediscover: (id: string) => void;
   onVerify: (id: string) => void;
+  onRebind?: (id: string, newAddress: string) => Promise<void> | void;
   onCreateTarget?: (targetData: {
     name: string;
     category: any;
@@ -32,11 +34,16 @@ export const Targets: React.FC<TargetsProps> = ({
   targets,
   onRediscover,
   onVerify,
+  onRebind,
   onCreateTarget,
   onNavigateTab
 }) => {
   const [selectedTargetId, setSelectedTargetId] = useState<string>(targets[0]?.id || '');
   const [showModal, setShowModal] = useState(false);
+  const [showRebindModal, setShowRebindModal] = useState(false);
+  const [rebindAddress, setRebindAddress] = useState('');
+  const [rebindLoading, setRebindLoading] = useState(false);
+  const [rebindError, setRebindError] = useState<string | null>(null);
   const [targetIp, setTargetIp] = useState('');
   const [targetName, setTargetName] = useState('');
   const [targetCategory, setTargetCategory] = useState<'WEB' | 'PWN' | 'REV' | 'CRYPTO' | 'FORENSICS' | 'RECON'>('WEB');
@@ -54,6 +61,42 @@ export const Targets: React.FC<TargetsProps> = ({
   const handleOpenModal = () => {
     soundEngine.playClick();
     setShowModal(true);
+  };
+
+  const handleOpenRebindModal = () => {
+    soundEngine.playClick();
+    setRebindAddress(activeTarget?.currentIp || '');
+    setRebindError(null);
+    setShowRebindModal(true);
+  };
+
+  const handleRebindSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeTarget) return;
+    const cleanAddr = rebindAddress.trim();
+    if (!cleanAddr) {
+      setRebindError('Target address cannot be empty.');
+      return;
+    }
+    if (cleanAddr === activeTarget.currentIp) {
+      setRebindError('New address is the same as current address.');
+      return;
+    }
+
+    if (onRebind) {
+      setRebindLoading(true);
+      setRebindError(null);
+      try {
+        await onRebind(activeTarget.id, cleanAddr);
+        soundEngine.playFanfare();
+        setShowRebindModal(false);
+      } catch (err: any) {
+        soundEngine.playWarning();
+        setRebindError(err?.message || 'Failed to rebind target address');
+      } finally {
+        setRebindLoading(false);
+      }
+    }
   };
 
   const handleFormSubmit = (e: React.FormEvent) => {
@@ -239,6 +282,14 @@ export const Targets: React.FC<TargetsProps> = ({
 
                 {/* Actions */}
                 <div className="flex items-center space-x-2">
+                  <button
+                    onClick={handleOpenRebindModal}
+                    className="px-3.5 py-1.5 rounded-lg bg-obsidian-900 hover:bg-cyan-950/80 border border-cyber-cyan/70 text-cyber-cyan font-bold text-xs flex items-center space-x-1.5 transition-all shadow-[0_0_10px_rgba(0,240,255,0.2)]"
+                    title="Rebind target IP / host dynamically while keeping history and evidence"
+                  >
+                    <Link2 className="w-3.5 h-3.5 text-cyber-cyan" />
+                    <span>REBIND ADDRESS</span>
+                  </button>
                   <button
                     onClick={() => { soundEngine.playClick(); onVerify(activeTarget.id); }}
                     className="px-3.5 py-1.5 rounded-lg bg-emerald-950 hover:bg-emerald-900 border border-emerald-700 text-cyber-emerald font-bold text-xs flex items-center space-x-1.5 transition-colors"
@@ -433,6 +484,83 @@ export const Targets: React.FC<TargetsProps> = ({
                   className="px-6 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all uppercase"
                 >
                   INITIALIZE TARGET
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* TARGET REBIND MODAL */}
+      {showRebindModal && activeTarget && (
+        <div className="fixed inset-0 bg-obsidian-950/80 backdrop-blur-md flex items-center justify-center p-4 z-50">
+          <div className="glass-panel border-2 border-cyber-cyan/60 rounded-xl max-w-lg w-full p-6 space-y-5 shadow-[0_0_40px_rgba(0,240,255,0.25)] cyber-corner">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center space-x-2">
+                <Link2 className="w-5 h-5 text-cyber-cyan" />
+                <h2 className="text-sm font-display font-bold text-slate-100 uppercase neon-text-cyan">
+                  DYNAMIC ADDRESS RE-BINDING
+                </h2>
+              </div>
+              <button 
+                onClick={() => setShowRebindModal(false)}
+                className="text-slate-400 hover:text-slate-100 font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Update the network address for target identity <span className="text-cyber-cyan font-bold">{activeTarget.id}</span> ({activeTarget.hostname}). Past evidence, telemetry dumps, and run history remain fully preserved and attached to the challenge.
+            </p>
+
+            {rebindError && (
+              <div className="p-3 rounded-lg bg-red-950/80 border border-red-700 text-red-300 text-xs font-mono">
+                ⚠ {rebindError}
+              </div>
+            )}
+
+            <form onSubmit={handleRebindSubmit} className="space-y-4 text-xs font-mono">
+              <div className="p-3 rounded-lg bg-obsidian-900 border border-slate-800 space-y-1">
+                <span className="text-slate-400 text-[11px] block">Current Active Address:</span>
+                <span className="text-slate-200 font-bold text-xs">{activeTarget.currentIp}</span>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 mb-1 font-bold">New Target Address (IP / URL / Domain) *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. 10.10.14.25, http://target.local:8080"
+                  value={rebindAddress}
+                  onChange={(e) => setRebindAddress(e.target.value)}
+                  className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan transition-colors"
+                  autoFocus
+                />
+              </div>
+
+              <div className="flex items-center justify-end space-x-3 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowRebindModal(false)}
+                  disabled={rebindLoading}
+                  className="px-4 py-2 rounded-lg bg-obsidian-900 border border-slate-700 text-slate-300 font-bold hover:bg-slate-800 transition-colors"
+                >
+                  CANCEL
+                </button>
+                <button
+                  type="submit"
+                  disabled={rebindLoading}
+                  className="px-6 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all uppercase flex items-center space-x-2"
+                >
+                  {rebindLoading ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>REBINDING...</span>
+                    </>
+                  ) : (
+                    <span>CONFIRM REBIND</span>
+                  )}
                 </button>
               </div>
             </form>
