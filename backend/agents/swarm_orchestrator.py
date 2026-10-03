@@ -533,6 +533,10 @@ class SwarmOrchestrator:
         MAX_CONSECUTIVE_ERRORS = 5
         consecutive_duplicates = 0
         MAX_CONSECUTIVE_DUPLICATES = 3
+        # No-progress ceiling: consecutive steps without meaningful forward progress
+        # (new endpoints, new headers, new flag candidates, successful execution, etc.)
+        consecutive_no_progress = 0
+        MAX_CONSECUTIVE_NO_PROGRESS = 10  # ~10 steps with zero knowledge growth triggers stop
 
         while not board.flag_captured and not board.is_stopped:
             # Hard-pause at a checkpoint: idle until the operator response resumes us.
@@ -568,6 +572,26 @@ class SwarmOrchestrator:
                 board.agent_paused_seconds.get(agent_id, 0.0),
             )
             iters = board.agent_iterations.get(agent_id, 0)
+
+            # Hard iteration cap: stop this agent cleanly when it hits its iteration budget.
+            if board.max_iterations and iters >= board.max_iterations:
+                reason = f"Iteration budget exhausted ({iters}/{board.max_iterations}) — winding agent down."
+                board.record_agent_step(agent_id, note=reason)
+                _append_to_challenge_log(board.challenge_id, agent_id, reason)
+                await board.update_worker_state(agent_id, status="DONE", current_task=reason)
+                if not board.stall_reason:
+                    board.stall_reason = reason
+                break
+
+            # Hard wall-clock ceiling: stop this agent cleanly when it hits its time budget.
+            if board.max_minutes and elapsed_min >= board.max_minutes:
+                reason = f"Wall-clock budget exhausted ({elapsed_min:.1f}/{board.max_minutes} min) — winding agent down."
+                board.record_agent_step(agent_id, note=reason)
+                _append_to_challenge_log(board.challenge_id, agent_id, reason)
+                await board.update_worker_state(agent_id, status="DONE", current_task=reason)
+                if not board.stall_reason:
+                    board.stall_reason = reason
+                break
 
             try:
                 ctx = self._build_agent_context(board, workdir, agent_id)
@@ -726,6 +750,7 @@ class SwarmOrchestrator:
                     board.record_agent_step(agent_id, command=cmd, note="skipped (already executed by the swarm)")
                     _append_to_challenge_log(board.challenge_id, agent_id, f"[DUPLICATE SKIPPED] {cmd[:150]}")
                     consecutive_duplicates += 1
+                    consecutive_no_progress += 1  # Duplicate = no progress
                     if consecutive_duplicates >= MAX_CONSECUTIVE_DUPLICATES:
                         _append_to_challenge_log(
                             board.challenge_id, agent_id,
@@ -741,6 +766,7 @@ class SwarmOrchestrator:
                 bin_name = os.path.basename(cmd_tokens[0]).lower() if cmd_tokens else ""
                 if ("sudo" in board.blocked_capabilities and cmd.strip().startswith("sudo ")) or (f"cmd:{bin_name}" in board.blocked_capabilities):
                     board.record_agent_step(agent_id, command=cmd, note=f"[CAPABILITY BLOCKED] Command '{cmd[:80]}' uses a capability/tool blocked on first failure.")
+                    consecutive_no_progress += 1
                     await asyncio.sleep(0.5)
                     continue
 
@@ -750,6 +776,7 @@ class SwarmOrchestrator:
                     cached = board.recon_cache[recon_key]
                     board.record_agent_step(agent_id, command=cmd, output=cached, note="[RECON CACHE HIT] Result already fetched by another agent.")
                     _append_to_challenge_log(board.challenge_id, agent_id, f"[RECON CACHE HIT] {cmd[:100]}")
+                    consecutive_no_progress += 1
                     await asyncio.sleep(0.5)
                     continue
 
@@ -757,6 +784,7 @@ class SwarmOrchestrator:
                 cmd_shape = _normalize_command_shape(cmd)
                 if cmd_shape in board.blocked_failure_sigs:
                     board.record_agent_step(agent_id, command=cmd, note=f"[SIGNATURE BLOCKED] Command shape '{cmd_shape}' is blocked after repeated failures.")
+                    consecutive_no_progress += 1
                     await asyncio.sleep(0.5)
                     continue
 
@@ -774,6 +802,7 @@ class SwarmOrchestrator:
                         note=f"[STRATEGY BLOCKED] Strategy '{strategy_label}' exhausted; skipping execution."
                     )
                     asyncio.create_task(_force_pivot_if_needed(board, agent_id, strategy_label))
+                    consecutive_no_progress += 1
                     await asyncio.sleep(0.5)
                     continue
 
@@ -836,6 +865,7 @@ class SwarmOrchestrator:
                         command=cmd,
                         note=f"[CAPABILITY_GAP] Privilege {status_str.upper()} for '{intent['capability']}'. Preserving intent for approval escalation.",
                     )
+                    consecutive_no_progress += 1
                     await asyncio.sleep(0.5)
                     continue
 
@@ -1009,7 +1039,7 @@ class SwarmOrchestrator:
                 anom_result = board.response_profiler.profile_and_evaluate(
                     command_or_target=cmd,
                     output=output,
-                    status_code=getattr(res, "exit_code", None),
+                    status_code=getattr(res, "status_code", None),
                     base_url=board.target_scope,
                 )
                 if anom_result.is_anomalous:
@@ -1079,6 +1109,39 @@ class SwarmOrchestrator:
                     board.discovered_endpoints.add(ep)
 
                 consecutive_errors = 0
+
+                # No-progress detection: track if this step added meaningful knowledge.
+                # Meaningful progress = new endpoints, new headers, new flag candidates,
+                # successful execution (exit 0 with output), or decoded artifacts.
+                made_progress = False
+                if getattr(res, "exit_code", 1) == 0 and output.strip():
+                    made_progress = True
+                if board.discovered_endpoints and len(board.discovered_endpoints) > getattr(board, "_last_endpoint_count", 0):
+                    made_progress = True
+                if board.extracted_headers and len(board.extracted_headers) > getattr(board, "_last_header_count", 0):
+                    made_progress = True
+                if board.flag_candidates and len(board.flag_candidates) > getattr(board, "_last_flag_candidate_count", 0):
+                    made_progress = True
+                if board.derived_artifacts and len(board.derived_artifacts) > getattr(board, "_last_derived_count", 0):
+                    made_progress = True
+
+                if made_progress:
+                    consecutive_no_progress = 0
+                    board._last_endpoint_count = len(board.discovered_endpoints)
+                    board._last_header_count = len(board.extracted_headers)
+                    board._last_flag_candidate_count = len(board.flag_candidates)
+                    board._last_derived_count = len(board.derived_artifacts)
+                else:
+                    consecutive_no_progress += 1
+                    if consecutive_no_progress >= MAX_CONSECUTIVE_NO_PROGRESS:
+                        reason = f"No meaningful progress in {MAX_CONSECUTIVE_NO_PROGRESS} consecutive steps — winding agent down."
+                        board.record_agent_step(agent_id, note=reason)
+                        _append_to_challenge_log(board.challenge_id, agent_id, reason)
+                        await board.update_worker_state(agent_id, status="DONE", current_task=reason)
+                        if not board.stall_reason:
+                            board.stall_reason = reason
+                        break
+
                 await board._broadcast_blackboard()
 
             except Exception as e:

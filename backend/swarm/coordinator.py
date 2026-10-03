@@ -136,7 +136,22 @@ class SwarmCoordinator:
         # Phase 5 — adaptive reasoning: budget, no-progress ledger, scorer, candidate
         # generator. All deterministic; reasoning can be disabled for pure Phase-4 behaviour.
         self.enable_reasoning = enable_reasoning
-        self.budget = budget or MissionBudget()
+        # Set budget caps based on swarm limits so the coordinated engine can stop on budget.
+        max_agent_calls = self.limits.max_total_tasks * self.limits.max_turns_per_task
+        max_tool_execs = max_agent_calls * 3  # ~3 tool calls per agent turn
+        max_failed = self.limits.max_total_tasks * 2
+        max_dupes = self.limits.max_total_tasks
+        wall_seconds = self.limits.task_timeout_seconds * self.limits.max_total_tasks
+        if wall_seconds <= 0:
+            wall_seconds = 0  # 0 = unbounded
+        self.budget = budget or MissionBudget(
+            max_agent_calls=max_agent_calls,
+            max_tool_executions=max_tool_execs,
+            max_failed_attempts=max_failed,
+            max_duplicate_attempts=max_dupes,
+            max_wall_seconds=float(wall_seconds),
+        )
+        self.budget.start()
         self.ledger = ProgressLedger(stagnation_limit=stagnation_limit)
         self.scorer = scorer or ActionScorer()
         if candidate_generator is not None:
@@ -764,6 +779,7 @@ class SwarmCoordinator:
             new_task.priority = cand.priority                  # §17 score-driven priority
             if self._add_task(new_task, origin="reasoning"):
                 injected += 1
+                self.budget.record_duplicate()  # Track duplicate attempt budget
 
     def _evaluate_stop_conditions(self) -> None:
         """Stop the mission on budget exhaustion / stagnation / all-capabilities-blocked
@@ -883,9 +899,11 @@ class SwarmCoordinator:
         # Cross-check against shared attempted signatures too (dedupes across resume).
         if task.signature in set(self.mission.attempted_signatures) and origin != "plan":
             if self.scheduler.has_signature(task.signature):
+                self.budget.record_duplicate()  # Track duplicate attempt budget
                 return False
         added = self.scheduler.add(task)
         if not added:
+            self.budget.record_duplicate()  # Track duplicate attempt budget
             return False
         self.mission.note_attempt(task.signature)
         self._record_coord("TASK_CREATED", command=(task.objective or "")[:400],

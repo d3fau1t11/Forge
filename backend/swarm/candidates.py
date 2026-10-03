@@ -32,7 +32,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional
 
 from backend.swarm.reasoning import (
-    CandidateAction, profile_for,
+    CandidateAction, profile_for, FailedApproach,
 )
 from backend.swarm.scoring import information_gain_for
 
@@ -103,6 +103,9 @@ class CandidateGenerator:
             out.extend(self._from_evidence(ev, mission_state))
         if use_memory:
             out.extend(self._from_memory(mission_state, max_memory=max_memory))
+        # Cross-mission failed approaches (A4) — always included, independent of use_memory
+        # since they are advisory dead-end signals, not experience-based proposals.
+        self._add_cross_mission_failures(mission_state)
         return self._dedupe(out)
 
     # ------------------------------------------------------------------ #
@@ -378,6 +381,33 @@ class CandidateGenerator:
             cand.historical_support = hist_support
             cands.append(cand)
         return cands
+
+    def _add_cross_mission_failures(self, ms: Any) -> None:
+        """Add cross-mission failed approaches to mission state for scorer visibility (A4).
+
+        These are advisory dead-end signals from prior missions of the same category.
+        They are NOT actionable candidates; they are injected so the scorer can
+        penalize similar approaches during ranking.
+        """
+        category = getattr(ms, "category", "") or ""
+        if not category:
+            return
+        try:
+            from backend.knowledge.failed_approaches import recall_failed_approaches
+            xmission_failed = recall_failed_approaches(category, limit=10)
+            for sig, count, reason in xmission_failed:
+                # Add to mission state's failed_approaches for scorer visibility
+                # (bounded, deduped by signature)
+                fa = FailedApproach(action=sig, signature=sig, failure_class="cross_mission",
+                                    reason=reason or f"Failed {count}x in prior missions")
+                ms_failed = getattr(ms, "failed_approaches", [])
+                if not any(f.get("signature") == sig for f in ms_failed):
+                    ms_failed.append(fa.to_dict())
+                    # Keep bounded
+                    if len(ms_failed) > 150:
+                        del ms_failed[:-150]
+        except Exception as e:
+            logger.debug(f"[CandidateGenerator] cross-mission failed approaches skipped: {e}")
 
     # ------------------------------------------------------------------ #
     # helpers

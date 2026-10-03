@@ -76,17 +76,36 @@ class MissionBudget:
     started_monotonic: float = 0.0
     elapsed_seconds: float = 0.0
 
+    def start(self) -> None:
+        """Start the wall-clock timer."""
+        if self.started_monotonic == 0.0:
+            import time
+            self.started_monotonic = time.monotonic()
+
+    def update_elapsed(self) -> None:
+        """Update elapsed_seconds from the monotonic clock."""
+        if self.started_monotonic > 0.0:
+            import time
+            self.elapsed_seconds = time.monotonic() - self.started_monotonic
+
     # -- accounting ----------------------------------------------------------- #
 
     def record_agent_call(self, n: int = 1) -> None:
         self.agent_calls += n
+        self.update_elapsed()
 
     def record_tool_executions(self, n: int) -> None:
         if n:
             self.tool_executions += int(n)
+        self.update_elapsed()
 
     def record_failure(self, n: int = 1) -> None:
         self.failed_attempts += n
+        self.update_elapsed()
+
+    def record_duplicate(self, n: int = 1) -> None:
+        self.duplicate_attempts += n
+        self.update_elapsed()
 
     # -- queries -------------------------------------------------------------- #
 
@@ -111,7 +130,22 @@ class MissionBudget:
         return round(min(1.0, max(fracs)) if fracs else 0.0, 4)
 
     def exhausted(self) -> Tuple[bool, str]:
-        """Return (exhausted, reason). Budget restrictions removed so runs are never halted on budget."""
+        """Return (exhausted, reason). Checks all bounded dimensions."""
+        # Agent calls budget
+        if self.max_agent_calls > 0 and self.agent_calls >= self.max_agent_calls:
+            return True, f"Agent call budget exhausted ({self.agent_calls}/{self.max_agent_calls})"
+        # Tool executions budget
+        if self.max_tool_executions > 0 and self.tool_executions >= self.max_tool_executions:
+            return True, f"Tool execution budget exhausted ({self.tool_executions}/{self.max_tool_executions})"
+        # Failed attempts budget
+        if self.max_failed_attempts > 0 and self.failed_attempts >= self.max_failed_attempts:
+            return True, f"Failed attempt budget exhausted ({self.failed_attempts}/{self.max_failed_attempts})"
+        # Duplicate attempts budget
+        if self.max_duplicate_attempts > 0 and self.duplicate_attempts >= self.max_duplicate_attempts:
+            return True, f"Duplicate attempt budget exhausted ({self.duplicate_attempts}/{self.max_duplicate_attempts})"
+        # Wall-clock budget
+        if self.max_wall_seconds > 0 and self.elapsed_seconds >= self.max_wall_seconds:
+            return True, f"Wall-clock budget exhausted ({self.elapsed_seconds:.1f}/{self.max_wall_seconds:.1f}s)"
         return False, ""
 
     def to_dict(self) -> Dict[str, Any]:
