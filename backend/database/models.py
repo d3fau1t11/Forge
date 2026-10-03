@@ -633,3 +633,59 @@ class ProviderBreakerModel(Base):
     expiry_ts = Column(Float, nullable=False)
     reason = Column(Text, default="")
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+# =============================================================================
+# CHALLENGE INTAKE SESSIONS — durable, restart-surviving conversation state
+# =============================================================================
+# These two tables replace the in-memory _CHAT_SESSIONS dict so that an intake
+# session can be resumed after a process restart. The deterministic gate in
+# routes/challenges.py remains authoritative; the model (interpret_operator_message)
+# only suggests fields — ready_to_create from the model never commits by itself.
+# =============================================================================
+
+class IntakeSessionModel(Base):
+    """One durable intake session. Survives process restarts."""
+    __tablename__ = "intake_sessions"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    step = Column(Integer, default=1)
+    status = Column(String, default="OPEN", index=True)  # OPEN | COMMITTED | ABANDONED
+    fields = Column(JSON, default=dict)
+    challenge_id = Column(String, nullable=True, index=True)  # plain string, no FK
+    created_at = Column(DateTime, default=utcnow, index=True)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class IntakeTurnModel(Base):
+    """One conversational turn within an intake session."""
+    __tablename__ = "intake_turns"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    session_id = Column(String, ForeignKey("intake_sessions.id"), nullable=False, index=True)
+    role = Column(String, nullable=False)  # "user" | "assistant"
+    content = Column(Text, default="")
+    created_at = Column(DateTime, default=utcnow, index=True)
+
+
+# =============================================================================
+# TERMINAL COMMAND HISTORY — durable operator terminal command persistence
+# =============================================================================
+# Operator terminal commands and their output are persisted so they survive
+# process restarts. The TerminalView fetches /terminal/history on mount to
+# replay prior commands before live websocket events arrive.
+# =============================================================================
+
+class TerminalCommandModel(Base):
+    """Persisted operator terminal command with full output for replay."""
+    __tablename__ = "terminal_commands"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    challenge_id = Column(String, nullable=True, index=True)  # plain string, no FK
+    session_id = Column(String, nullable=True)
+    command = Column(Text, nullable=False)
+    stdout = Column(Text, default="")
+    stderr = Column(Text, default="")
+    exit_code = Column(Integer, nullable=True)
+    duration_ms = Column(Float, default=0.0)
+    created_at = Column(DateTime, default=utcnow, index=True)

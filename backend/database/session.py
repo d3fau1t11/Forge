@@ -100,6 +100,13 @@ MIGRATIONS = [
     # Base.metadata.create_all() creates it on fresh DBs; this migration covers pre-existing
     # databases that were created before ModelConfigModel was added to models.py.
     (22, "CREATE TABLE IF NOT EXISTS models (id VARCHAR PRIMARY KEY, provider_name VARCHAR NOT NULL, model_name VARCHAR NOT NULL, capability VARCHAR NOT NULL, context_length INTEGER DEFAULT 8192, cost_per_1k_input FLOAT DEFAULT 0.0, cost_per_1k_output FLOAT DEFAULT 0.0, enabled BOOLEAN DEFAULT 1)"),
+    # Challenge intake sessions — durable, restart-surviving conversation state
+    (23, "CREATE TABLE IF NOT EXISTS intake_sessions (id VARCHAR PRIMARY KEY, step INTEGER DEFAULT 1, status VARCHAR DEFAULT 'OPEN', fields JSON DEFAULT '{}', challenge_id VARCHAR, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"),
+    (24, "CREATE TABLE IF NOT EXISTS intake_turns (id VARCHAR PRIMARY KEY, session_id VARCHAR NOT NULL REFERENCES intake_sessions(id), role VARCHAR NOT NULL, content TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"),
+    # Terminal command history — durable operator terminal persistence for replay
+    (25, "CREATE TABLE IF NOT EXISTS terminal_commands (id VARCHAR PRIMARY KEY, challenge_id VARCHAR, session_id VARCHAR, command TEXT NOT NULL, stdout TEXT DEFAULT '', stderr TEXT DEFAULT '', exit_code INTEGER, duration_ms FLOAT DEFAULT 0.0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"),
+    (26, "CREATE INDEX IF NOT EXISTS ix_terminal_commands_challenge_id ON terminal_commands(challenge_id)"),
+    (27, "CREATE INDEX IF NOT EXISTS ix_terminal_commands_created_at ON terminal_commands(created_at)"),
 ]
 
 # SQLite's exact wording for ADD COLUMN on a column that already exists

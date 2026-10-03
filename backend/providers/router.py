@@ -11,6 +11,14 @@ from backend.providers.quota_manager import quota_manager
 
 logger = logging.getLogger("forge.router")
 
+# Gateways fronted by Cloudflare (Clean APIs) reject non-browser client signatures at the
+# edge with HTTP 403 "error code: 1010". httpx's default User-Agent trips that rule, so any
+# provider whose base_url sits behind such a rule must send a browser-like UA explicitly.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
 async def _notify_fallback(failed_provider: str, reason: str, next_candidate: Optional[str] = None):
     """Broadcast real-time WebSocket notification when a provider fails/exhausts quota and triggers cascade."""
     try:
@@ -30,33 +38,37 @@ async def _notify_fallback(failed_provider: str, reason: str, next_candidate: Op
 class ModelRouter:
     """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
 
-    # Single source of truth (Workstream C): Gemini is reserved for exactly two jobs —
-    # reading images (vision_read) and authoring long-form report/chat prose
-    # (report_generation). It is deliberately EXCLUDED from every solving/fallback chain
-    # because on real red-team tasks it frequently refuses (safety filters fire on
-    # exploit/recon prompts), which silently burned a fallback slot and stalled runs.
-    # route_request enforces this at runtime so a stray chain entry can never re-enable
-    # Gemini as a solver.
-    GEMINI_ALLOWED_CAPABILITIES = frozenset({"report_generation", "vision_read"})
+    # Single source of truth (Workstream C): Gemini is reserved for exactly three jobs —
+    # reading images (vision_read), authoring long-form report/chat prose
+    # (report_generation), and driving the challenge intake conversation (chat_creation).
+    # It is deliberately EXCLUDED from every solving/fallback chain because on real
+    # red-team tasks it frequently refuses (safety filters fire on exploit/recon prompts),
+    # which silently burned a fallback slot and stalled runs. route_request enforces this
+    # at runtime so a stray chain entry can never re-enable Gemini as a solver.
+    GEMINI_ALLOWED_CAPABILITIES = frozenset({"report_generation", "vision_read", "chat_creation"})
 
     DEFAULT_ROUTING_MAP = {
         # Curated order: Groq (multi-key), xKiro free models incl. Mistral/Ministral, OpenRouter (GLM/DeepSeek),
         # RapidAPI, Cloudflare, NVIDIA. Direct Mistral API sits LAST among LLM options
         # because its free-tier mistral-small/medium are gated to limit=0; xkiro_mistral serves them free.
         # NOTE: Gemini is intentionally absent from every solving chain — see GEMINI_ALLOWED_CAPABILITIES.
-        "recon": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
-        "directory_enumeration": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
-        "web_analysis": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
-        "web_testing": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
-        "code_analysis": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "mistral"],
-        "reverse_engineering": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "mistral"],
-        "fast_reasoning": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "cloudflare", "rapidapi_gpt54_mini", "nvidia", "mistral"],
-        "general_reasoning": ["groq", "xkiro", "xkiro_planner", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
-        "verification": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "mistral"],
+        "recon": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "cleanapis", "mistral"],
+        "directory_enumeration": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "cleanapis", "mistral"],
+        "web_analysis": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "cleanapis", "mistral"],
+        "web_testing": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "cleanapis", "mistral"],
+        "code_analysis": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "cleanapis", "mistral"],
+        "reverse_engineering": ["mistral_codestral", "xkiro_coder", "groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "cleanapis", "mistral"],
+        "fast_reasoning": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "cloudflare", "rapidapi_gpt54_mini", "nvidia", "cleanapis", "mistral"],
+        "general_reasoning": ["groq", "xkiro", "xkiro_planner", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "cleanapis", "mistral"],
+        "verification": ["groq", "xkiro", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "cloudflare", "nvidia", "cleanapis", "mistral"],
         # Writeup / report authoring — Gemini is deliberately FIRST for this task
         # (strong long-form technical prose); the rest of the free chain is the
         # fallback if Gemini is unavailable / quota-exhausted.
-        "report_generation": ["gemini", "groq", "xkiro", "xkiro_planner", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "mistral"],
+        "report_generation": ["gemini", "groq", "xkiro", "xkiro_planner", "xkiro_mistral", "openrouter", "rapidapi_deepseek_v32", "rapidapi_gpt54_mini", "cloudflare", "nvidia", "cleanapis", "mistral"],
+        # Challenge intake conversation — Gemini drives the dialogue (strong
+        # instruction-following for structured JSON output); free-tier chain is the
+        # fallback if Gemini is unavailable / quota-exhausted.
+        "chat_creation": ["gemini", "groq", "xkiro", "xkiro_mistral", "openrouter", "cloudflare", "nvidia", "cleanapis", "mistral"],
         # Multimodal image reading — mapped explicitly to Gemini (vision-capable provider)
         "vision_read": ["gemini"]
     }
@@ -117,6 +129,44 @@ class ModelRouter:
         # "codestral-2508" entry here silently shadowed the Mistral mapping.
         "devstral-medium": ("xkiro_coder", "mistralai/devstral-medium"),
         "sensenova-6.8": ("xkiro", "sensenova/sensenova-6.8-flash-lite"),
+        # Clean APIs (cleanapis.com) — all 33 catalog models, mirrored live from
+        # GET https://cleanapis.com/v1/models. Prefixed "clean-" on purpose: several
+        # gateway IDs collide with an existing alias above (gemini-3.6-flash, glm-5.3,
+        # kimi-k3, qwen3.8-27b), and a bare duplicate here would silently shadow the
+        # original mapping — the same bug the "codestral-2508" note above warns about.
+        "clean-claude-fable-5": ("cleanapis", "claude-fable-5"),
+        "clean-claude-fable-5.1": ("cleanapis", "claude-fable-5.1"),
+        "clean-claude-mythos-preview": ("cleanapis", "claude-mythos-preview"),
+        "clean-claude-opus-4.6": ("cleanapis", "claude-opus-4.6"),
+        "clean-claude-opus-4.7": ("cleanapis", "claude-opus-4.7"),
+        "clean-claude-opus-4.8": ("cleanapis", "claude-opus-4.8"),
+        "clean-claude-opus-5": ("cleanapis", "claude-opus-5"),
+        "clean-claude-opus-5.5": ("cleanapis", "claude-opus-5.5"),
+        "clean-claude-sonnet-5": ("cleanapis", "claude-sonnet-5"),
+        "clean-deepseek-v4-flash-0731": ("cleanapis", "deepseek-v4-flash-0731"),
+        "clean-deepseek-v4-pro-0813": ("cleanapis", "deepseek-v4-pro-0813"),
+        "clean-deepseek-v4-pro-max": ("cleanapis", "deepseek-v4-pro-max"),
+        "clean-gemini-3.1-pro": ("cleanapis", "gemini-3.1-pro"),
+        "clean-gemini-3.6-flash": ("cleanapis", "gemini-3.6-flash"),
+        "clean-gemini-3.7-flash": ("cleanapis", "gemini-3.7-flash"),
+        "clean-gemma-2-2b": ("cleanapis", "gemma-2-2b"),
+        "clean-glm-5.2": ("cleanapis", "glm-5.2"),
+        "clean-glm-5.3": ("cleanapis", "glm-5.3"),
+        "clean-gpt-5.5": ("cleanapis", "gpt-5.5"),
+        "clean-gpt-5.5-pro": ("cleanapis", "gpt-5.5-pro"),
+        "clean-gpt-5.6-luna": ("cleanapis", "gpt-5.6-luna"),
+        "clean-gpt-5.6-sol": ("cleanapis", "gpt-5.6-sol"),
+        "clean-gpt-5.6-terra": ("cleanapis", "gpt-5.6-terra"),
+        "clean-grok-4.5": ("cleanapis", "grok-4.5"),
+        "clean-grok-4.6": ("cleanapis", "grok-4.6"),
+        "clean-kimi-k2.6": ("cleanapis", "kimi-k2.6"),
+        "clean-kimi-k3": ("cleanapis", "kimi-k3"),
+        "clean-muse-spark-1.1": ("cleanapis", "muse-spark-1.1"),
+        "clean-qwen3.7-max": ("cleanapis", "qwen3.7-max"),
+        "clean-qwen3.8-27b": ("cleanapis", "qwen3.8-27b"),
+        "clean-qwen3.8-max": ("cleanapis", "qwen3.8-max"),
+        "clean-seed-2.1-pro": ("cleanapis", "seed-2.1-pro"),
+        "clean-seed-2.1-turbo": ("cleanapis", "seed-2.1-turbo"),
     }
 
     def __init__(self):
@@ -229,12 +279,18 @@ class ModelRouter:
             ))
         # 8. xKiro AI Gateway Provider (Free models, verified CTF unrestricted)
         xkiro_key = (getattr(settings, "XKIRO_API_KEY", "") or os.getenv("XKIRO_API_KEY", "")).strip()
-        if xkiro_key:
+        # Multi-key pool: OpenAISpecProvider rotates to the next key on 429/402/401/403,
+        # so a rate-limited key fails over instead of stalling the whole capability chain.
+        xkiro_keys = [k.strip() for k in (getattr(settings, "XKIRO_API_KEYS", "") or "").split(",") if k.strip()]
+        if xkiro_key and xkiro_key not in xkiro_keys:
+            xkiro_keys.insert(0, xkiro_key)
+        if xkiro_keys:
             # Default fast reasoning / recon (Free SenseNova 6.8 Flash-Lite, 262k context)
             self.register_provider("xkiro", OpenAISpecProvider(
                 name="xkiro",
                 is_paid=False,
-                api_key=xkiro_key,
+                api_key=xkiro_keys[0],
+                api_keys=xkiro_keys,
                 default_model="sensenova/sensenova-6.8-flash-lite",
                 base_url="https://api.xkiro.com/v1",
                 speed_tier="fast"
@@ -243,7 +299,8 @@ class ModelRouter:
             self.register_provider("xkiro_coder", OpenAISpecProvider(
                 name="xkiro_coder",
                 is_paid=False,
-                api_key=xkiro_key,
+                api_key=xkiro_keys[0],
+                api_keys=xkiro_keys,
                 default_model="mistralai/codestral-2508",
                 base_url="https://api.xkiro.com/v1",
                 speed_tier="fast"
@@ -252,7 +309,8 @@ class ModelRouter:
             self.register_provider("xkiro_planner", OpenAISpecProvider(
                 name="xkiro_planner",
                 is_paid=False,
-                api_key=xkiro_key,
+                api_key=xkiro_keys[0],
+                api_keys=xkiro_keys,
                 default_model="mistralai/mistral-large-2512",
                 base_url="https://api.xkiro.com/v1",
                 speed_tier="fast"
@@ -263,13 +321,39 @@ class ModelRouter:
             self.register_provider("xkiro_mistral", OpenAISpecProvider(
                 name="xkiro_mistral",
                 is_paid=False,
-                api_key=xkiro_key,
+                api_key=xkiro_keys[0],
+                api_keys=xkiro_keys,
                 default_model="mistralai/ministral-8b",
                 base_url="https://api.xkiro.com/v1",
                 speed_tier="fast"
             ))
         # Note: Direct HTTP REST calls to agentrouter.org/v1 return 401 Unauthorized Client.
         # AgentRouter access is strictly mediated via terminal CLI tools (agentrouter_claude_code & agentrouter_codex).
+
+        # 9. Clean APIs (cleanapis.com) — OpenAI-compatible multi-model gateway.
+        # base_url ".../v1" + OpenAISpecProvider's "/chat/completions" append matches the
+        # documented endpoint (POST https://cleanapis.com/v1/chat/completions).
+        # The gateway sits behind Cloudflare and its edge rule bans non-browser client
+        # signatures (plain urllib -> HTTP 403 "error code: 1010"), so an explicit
+        # browser User-Agent is required; httpx's default UA is not enough.
+        cleanapis_key = (getattr(settings, "CLEANAPIS_API_KEY", "") or os.getenv("CLEANAPIS_API_KEY", "")).strip()
+        cleanapis_keys = [k.strip() for k in (getattr(settings, "CLEANAPIS_API_KEYS", "") or "").split(",") if k.strip()]
+        if cleanapis_key and cleanapis_key not in cleanapis_keys:
+            cleanapis_keys.insert(0, cleanapis_key)
+        if cleanapis_keys:
+            self.register_provider("cleanapis", OpenAISpecProvider(
+                name="cleanapis",
+                # Free tier: a monthly token allowance, no billing. Marking it paid
+                # would (a) exclude it when PAID_MODEL_ALLOWED=false and (b) report a
+                # flat $0.001/call in cost telemetry for calls that cost nothing.
+                is_paid=False,
+                api_key=cleanapis_keys[0],
+                api_keys=cleanapis_keys,
+                default_model="claude-opus-4.8",
+                base_url="https://cleanapis.com/v1",
+                extra_headers={"User-Agent": _BROWSER_UA},
+                speed_tier="deep"
+            ))
 
     def register_provider(self, name: str, provider: BaseProvider):
         self.providers[name.lower()] = provider

@@ -57,6 +57,12 @@ try:
         GROQ_API_KEYS: str = ""
         RAPIDAPI_KEY: str = ""
         XKIRO_API_KEY: str = ""
+        # Additional xKiro keys (comma-separated). The pool rotates on 429/402/401/403
+        # so a single rate-limited key never stalls a run.
+        XKIRO_API_KEYS: str = ""
+        # Clean APIs (cleanapis.com) — OpenAI-compatible gateway, Bearer cc_...
+        CLEANAPIS_API_KEY: str = ""
+        CLEANAPIS_API_KEYS: str = ""
 
         # AgentRouter Per-Model Keys
         AGENTROUTER_CLAUDE_OPUS_5_KEY: str = ""
@@ -163,6 +169,9 @@ except ImportError:
             self.COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
             self.GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
             self.XKIRO_API_KEY = os.getenv("XKIRO_API_KEY", "")
+            self.XKIRO_API_KEYS = os.getenv("XKIRO_API_KEYS", "")
+            self.CLEANAPIS_API_KEY = os.getenv("CLEANAPIS_API_KEY", "")
+            self.CLEANAPIS_API_KEYS = os.getenv("CLEANAPIS_API_KEYS", "")
 
             # AgentRouter Per-Model Keys
             self.AGENTROUTER_CLAUDE_OPUS_5_KEY = os.getenv("AGENTROUTER_CLAUDE_OPUS_5_KEY", "")

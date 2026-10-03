@@ -20,7 +20,7 @@ SOLVING_CAPABILITIES = [
     "code_analysis", "reverse_engineering", "fast_reasoning",
     "general_reasoning", "verification",
 ]
-ALLOWED = {"report_generation", "vision_read"}
+ALLOWED = {"report_generation", "vision_read", "chat_creation"}
 
 
 class TestGeminiRestriction(unittest.TestCase):

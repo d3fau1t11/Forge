@@ -96,7 +96,7 @@ class TestConversationalCreationFlow(unittest.TestCase):
         self.assertEqual(r1.status_code, 200)
         body1 = r1.json()
         self.assertEqual(body1["step"], 1)                 # still collecting
-        self.assertIn("category", body1.get("awaiting", []))
+        self.assertIn("type", body1.get("awaiting", []))
         self.assertIn("difficulty", body1.get("awaiting", []))
         self.assertNotIn("name", body1.get("awaiting", []))  # name already captured
 
@@ -142,7 +142,7 @@ class TestConversationalCreationFlow(unittest.TestCase):
         self.assertEqual(r1.status_code, 200)
         body1 = r1.json()
         self.assertEqual(body1["step"], 1)
-        self.assertIn("category", body1.get("awaiting", []))
+        self.assertIn("type", body1.get("awaiting", []))
         self.assertIn("difficulty", body1.get("awaiting", []))
 
         # Turn 2: provide category and difficulty

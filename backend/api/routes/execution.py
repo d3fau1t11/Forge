@@ -3,7 +3,7 @@ the execution-layer status views, target-type detection, interactive sessions, a
 the emergency kill switch that halts a running workflow."""
 
 import os
-from backend.utils.time import utcnow
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,13 +11,16 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from backend.api.runner import workflow_runner
-from backend.database.models import RunModel, ToolExecutionModel
+from backend.database.models import RunModel, ToolExecutionModel, TerminalCommandModel
 from backend.database.session import get_db
+from backend.utils.time import utcnow
 from backend.execution.service import execution_service
 from backend.privilege.gate import require_approval, SHARED_PENDING_APPROVALS
 from backend.tools.manager import tool_manager
 from backend.tools.registry import tool_registry
 from backend.websocket.manager import ws_manager
+
+logger = logging.getLogger("forge.api.execution")
 
 router = APIRouter()
 
@@ -135,6 +138,31 @@ async def execute_terminal_command(req: TerminalExecuteRequest):
         output = f"Execution error: {str(e)}"
         exit_code = -1
 
+    duration_ms = (utcnow() - start_time).total_seconds() * 1000
+
+    # Persist terminal command to database (non-blocking: log failure but continue)
+    try:
+        db = next(get_db())
+        cmd_record = TerminalCommandModel(
+            challenge_id=req.challenge_id,
+            session_id=None,  # could be extended with a session tracker later
+            command=req.command,
+            stdout=exec_result.stdout if 'exec_result' in locals() and exec_result.stdout else "",
+            stderr=exec_result.stderr if 'exec_result' in locals() and exec_result.stderr else "",
+            exit_code=exit_code,
+            duration_ms=duration_ms,
+        )
+        db.add(cmd_record)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to persist terminal command: {e}")
+        # Do not break command execution on DB write failure
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
     event_payload = {
         "event": "LOG_OUTPUT",
         "challenge_id": req.challenge_id,
@@ -145,6 +173,42 @@ async def execute_terminal_command(req: TerminalExecuteRequest):
     }
     await ws_manager.broadcast(event_payload)
     return event_payload
+
+
+@router.get("/terminal/history")
+def get_terminal_history(
+    challenge_id: Optional[str] = None,
+    limit: int = 200,
+    db: Session = Depends(get_db)
+):
+    """Terminal command history for replay, optionally filtered by challenge.
+
+    Returns entries in ascending created_at order (oldest first) so the frontend
+    can render them sequentially. Field names match list_tool_executions for
+    shared renderer compatibility.
+    """
+    limit = min(max(limit, 1), 500)
+    query = db.query(TerminalCommandModel)
+    if challenge_id:
+        query = query.filter(TerminalCommandModel.challenge_id == challenge_id)
+    rows = query.order_by(TerminalCommandModel.created_at.asc()).limit(limit).all()
+    return [{
+        "id": r.id,
+        "run_id": None,
+        "challenge_id": r.challenge_id,
+        "agent": "operator",
+        "tool_name": "terminal",
+        "capability": "terminal_command",
+        "command": r.command,
+        "privilege_level": "SAFE",
+        "approved": True,
+        "status": "SUCCESS" if r.exit_code == 0 else "FAILED",
+        "stdout": r.stdout,
+        "stderr": r.stderr,
+        "exit_code": r.exit_code,
+        "duration_ms": r.duration_ms,
+        "created_at": r.created_at.isoformat() if r.created_at else None
+    } for r in rows]
 
 
 @router.get("/execution/status")

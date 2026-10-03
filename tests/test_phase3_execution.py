@@ -624,6 +624,20 @@ class TestExecutionStatusEndpoint(unittest.TestCase):
         self.assertEqual(payload["output"], "root\n")
         self.assertEqual(payload["exit_code"], 0)
 
+    def tearDown(self):
+        # Clean up any terminal_commands rows created during tests to avoid cross-suite pollution
+        from backend.database.session import SessionLocal
+        from backend.database.models import TerminalCommandModel
+        db = SessionLocal()
+        try:
+            db.query(TerminalCommandModel).delete()
+            db.commit()
+        except Exception:
+            # Table may not exist in this test's database schema
+            db.rollback()
+        finally:
+            db.close()
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

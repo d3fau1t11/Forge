@@ -21,6 +21,8 @@ from backend.database.models import (
     ChatMessageModel,
     EvidenceModel,
     FindingModel,
+    IntakeSessionModel,
+    IntakeTurnModel,
     ReportModel,
     RunModel,
     SwarmEvidenceModel,
@@ -39,12 +41,10 @@ router = APIRouter()
 logger = logging.getLogger("forge.routes")
 
 # ---------------------------------------------------------------------------
-# CHAT-SESSION STATE (in-memory, per-process, keyed by session_id)
-# Each entry lives only until the session commits or is garbage-collected.
-# Structure: { session_id: { "name": str, "platform": str, "type": str,
-#              "step": 1|2, "uploaded_paths": [str] } }
+# CHAT-SESSION STATE — now backed by IntakeSessionModel / IntakeTurnModel
+# The in-memory _CHAT_SESSIONS is REMOVED. All session state lives in the DB
+# so a process restart can resume any OPEN session by its session_id.
 # ---------------------------------------------------------------------------
-_CHAT_SESSIONS: Dict[str, dict] = {}
 
 
 def _safe_delete_working_dir(working_dir: str):
@@ -195,33 +195,74 @@ class PostChallengeChatMessageRequest(BaseModel):
 # CHAT-DRIVEN CHALLENGE CREATION
 # ----------------------------------------------------
 
-@router.post("/challenges/chat-session")
-async def start_chat_session(_req: ChatSessionStartRequest = None):
-    """Open a new two-turn chat session.
+# ---------------------------------------------------------------------------
+# FIXED OPENING PROMPT (identical to the original in-memory version)
+# ---------------------------------------------------------------------------
+_INTAKE_OPENING_PROMPT = (
+    "Let's set up your challenge.\n\n"
+    "Please tell me:\n"
+    "1. **Challenge name** — what is this challenge called?\n"
+    "2. **Platform / event name** — e.g. PicoCTF, HackTheBox, DEF CON, …\n"
+    "3. **Category** — e.g. Web, Pwn, Crypto, Forensics, Rev, Recon, Stego, Mobile, Hardware, AI, or anything you like.\n"
+    "4. **Difficulty** — EASY, MEDIUM, HARD, or INSANE.\n\n"
+    "You can answer all four in one message, or just start with what you know."
+)
 
-    Returns a session_id the client must carry through the second turn, plus
-    the first bot prompt the UI should display in the chat window.
+
+# Model returns "category" but session/gate use "type" — translate at merge site only.
+_MODEL_FIELD_ALIASES = {"category": "type"}
+
+
+def _step1_missing_fields(session: IntakeSessionModel) -> list[tuple[str, str]]:
+    """Return list of (field_key, human_label) for missing required step-1 fields."""
+    from backend.utils.challenge_normalize import CATEGORIES
+    fields = session.fields or {}
+    missing = []
+    if not fields.get("name"):
+        missing.append(("name", "the **challenge name**"))
+    if not fields.get("type"):
+        missing.append(("type", f"the **category** (one of: {', '.join(CATEGORIES)})"))
+    if not fields.get("difficulty"):
+        missing.append(("difficulty", "the **difficulty** (EASY, MEDIUM, HARD or INSANE)"))
+    return missing
+
+
+def _step1_all_present(session: IntakeSessionModel) -> bool:
+    """True if name, type, and difficulty are all non-empty."""
+    fields = session.fields or {}
+    return bool(fields.get("name") and fields.get("type") and fields.get("difficulty"))
+
+
+@router.post("/challenges/chat-session")
+async def start_chat_session(_req: ChatSessionStartRequest = None, db: Session = Depends(get_db)):
+    """Open a new durable intake session.
+
+    Creates an IntakeSessionModel row and the first assistant turn.
+    Returns session_id, step=1, and the fixed opening bot_message.
     """
     session_id = _uuid_mod.uuid4().hex
-    _CHAT_SESSIONS[session_id] = {
-        "step": 1,
-        "name": None,
-        "platform": None,
-        "type": None,
-        "uploaded_paths": [],
-    }
+    session = IntakeSessionModel(
+        id=session_id,
+        step=1,
+        status="OPEN",
+        fields={},
+    )
+    db.add(session)
+
+    # Persist the opening assistant turn
+    turn = IntakeTurnModel(
+        id=_uuid_mod.uuid4().hex,
+        session_id=session_id,
+        role="assistant",
+        content=_INTAKE_OPENING_PROMPT,
+    )
+    db.add(turn)
+    db.commit()
+
     return {
         "session_id": session_id,
         "step": 1,
-        "bot_message": (
-            "Let's set up your challenge.\n\n"
-            "Please tell me:\n"
-            "1. **Challenge name** — what is this challenge called?\n"
-            "2. **Platform / event name** — e.g. PicoCTF, HackTheBox, DEF CON, …\n"
-            "3. **Challenge type / category** — e.g. Web, Pwn, Crypto, Forensics, Rev, Recon, Stego, Mobile, Hardware, AI, or anything you like.\n"
-            "4. **Difficulty** — EASY, MEDIUM, HARD, or INSANE.\n\n"
-            "You can answer all four in one message, or just start with what you know."
-        ),
+        "bot_message": _INTAKE_OPENING_PROMPT,
     }
 
 
@@ -231,66 +272,66 @@ async def send_chat_message(
     req: ChatSessionMessageRequest,
     db: Session = Depends(get_db),
 ):
-    """Advance a chat session by one turn.
+    """Advance a durable intake session by one turn.
 
-    * **Turn 1** (step==1): expects challenge_name, platform_name, challenge_type.
-      Stores them and returns the step-2 prompt.
-    * **Turn 2** (step==2): expects description (required) plus optional
-      target_address and attached_file_paths.  Commits by calling the existing
-      create_challenge() logic and returns the new challenge row.
+    * **Turn 1 (step==1)**: Collect name, category, difficulty (platform optional).
+      - Fast path: if request body already has all three, apply them and advance
+        to step 2 WITHOUT calling the LLM.
+      - Otherwise: persist user turn, call interpret_operator_message, merge fields,
+        then run the deterministic missing-field gate.
+    * **Turn 2 (step==2)**: Collect description (required), optional target_address
+      and attached_file_paths. Commits the challenge via create_challenge().
     """
-    session = _CHAT_SESSIONS.get(session_id)
+    session = db.query(IntakeSessionModel).filter(
+        IntakeSessionModel.id == session_id,
+        IntakeSessionModel.status == "OPEN",
+    ).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Chat session not found or already committed")
 
-    step = session["step"]
+    step = session.step
+    fields = dict(session.fields or {})
 
     # ------------------------------------------------------------------
-    # TURN 1: collect the three required fields
+    # TURN 1: collect required fields (name, category, difficulty)
     # ------------------------------------------------------------------
     if step == 1:
-        # Conversational, incremental collection (Workstream F3/F4): accept whatever the
-        # operator supplied, normalize the category, and ask ONLY for the fields still
-        # missing — never fail, never demand everything at once.
         from backend.utils.challenge_normalize import normalize_category, normalize_difficulty, CATEGORIES
 
-        if req.challenge_name and req.challenge_name.strip():
-            session["name"] = req.challenge_name.strip()
-        if req.platform_name and req.platform_name.strip():
-            session["platform"] = req.platform_name.strip()
-        if req.challenge_type and req.challenge_type.strip():
+        # FAST PATH: if the request body already supplies all three required
+        # structured fields, apply them directly and advance — NO LLM CALL.
+        fast_path = (
+            req.challenge_name and req.challenge_name.strip() and
+            req.challenge_type and req.challenge_type.strip() and
+            req.difficulty and req.difficulty.strip()
+        )
+
+        if fast_path:
+            fields["name"] = req.challenge_name.strip()
+            fields["platform"] = req.platform_name.strip() if req.platform_name else None
             canon = normalize_category(req.challenge_type)
-            session["type"] = canon or req.challenge_type.strip()
-        if req.difficulty and req.difficulty.strip():
-            session["difficulty"] = normalize_difficulty(req.difficulty)
+            fields["type"] = canon or req.challenge_type.strip()
+            fields["difficulty"] = normalize_difficulty(req.difficulty)
 
-        missing = []
-        if not session.get("name"):
-            missing.append(("name", "the **challenge name**"))
-        if not session.get("type"):
-            missing.append(("category", f"the **category** (one of: {', '.join(CATEGORIES)})"))
-        if not session.get("difficulty"):
-            missing.append(("difficulty", "the **difficulty** (EASY, MEDIUM, HARD or INSANE)"))
+            session.fields = fields
+            session.step = 2
+            session.updated_at = utcnow()
 
-        if missing:
-            # platform is optional; only name/category/difficulty gate advancement.
-            asks = " and ".join(m[1] for m in missing)
-            return {
-                "session_id": session_id,
-                "step": 1,
-                "awaiting": [m[0] for m in missing],
-                "bot_message": f"Thanks. Could you also tell me {asks}?",
-            }
+            # Persist user turn (structured summary)
+            user_turn_content = f"Challenge Name: {fields['name']}\nPlatform: {fields.get('platform') or 'Unknown'}\nCategory: {fields['type']}\nDifficulty: {fields['difficulty']}"
+            user_turn = IntakeTurnModel(
+                id=_uuid_mod.uuid4().hex,
+                session_id=session_id,
+                role="user",
+                content=user_turn_content,
+            )
+            db.add(user_turn)
 
-        session["step"] = 2
-        name = session["name"]
-        platform = session.get("platform") or "Unknown"
-        return {
-            "session_id": session_id,
-            "step": 2,
-            "bot_message": (
-                f"Got it — **{name}** on **{platform}** "
-                f"({session['type']}, {session['difficulty']}).\n\n"
+            # Assistant turn for step 2
+            platform_display = fields.get("platform") or "Unknown"
+            bot_message = (
+                f"Got it — **{fields['name']}** on **{platform_display}** "
+                f"({fields['type']}, {fields['difficulty']}).\n\n"
                 "Now, optionally:\n"
                 "• Paste one or more **target addresses** (IP, URL, or `nc host port`; "
                 "separate several with `+`) if you have them.\n"
@@ -298,11 +339,145 @@ async def send_chat_message(
                 "And in one sentence or more: **what is your goal for this challenge?** "
                 "(This becomes the challenge description.)\n\n"
                 "Send your message when ready — the challenge will be created immediately."
-            ),
+            )
+            bot_turn = IntakeTurnModel(
+                id=_uuid_mod.uuid4().hex,
+                session_id=session_id,
+                role="assistant",
+                content=bot_message,
+            )
+            db.add(bot_turn)
+            db.commit()
+
+            return {
+                "session_id": session_id,
+                "step": 2,
+                "bot_message": bot_message,
+            }
+
+        # SLOW PATH: Apply any structured fields from request, persist user turn,
+        # call LLM, merge model fields (with alias), THEN run deterministic gate.
+        from backend.utils.challenge_normalize import normalize_category, normalize_difficulty
+
+        # Apply any structured fields the user provided in this request
+        user_provided = {}
+        if req.challenge_name and req.challenge_name.strip():
+            user_provided["name"] = req.challenge_name.strip()
+            fields["name"] = req.challenge_name.strip()
+        if req.platform_name and req.platform_name.strip():
+            user_provided["platform"] = req.platform_name.strip()
+            fields["platform"] = req.platform_name.strip()
+        if req.challenge_type and req.challenge_type.strip():
+            canon = normalize_category(req.challenge_type)
+            user_provided["type"] = canon or req.challenge_type.strip()
+            fields["type"] = canon or req.challenge_type.strip()
+        if req.difficulty and req.difficulty.strip():
+            user_provided["difficulty"] = normalize_difficulty(req.difficulty)
+            fields["difficulty"] = normalize_difficulty(req.difficulty)
+
+        user_content_parts = []
+        if req.challenge_name and req.challenge_name.strip():
+            user_content_parts.append(f"Challenge Name: {req.challenge_name.strip()}")
+        if req.platform_name and req.platform_name.strip():
+            user_content_parts.append(f"Platform: {req.platform_name.strip()}")
+        if req.challenge_type and req.challenge_type.strip():
+            user_content_parts.append(f"Category: {req.challenge_type.strip()}")
+        if req.difficulty and req.difficulty.strip():
+            user_content_parts.append(f"Difficulty: {req.difficulty.strip()}")
+        if not user_content_parts:
+            user_content_parts.append("(no structured fields provided)")
+
+        user_turn = IntakeTurnModel(
+            id=_uuid_mod.uuid4().hex,
+            session_id=session_id,
+            role="user",
+            content="\n".join(user_content_parts),
+        )
+        db.add(user_turn)
+
+        # Update session fields with any newly provided structured data
+        session.fields = fields
+        session.updated_at = utcnow()
+        db.commit()
+
+        # Build transcript for the LLM (all prior turns in this session)
+        prior_turns = db.query(IntakeTurnModel).filter(
+            IntakeTurnModel.session_id == session_id
+        ).order_by(IntakeTurnModel.created_at.asc()).all()
+        transcript = [{"role": t.role, "content": t.content} for t in prior_turns]
+
+        # Call interpret_operator_message for a natural reply
+        from backend.agents.challenge_intake import interpret_operator_message
+        model_result = await interpret_operator_message(transcript, fields)
+
+        # Merge model-suggested fields (with alias: model uses "category" -> session uses "type")
+        if model_result is not None:
+            model_fields = model_result.get("fields", {})
+            for k, v in model_fields.items():
+                key = _MODEL_FIELD_ALIASES.get(k, k)
+                if v is not None and (not isinstance(v, str) or v.strip()):
+                    fields[key] = v
+            session.fields = fields
+            session.updated_at = utcnow()
+            db.commit()
+
+        # DETERMINISTIC GATE: recompute missing AFTER merging model fields
+        missing = _step1_missing_fields(session)
+        if missing:
+            # Still missing fields — ask for them
+            asks = " and ".join(m[1] for m in missing)
+            model_reply = model_result.get("reply") if model_result is not None else None
+            bot_message = model_reply if model_reply else f"Thanks. Could you also tell me {asks}?"
+
+            bot_turn = IntakeTurnModel(
+                id=_uuid_mod.uuid4().hex,
+                session_id=session_id,
+                role="assistant",
+                content=bot_message,
+            )
+            db.add(bot_turn)
+            db.commit()
+
+            return {
+                "session_id": session_id,
+                "step": 1,
+                "awaiting": [m[0] for m in missing],
+                "bot_message": bot_message,
+            }
+
+        # All required fields present — advance to step 2 (reuse step-2 logic)
+        session.step = 2
+        session.updated_at = utcnow()
+
+        platform_display = fields.get("platform") or "Unknown"
+        bot_message = (
+            f"Got it — **{fields['name']}** on **{platform_display}** "
+            f"({fields['type']}, {fields['difficulty']}).\n\n"
+            "Now, optionally:\n"
+            "• Paste one or more **target addresses** (IP, URL, or `nc host port`; "
+            "separate several with `+`) if you have them.\n"
+            "• Attach a **challenge file** using the upload button.\n\n"
+            "And in one sentence or more: **what is your goal for this challenge?** "
+            "(This becomes the challenge description.)\n\n"
+            "Send your message when ready — the challenge will be created immediately."
+        )
+        bot_turn = IntakeTurnModel(
+            id=_uuid_mod.uuid4().hex,
+            session_id=session_id,
+            role="assistant",
+            content=bot_message,
+        )
+        db.add(bot_turn)
+        db.commit()
+
+        return {
+            "session_id": session_id,
+            "step": 2,
+            "bot_message": bot_message,
         }
 
     # ------------------------------------------------------------------
-    # TURN 2: collect optional target / files / goal, then create
+    # TURN 2: collect description (+ optional target/files), then create
     # ------------------------------------------------------------------
     if step == 2:
         description = (req.description or "").strip()
@@ -312,22 +487,42 @@ async def send_chat_message(
                 detail="Please include a description / goal for the challenge.",
             )
 
+        # Persist user turn
+        user_turn_content = f"Target: {req.target_address or 'None'}\nGoal/Description: {description}"
+        user_turn = IntakeTurnModel(
+            id=_uuid_mod.uuid4().hex,
+            session_id=session_id,
+            role="user",
+            content=user_turn_content,
+        )
+        db.add(user_turn)
+
+        # Build transcript for LLM (may be used for step-2 bot message)
+        prior_turns = db.query(IntakeTurnModel).filter(
+            IntakeTurnModel.session_id == session_id
+        ).order_by(IntakeTurnModel.created_at.asc()).all()
+        transcript = [{"role": t.role, "content": t.content} for t in prior_turns]
+
+        # Call interpret_operator_message to get a natural bot reply for turn 2
+        from backend.agents.challenge_intake import interpret_operator_message
+        model_result = await interpret_operator_message(transcript, fields)
+        bot_message = None
+        if model_result is not None:
+            bot_message = model_result.get("reply")
+
         # Merge any file paths uploaded before this turn (via /challenges/upload)
         extra_paths = [p for p in (req.attached_file_paths or []) if p and os.path.isfile(p)]
-        all_paths = session.get("uploaded_paths", []) + extra_paths
+        all_paths = fields.get("uploaded_paths", []) + extra_paths
 
-        # Build the same request object the form path uses. Difficulty comes from the
-        # conversation (normalized in step 1); multiple targets are joined with ' + '
-        # per the FORGE multi-target convention (Workstream F5), never commas.
         from backend.utils.challenge_normalize import normalize_targets
         creation_req = CreateChallengeRequest(
-            name=session["name"],
-            category=session["type"],
-            difficulty=session.get("difficulty") or "MEDIUM",
+            name=fields["name"],
+            category=fields["type"],
+            difficulty=fields.get("difficulty") or "MEDIUM",
             description=description,
             target_address=normalize_targets(req.target_address),
             working_directory="",
-            platform_name=session["platform"],
+            platform_name=fields.get("platform"),
             requires_root=False,
             flag_pattern="",
             max_iterations=0,
@@ -336,11 +531,34 @@ async def send_chat_message(
             attached_file_paths=all_paths or None,
         )
 
-        # Delegate entirely to the existing creation endpoint so logic is never forked.
-        # Remove session before awaiting to avoid double-commit on retry.
-        _CHAT_SESSIONS.pop(session_id, None)
+        # Mark session committed BEFORE awaiting create_challenge to avoid
+        # double-commit on retry.
+        session.status = "COMMITTED"
+        session.updated_at = utcnow()
+        db.commit()
 
         challenge_row = await create_challenge(creation_req, db)
+
+        # Store challenge_id on the session for traceability
+        session.challenge_id = challenge_row.id
+        db.commit()
+
+        # If LLM didn't give a reply, use a default commit message
+        if not bot_message:
+            bot_message = (
+                f"Challenge **{challenge_row.name}** created successfully! "
+                f"Redirecting you to the challenges list…"
+            )
+
+        # Persist final assistant turn
+        bot_turn = IntakeTurnModel(
+            id=_uuid_mod.uuid4().hex,
+            session_id=session_id,
+            role="assistant",
+            content=bot_message,
+        )
+        db.add(bot_turn)
+        db.commit()
 
         # Seed initial creation exchange into ChatMessageModel for durable history
         try:
@@ -349,10 +567,11 @@ async def send_chat_message(
                 "Please tell me:\n"
                 "1. **Challenge name** — what is this challenge called?\n"
                 "2. **Platform / event name** — e.g. PicoCTF, HackTheBox, DEF CON, …\n"
-                "3. **Challenge type** — e.g. Web, Pwn, Crypto, Forensics, Rev, or anything you like."
+                "3. **Category** — e.g. Web, Pwn, Crypto, Forensics, Rev, or anything you like."
             )
-            user_turn1 = f"Challenge Name: {session['name']}\nPlatform: {session['platform']}\nType: {session['type']}"
-            bot_turn2 = f"Got it — **{session['name']}** on **{session['platform']}** ({session['type']})."
+            platform_for_seed = fields.get("platform") or "Unknown"
+            user_turn1 = f"Challenge Name: {fields['name']}\nPlatform: {platform_for_seed}\nCategory: {fields['type']}"
+            bot_turn2 = f"Got it — **{fields['name']}** on **{platform_for_seed}** ({fields['type']})."
             user_turn2 = f"Target: {req.target_address or 'None'}\nGoal/Description: {description}"
             bot_turn3 = f"Challenge **{challenge_row.name}** created successfully!"
 
@@ -367,14 +586,30 @@ async def send_chat_message(
         except Exception as seed_err:
             logger.debug(f"Failed to seed creation chat messages: {seed_err}")
 
+        # Build a plain dict for the challenge to avoid SQLAlchemy serialization issues
+        challenge_dict = {
+            "id": challenge_row.id,
+            "name": challenge_row.name,
+            "category": challenge_row.category,
+            "difficulty": challenge_row.difficulty,
+            "description": challenge_row.description,
+            "target_address": challenge_row.targets[0].current_address if challenge_row.targets else "",
+            "working_directory": challenge_row.working_directory,
+            "platform_name": challenge_row.platform_name,
+            "status": challenge_row.status,
+            "progress": challenge_row.progress,
+            "flag_status": challenge_row.flag_status,
+            "flag": challenge_row.flag,
+            "created_at": challenge_row.created_at.isoformat() if challenge_row.created_at else None,
+            "started_at": challenge_row.started_at.isoformat() if challenge_row.started_at else None,
+            "mission_plan": challenge_row.mission_plan,
+        }
+
         return {
             "session_id": session_id,
             "step": "committed",
-            "bot_message": (
-                f"Challenge **{challenge_row.name}** created successfully! "
-                f"Redirecting you to the challenges list…"
-            ),
-            "challenge": challenge_row,
+            "bot_message": bot_message,
+            "challenge": challenge_dict,
         }
 
     # Should never reach here

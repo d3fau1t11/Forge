@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Terminal as TerminalIcon, 
   Search, 
@@ -29,6 +29,37 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [isExecuting, setIsExecuting] = useState(false);
 
   const [userLogs, setUserLogs] = useState<TerminalLog[]>([]);
+  const [historyLogs, setHistoryLogs] = useState<TerminalLog[]>([]);
+  const historyLoadedRef = useRef<Set<string>>(new Set());
+
+  // Fetch terminal history on mount and when challenge changes
+  useEffect(() => {
+    if (!activeChallengeId || historyLoadedRef.current.has(activeChallengeId)) return;
+
+    const loadHistory = async () => {
+      try {
+        const history = await apiService.getTerminalHistory(activeChallengeId, 200);
+        const mappedLogs: TerminalLog[] = history.map((entry: any) => ({
+          id: entry.id,
+          timestamp: entry.created_at ? new Date(entry.created_at).toLocaleTimeString() : '--:--:--',
+          type: 'FORGE TOOL EXECUTION' as const,
+          command: entry.command,
+          output: entry.stdout || entry.stderr || '',
+          exitCode: entry.exit_code ?? 0,
+          duration: entry.duration_ms ? `${(entry.duration_ms / 1000).toFixed(1)}s` : '0.0s',
+          privilege: 'SAFE' as const,
+          agent: 'operator',
+          challengeId: entry.challenge_id,
+        }));
+        setHistoryLogs(mappedLogs);
+        historyLoadedRef.current.add(activeChallengeId);
+      } catch (err) {
+        console.warn('Failed to load terminal history:', err);
+      }
+    };
+
+    loadHistory();
+  }, [activeChallengeId]);
 
   const handleCopy = (id: string, text: string) => {
     soundEngine.playClick();
@@ -61,7 +92,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }
   };
 
-  const currentLogs = (logs && logs.length > 0 ? logs : userLogs) || [];
+  // Combine history logs (older) with live logs (newer)
+  // Live logs from websocket come in via `logs` prop, user logs from manual execution
+  const currentLogs = [...historyLogs, ...(logs && logs.length > 0 ? logs : userLogs)];
 
   const filteredLogs = currentLogs.filter((l) => {
     if (activeTab === 'forge_tools' && l.type !== 'FORGE TOOL EXECUTION' && l.type !== 'EXECUTION') return false;

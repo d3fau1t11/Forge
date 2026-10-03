@@ -488,6 +488,26 @@ export class ApiService {
     return await res.json();
   }
 
+  public async getTerminalHistory(challengeId?: string, limit: number = 200) {
+    try {
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (challengeId) params.set('challenge_id', challengeId);
+      const res = await apiFetch(`${API_BASE_URL}/terminal/history?${params.toString()}`);
+      if (!res.ok) {
+        this.isOnline = false;
+        this.lastError = `HTTP ${res.status}`;
+        throw new Error(`HTTP ${res.status}`);
+      }
+      this.isOnline = true;
+      this.lastError = null;
+      return await res.json();
+    } catch (e: any) {
+      this.isOnline = false;
+      this.lastError = e?.message || 'Network Error';
+      throw e;
+    }
+  }
+
   // ----------------------------------------------------
   // PRIVILEGE MANAGER
   // ----------------------------------------------------
