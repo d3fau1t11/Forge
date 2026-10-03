@@ -1,6 +1,7 @@
 import os
 import sys
 import shutil
+import asyncio
 import logging
 from typing import Optional
 from backend.providers.base import BaseProvider
@@ -47,3 +48,21 @@ class BaseCLIProvider(BaseProvider):
 
     async def is_available(self) -> bool:
         return self.find_executable() is not None
+
+    async def get_version(self) -> str:
+        """Return the CLI tool's version string, or 'unknown' if unavailable."""
+        exe = self.find_executable()
+        if not exe:
+            return "not installed"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                exe, "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            output = (stdout or stderr).decode(errors="replace").strip()
+            # Take first line only
+            return output.splitlines()[0] if output else "unknown"
+        except Exception:
+            return "unknown"

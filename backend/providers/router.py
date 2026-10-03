@@ -332,6 +332,12 @@ class ModelRouter:
             # Gemini stays vision + report only (Workstream C): a direct request for a
             # Gemini model on a solving capability falls through to the capability chain.
             gemini_blocked = provider_name == "gemini" and capability not in self.GEMINI_ALLOWED_CAPABILITIES
+
+            # Model-level breaker check for direct model requests (B3)
+            if quota_manager.is_tripped(provider_name, model=target_model, capability=capability):
+                logger.info(f"[ModelRouter] Model '{target_model}' on provider '{provider_name}' is circuit-broken for capability '{capability}'. Skipping direct request.")
+                gemini_blocked = True  # Force fallback to capability chain
+
             if not gemini_blocked and not quota_manager.is_blacklisted_for_session(provider_name):
                 provider = self.providers.get(provider_name)
                 if provider and await provider.is_available():
@@ -407,6 +413,28 @@ class ModelRouter:
         skip_quota_limited = quota_manager.should_skip_quota_limited_models()
         candidates = list(self.DEFAULT_ROUTING_MAP.get(capability, ["openrouter", "gemini", "cloudflare"]))
 
+        # --- Dynamic routing: filter to models discovery verified as present-and-callable ---
+        # Use discovery_service's catalog as a whitelist; append discovered alternatives
+        try:
+            from backend.providers.discovery import discovery_service
+            for provider_name in list(candidates):
+                health = discovery_service.health_for(provider_name)
+                if health is None:
+                    # Provider not probed yet — keep it as ordering hint
+                    continue
+                if health.health_status == "unavailable":
+                    # Provider completely down — remove from chain
+                    candidates.remove(provider_name)
+                    continue
+                if health.catalog_models:
+                    # Provider is healthy and has a catalog: ensure its DEFAULT model is in catalog
+                    if health.default_model_present is False:
+                        # Default model missing from live catalog — remove this provider
+                        candidates.remove(provider_name)
+                        continue
+        except Exception:
+            pass  # Discovery not ready; fall back to static map
+
         if speed_tier:
             # Sort providers matching requested speed_tier first
             candidates.sort(key=lambda p_name: 0 if getattr(self.providers.get(p_name), "speed_tier", "fast") == speed_tier else 1)
@@ -429,6 +457,27 @@ class ModelRouter:
             # (provider, capability) pair — is currently tripped.
             if quota_manager.is_tripped(provider_name, capability=capability):
                 continue
+
+            # Model-level breaker check: if discovery knows the provider's default model
+            # and it's tripped as (provider::model::capability), skip this provider.
+            try:
+                from backend.providers.discovery import discovery_service
+                health = discovery_service.health_for(provider_name)
+                if health and health.catalog_models:
+                    # Get the default model this provider would use
+                    default_model = getattr(self.providers.get(provider_name), "default_model", "") or ""
+                    # Check model-level breaker for the provider's default model.
+                    # Discovery trips the *two-part* key (provider::model) when the
+                    # default model is missing from the live catalog (HTTP 404) —
+                    # i.e. exactly when `default_model in health.catalog_models` is
+                    # False. Guarding on catalog membership skipped the check in the
+                    # one case that matters, leaving the breaker inert.
+                    if default_model and quota_manager.is_tripped(provider_name, model=default_model):
+                        continue
+                    if default_model and quota_manager.is_tripped(provider_name, model=default_model, capability=capability):
+                        continue
+            except Exception:
+                pass
 
             # Apply the quota-window decision computed above. The direct
             # target-model path already honours it; without this the fallback

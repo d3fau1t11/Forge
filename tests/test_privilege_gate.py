@@ -73,6 +73,23 @@ def _manual_mode():
 def _auto_mode():
     return patch.object(settings, "FORGE_APPROVAL_MODE", "auto")
 
+
+def _offline_planning():
+    """Stub the pre-flight mission plan for tests that drive the REAL loop.
+
+    `orchestrator_loop` patches only its own `model_router` binding, but
+    `strategic_planner` holds a *separate* reference to the live router — so
+    `generate_initial_plan()` makes a real provider call before the loop ever reaches
+    the approval gate. When the provider cascade is degraded (quota exhausted, rate
+    limited, model gone) that call stalls the loop past the test timeout, which is how
+    this suite flaked intermittently. Plan content is irrelevant to the gate
+    assertions, so stub it out.
+    """
+    return patch(
+        "backend.agents.orchestrator_loop.strategic_planner.generate_initial_plan",
+        AsyncMock(return_value={"tasks": []}),
+    )
+
 def _broadcast_events(broadcast) -> list:
     """The events actually pushed to the operator console, in order.
 
@@ -579,6 +596,7 @@ class TestLegacyLoopIsGated(_GateTestBase):
             with patch.object(loop_module, "model_router") as mock_router, \
                  patch.object(loop_module, "tool_manager") as mock_tm, \
                  patch.object(loop_module.workflow_runner, "is_cancelled", cancelled), \
+                 _offline_planning(), \
                  patch("backend.agents.orchestrator_loop.ws_manager.broadcast", AsyncMock()), \
                  _manual_mode():
                 mock_router.route_request = AsyncMock(
@@ -645,6 +663,7 @@ class TestLegacyLoopIsGated(_GateTestBase):
             with patch.object(loop_module, "model_router") as mock_router, \
                  patch.object(loop_module, "tool_manager") as mock_tm, \
                  patch.object(loop_module.workflow_runner, "is_cancelled", cancelled), \
+                 _offline_planning(), \
                  patch("backend.agents.orchestrator_loop.ws_manager.broadcast", AsyncMock()) as mock_bcast, \
                  _manual_mode():
                 mock_router.route_request = AsyncMock(

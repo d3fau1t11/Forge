@@ -12,7 +12,7 @@ drive them in one cycle:
    verbatim from blackboard state — never from an LLM — so nothing can be
    fabricated or have its confidence upgraded during summarization. Only the
    narrative fields (Hypothesis / Blocked on) come from a STRICTLY EXTRACTIVE
-   Gemini pass, and even that is optional: if the summarizer is absent or fails,
+   summarizer pass, and even that is optional: if the summarizer is absent or fails,
    deterministic placeholders are used and the report is still emitted.
 
 2. SUGGESTION PARSING (parse_suggestions)
@@ -39,7 +39,7 @@ _SUGGESTION_DELIMITER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Strictly-extractive prompt for the (optional) Gemini narrative pass. The
+# Strictly-extractive prompt for the (optional) summarizer narrative pass. The
 # factual fields are already fixed by the deterministic layer; this only fills
 # Hypothesis / Blocked-on, and is forbidden from inferring or inventing flags.
 _EXTRACTIVE_REPORT_PROMPT = """\

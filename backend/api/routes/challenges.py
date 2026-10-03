@@ -218,8 +218,9 @@ async def start_chat_session(_req: ChatSessionStartRequest = None):
             "Please tell me:\n"
             "1. **Challenge name** — what is this challenge called?\n"
             "2. **Platform / event name** — e.g. PicoCTF, HackTheBox, DEF CON, …\n"
-            "3. **Challenge type** — e.g. Web, Pwn, Crypto, Forensics, Rev, or anything you like.\n\n"
-            "You can answer all three in one message."
+            "3. **Challenge type / category** — e.g. Web, Pwn, Crypto, Forensics, Rev, Recon, Stego, Mobile, Hardware, AI, or anything you like.\n"
+            "4. **Difficulty** — EASY, MEDIUM, HARD, or INSANE.\n\n"
+            "You can answer all four in one message, or just start with what you know."
         ),
     }
 

@@ -215,12 +215,14 @@ class DiscoveryService:
             quota_manager.trip_breaker(name, default_model, reason=f"404 default model '{default_model}' not in live catalog")
 
     def _persist(self, health: ProviderHealth) -> None:
-        """Persist provider health to the providers table (best-effort, never raises)."""
+        """Persist provider health to the providers table AND each discovered model to the models table.
+        Best-effort, never raises."""
         try:
             from backend.database.session import SessionLocal
-            from backend.database.models import ProviderConfigModel
+            from backend.database.models import ProviderConfigModel, ModelConfigModel
             db = SessionLocal()
             try:
+                # Provider-level health
                 row = db.query(ProviderConfigModel).filter(ProviderConfigModel.name == health.name).first()
                 if row is None:
                     row = ProviderConfigModel(name=health.name)
@@ -228,11 +230,107 @@ class DiscoveryService:
                 row.latency_ms = health.latency_ms
                 row.health_status = health.health_status
                 row.api_key_configured = health.auth_ok
+
+                # Per-model catalog + context window
+                if health.catalog_models:
+                    # Map common model names to known context windows (provider-specific)
+                    context_map = self._context_window_map(health.name)
+                    for model_name in health.catalog_models:
+                        mrow = (db.query(ModelConfigModel)
+                                .filter(ModelConfigModel.provider_name == health.name)
+                                .filter(ModelConfigModel.model_name == model_name)
+                                .first())
+                        if mrow is None:
+                            mrow = ModelConfigModel(
+                                provider_name=health.name,
+                                model_name=model_name,
+                                capability="general_reasoning",  # default; provider-specific logic can override
+                                context_length=context_map.get(model_name, 8192),
+                                enabled=True,
+                            )
+                            db.add(mrow)
+                        else:
+                            # Update context length if we have better info
+                            if model_name in context_map:
+                                mrow.context_length = context_map[model_name]
+                            mrow.enabled = True
                 db.commit()
             finally:
                 db.close()
         except Exception as e:
             logger.debug(f"[Discovery] persist skip for {health.name}: {e}")
+
+    def _context_window_map(self, provider_name: str) -> dict:
+        """Return a mapping of model_name -> context_length for the given provider.
+        These are best-known values from provider catalogs/documentation."""
+        name = (provider_name or "").lower()
+        if name == "gemini":
+            return {
+                "gemini-3.6-flash": 1000000,
+                "gemini-1.5-pro": 2000000,
+                "gemini-1.5-flash": 1000000,
+                "gemini-2.0-flash": 1000000,
+                "gemini-2.0-pro": 2000000,
+            }
+        if name == "nvidia":
+            return {
+                "deepseek-ai/deepseek-v4-pro-0813": 131072,
+                "nvidia/nemotron-3.5-lightning-30b-a3b": 131072,
+                "nvidia/nemotron-3-ultra-550b-a55b": 131072,
+                "moonshotai/kimi-k3": 131072,
+            }
+        if name == "groq":
+            return {
+                "qwen/qwen3.8-27b": 131072,
+                "openai/gpt-oss-120b": 131072,
+                "groq/compound": 131072,
+                "llama-3.1-70b-versatile": 131072,
+                "llama-3.1-8b-instant": 131072,
+                "mixtral-8x7b-32768": 32768,
+            }
+        if name == "openrouter":
+            return {
+                "z-ai/glm-5.3-flash": 131072,
+                "z-ai/glm-5.3": 131072,
+                "deepseek/deepseek-chat": 65536,
+                "deepseek/deepseek-r1": 131072,
+            }
+        if name == "cloudflare":
+            return {
+                "@cf/meta/llama-3.1-8b-instruct": 131072,
+                "@cf/meta/llama-3.2-11b-vision-instruct": 131072,
+            }
+        if name == "mistral":
+            return {
+                "codestral-latest": 256000,
+                "codestral-2508": 256000,
+                "mistral-small-latest": 32768,
+                "mistral-medium-latest": 32768,
+                "mistral-medium-3.5": 32768,
+                "magistral-medium-latest": 32768,
+                "magistral-small-latest": 32768,
+                "ministral-8b-latest": 32768,
+            }
+        if name == "xkiro" or name == "xkiro_coder" or name == "xkiro_planner" or name == "xkiro_mistral":
+            return {
+                "sensenova/sensenova-6.8-flash-lite": 262144,
+                "sensenova/sensenova-6.7-flash-lite": 262144,
+                "mistralai/codestral-2508": 256000,
+                "mistralai/devstral-medium": 256000,
+                "mistralai/mistral-large-2512": 131072,
+                "mistralai/ministral-8b": 131072,
+                "mistralai/ministral-3b": 131072,
+                "mistralai/ministral-14b": 131072,
+                "mistralai/mistral-medium-3.5": 131072,
+                "mistralai/mistral-small-2603": 131072,
+            }
+        if name == "rapidapi_gpt54_mini":
+            return {"gpt-5.4-mini": 131072}
+        if name == "rapidapi_deepseek_v32":
+            return {"DeepSeek-V3.2": 65536}
+        if name == "rapidapi_gpt5_nano":
+            return {"GPT-5-nano": 131072}
+        return {}
 
 
 # Module-level singleton.

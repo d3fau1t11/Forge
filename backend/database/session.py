@@ -96,6 +96,10 @@ MIGRATIONS = [
     (19, "ALTER TABLE targets ADD COLUMN address_history JSON"),
     (20, "ALTER TABLE targets ADD COLUMN discovery_method VARCHAR DEFAULT 'FORGE Auto Ingest'"),
     (21, "ALTER TABLE challenges ADD COLUMN approval_mode VARCHAR DEFAULT NULL"),
+    # Workstream B/D: Ensure ModelConfigModel table exists for per-model context windows.
+    # Base.metadata.create_all() creates it on fresh DBs; this migration covers pre-existing
+    # databases that were created before ModelConfigModel was added to models.py.
+    (22, "CREATE TABLE IF NOT EXISTS models (id VARCHAR PRIMARY KEY, provider_name VARCHAR NOT NULL, model_name VARCHAR NOT NULL, capability VARCHAR NOT NULL, context_length INTEGER DEFAULT 8192, cost_per_1k_input FLOAT DEFAULT 0.0, cost_per_1k_output FLOAT DEFAULT 0.0, enabled BOOLEAN DEFAULT 1)"),
 ]
 
 # SQLite's exact wording for ADD COLUMN on a column that already exists

@@ -520,15 +520,32 @@ class AgentRuntime:
 
             recent = self.trajectory.get_recent(
                 session.id, n=8, event_types=["COMMAND", "OBSERVATION", "REPLAN", "RECOVERY"])
+            
+            # Determine the model to budget for: prefer the model that will actually be used
+            # for this capability (avoids one-turn lag when provider fallback switches models).
+            # Fall back to session.model_name (previous turn) if no routing hint available.
+            budget_model = getattr(session, "model_name", "") or ""
+            try:
+                from backend.providers.router import model_router
+                candidates = model_router.DEFAULT_ROUTING_MAP.get(state.phase, [])
+                if candidates:
+                    # Use the first viable provider's default model as budget hint
+                    for p_name in candidates:
+                        provider = model_router.providers.get(p_name)
+                        if provider and getattr(provider, "default_model", None):
+                            budget_model = provider.default_model
+                            break
+            except Exception:
+                pass
+
             system_instruction, user_prompt = self.context.build(
                 state=state, latest_observation=None, recent_events=recent,
                 recovery_directive=recovery_directive, memory_context=memory_context,
                 tool_inventory=self._tool_inventory, python_libs=self._python_libs,
                 detected_os=self._detected_os, cross_session_failures=cross_session_failures,
-                # Budget/compact against the model the last turn used (Workstream D). Empty on
-                # turn 1 (budgeting disabled); a mid-run model switch is picked up next turn,
-                # so the budget always tracks the model actually in use (D3 fallback-aware).
-                model_name=getattr(session, "model_name", "") or "",
+                # Budget/compact against the model expected for this capability (Workstream D).
+                # Falls back to session.model_name (previous turn) if routing unavailable.
+                model_name=budget_model,
             )
 
             # ── (Step 4) ask model for next action ──

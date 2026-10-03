@@ -228,7 +228,17 @@ class AnswerResolver:
             inner = m.group(0)
             brace = inner.find("{")
             if brace != -1 and inner.rstrip().endswith("}"):
-                subject = inner[brace + 1:inner.rstrip().rfind("}")]
+                body = inner[brace + 1:inner.rstrip().rfind("}")]
+                # Reject placeholder/template flag bodies:
+                # - Variable references: $var, ${var}, %s, {{var}}
+                # - Angle-bracket placeholders: <name>, <flag>, <value>
+                # - Underscore placeholders: your_flag_here, flag_here, insert_here
+                # - Bare dummy words: flag, value, answer, x, todo, redacted, tbd
+                if re.search(r"\$\w+|\$\{\w+\}|%s|{{|}}|<\w+>|_here\b", body):
+                    return True
+                if re.search(r"^\w+$", body) and body.lower() in {"flag", "value", "answer", "x", "todo", "redacted", "tbd", "content", "name", "flag_here"}:
+                    return True
+                subject = body
             # Check for non-whitespace context surrounding the envelope — anything
             # outside a clean `prefix{...}` structure signals string interpolation.
             pre = value[:m.start()].strip()

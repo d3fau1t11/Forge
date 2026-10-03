@@ -6,11 +6,11 @@ import {
   Server, 
   ArrowDown, 
   Globe,
-  Plus,
   Shield,
   Search,
   Activity,
-  Link2
+  Link2,
+  MessageSquare
 } from 'lucide-react';
 import { Target } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
@@ -27,6 +27,7 @@ interface TargetsProps {
     target: string;
     description: string;
   }) => void;
+  onOpenChatCreation?: () => void;
   onNavigateTab?: (tab: any) => void;
 }
 
@@ -35,20 +36,14 @@ export const Targets: React.FC<TargetsProps> = ({
   onRediscover,
   onVerify,
   onRebind,
-  onCreateTarget,
+  onOpenChatCreation,
   onNavigateTab
 }) => {
   const [selectedTargetId, setSelectedTargetId] = useState<string>(targets[0]?.id || '');
-  const [showModal, setShowModal] = useState(false);
   const [showRebindModal, setShowRebindModal] = useState(false);
   const [rebindAddress, setRebindAddress] = useState('');
   const [rebindLoading, setRebindLoading] = useState(false);
   const [rebindError, setRebindError] = useState<string | null>(null);
-  const [targetIp, setTargetIp] = useState('');
-  const [targetName, setTargetName] = useState('');
-  const [targetCategory, setTargetCategory] = useState<'WEB' | 'PWN' | 'REV' | 'CRYPTO' | 'FORENSICS' | 'RECON'>('WEB');
-  const [targetDifficulty, setTargetDifficulty] = useState<'EASY' | 'MEDIUM' | 'HARD' | 'INSANE'>('MEDIUM');
-  const [targetDesc, setTargetDesc] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
 
   const activeTarget = targets.find((t) => t.id === selectedTargetId) || targets[0];
@@ -56,11 +51,6 @@ export const Targets: React.FC<TargetsProps> = ({
   const handleSelectTarget = (id: string) => {
     soundEngine.playClick();
     setSelectedTargetId(id);
-  };
-
-  const handleOpenModal = () => {
-    soundEngine.playClick();
-    setShowModal(true);
   };
 
   const handleOpenRebindModal = () => {
@@ -99,25 +89,13 @@ export const Targets: React.FC<TargetsProps> = ({
     }
   };
 
-  const handleFormSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!targetIp.trim() || !targetName.trim()) return;
-
-    soundEngine.playFanfare();
-    if (onCreateTarget) {
-      onCreateTarget({
-        name: targetName,
-        category: targetCategory,
-        difficulty: targetDifficulty,
-        target: targetIp,
-        description: targetDesc || `Target ${targetName} bound to IP ${targetIp}`
-      });
+  const handleOpenChatCreation = () => {
+    soundEngine.playClick();
+    if (onOpenChatCreation) {
+      onOpenChatCreation();
+    } else if (onNavigateTab) {
+      onNavigateTab('challenges');
     }
-
-    setTargetIp('');
-    setTargetName('');
-    setTargetDesc('');
-    setShowModal(false);
   };
 
   const filteredTargets = targets.filter(t => 
@@ -168,11 +146,11 @@ export const Targets: React.FC<TargetsProps> = ({
           )}
 
           <button
-            onClick={handleOpenModal}
+            onClick={handleOpenChatCreation}
             className="px-4 py-1.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-1.5 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all uppercase"
           >
-            <Plus className="w-4 h-4" />
-            <span>REGISTER TARGET</span>
+            <MessageSquare className="w-4 h-4" />
+            <span>NEW CHALLENGE (CHAT)</span>
           </button>
         </div>
       </div>
@@ -188,16 +166,16 @@ export const Targets: React.FC<TargetsProps> = ({
               NO TARGET IDENTITIES REGISTERED
             </h2>
             <p className="text-xs text-slate-400 font-mono leading-relaxed">
-              No target host IP or domain is active in the matrix. Register a new target identity or start a challenge to initiate target tracking.
+              No target host IP or domain is active in the matrix. Start a challenge to initiate target tracking.
             </p>
           </div>
           <div className="flex items-center space-x-3 pt-2">
             <button
-              onClick={handleOpenModal}
+              onClick={handleOpenChatCreation}
               className="px-6 py-2.5 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs flex items-center space-x-2 shadow-[0_0_20px_rgba(0,240,255,0.4)] hover:scale-105 transition-all uppercase tracking-wider"
             >
-              <Plus className="w-4 h-4" />
-              <span>REGISTER NEW TARGET</span>
+              <MessageSquare className="w-4 h-4" />
+              <span>CREATE CHALLENGE (CHAT)</span>
             </button>
 
             {onNavigateTab && (
@@ -374,120 +352,6 @@ export const Targets: React.FC<TargetsProps> = ({
               </div>
             </div>
           )}
-        </div>
-      )}
-
-      {/* TARGET INITIALIZATION MODAL */}
-      {showModal && (
-        <div className="fixed inset-0 bg-obsidian-950/80 backdrop-blur-md flex items-center justify-center p-4 z-50">
-          <div className="glass-panel border-2 border-cyber-cyan/60 rounded-xl max-w-lg w-full p-6 space-y-5 shadow-[0_0_40px_rgba(0,240,255,0.25)] cyber-corner">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <div className="flex items-center space-x-2">
-                <TargetIcon className="w-5 h-5 text-cyber-cyan" />
-                <h2 className="text-sm font-display font-bold text-slate-100 uppercase neon-text-cyan">
-                  REGISTER TARGET IDENTITY
-                </h2>
-              </div>
-              <button 
-                onClick={() => setShowModal(false)}
-                className="text-slate-400 hover:text-slate-100 font-bold"
-              >
-                ✕
-              </button>
-            </div>
-
-            <form onSubmit={handleFormSubmit} className="space-y-4 text-xs font-mono">
-              <div>
-                <label className="block text-slate-300 mb-1 font-bold">Target IP / Hostname *</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. 10.10.14.23 or target.ctf"
-                  value={targetIp}
-                  onChange={(e) => setTargetIp(e.target.value)}
-                  className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan transition-colors"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-300 mb-1 font-bold">Challenge / Target Name *</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. VAULT_RECON"
-                  value={targetName}
-                  onChange={(e) => setTargetName(e.target.value)}
-                  className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan transition-colors"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-slate-300 mb-1 font-bold">Category (Typeable)</label>
-                  <input
-                    type="text"
-                    list="target-category-suggestions"
-                    value={targetCategory}
-                    onChange={(e) => setTargetCategory(e.target.value as any)}
-                    placeholder="e.g. WEB, PWN, OSINT..."
-                    className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan font-mono uppercase"
-                  />
-                  <datalist id="target-category-suggestions">
-                    <option value="WEB" />
-                    <option value="PWN" />
-                    <option value="REV" />
-                    <option value="CRYPTO" />
-                    <option value="FORENSICS" />
-                    <option value="RECON" />
-                    <option value="OSINT" />
-                    <option value="MISC" />
-                    <option value="CLOUD" />
-                  </datalist>
-                </div>
-
-                <div>
-                  <label className="block text-slate-300 mb-1 font-bold">Difficulty</label>
-                  <select
-                    value={targetDifficulty}
-                    onChange={(e) => setTargetDifficulty(e.target.value as any)}
-                    className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan transition-colors"
-                  >
-                    <option value="EASY">EASY</option>
-                    <option value="MEDIUM">MEDIUM</option>
-                    <option value="HARD">HARD</option>
-                    <option value="INSANE">INSANE</option>
-                  </select>
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-slate-300 mb-1 font-bold">Target Notes / Description</label>
-                <textarea
-                  rows={3}
-                  placeholder="Target details, scope notes, or flag format (e.g. HTB{...})"
-                  value={targetDesc}
-                  onChange={(e) => setTargetDesc(e.target.value)}
-                  className="w-full bg-obsidian-950 border border-slate-800 rounded-lg p-2.5 text-slate-100 focus:outline-none focus:border-cyber-cyan transition-colors resize-none"
-                />
-              </div>
-
-              <div className="flex items-center justify-end space-x-3 pt-3 border-t border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setShowModal(false)}
-                  className="px-4 py-2 rounded-lg bg-obsidian-900 border border-slate-700 text-slate-300 font-bold hover:bg-slate-800 transition-colors"
-                >
-                  CANCEL
-                </button>
-                <button
-                  type="submit"
-                  className="px-6 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all uppercase"
-                >
-                  INITIALIZE TARGET
-                </button>
-              </div>
-            </form>
-          </div>
         </div>
       )}
 

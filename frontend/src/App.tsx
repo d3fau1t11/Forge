@@ -42,6 +42,7 @@ import { SystemView } from './components/Pages/SystemView';
 import { ChallengeWorkspace } from './components/Pages/ChallengeWorkspace';
 import { KnowledgeCoverage } from './components/Pages/KnowledgeCoverage';
 import { ExperienceMemory } from './components/Pages/ExperienceMemory';
+import { NewChallengeChat } from './components/Pages/NewChallengeChat';
 import { apiService, apiFetch } from './services/api';
 import { AlertTriangle, X } from 'lucide-react';
 import { soundEngine } from './utils/soundEngine';
@@ -98,6 +99,7 @@ export default function App() {
   const [activeChallenge, setActiveChallenge] = useState<Challenge | null>(null);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [showModalKillSwitch, setShowModalKillSwitch] = useState(false);
+  const [showChatCreation, setShowChatCreation] = useState(false);
   const [operationalMode, setOperationalMode] = useState<string>('CTF_OFFENSIVE_CONTROLLED');
   const [fallbackNotice, setFallbackNotice] = useState<{
     failedProvider: string;
@@ -853,92 +855,6 @@ export default function App() {
   };
 
 
-  const handleCreateChallenge = async (newCh: {
-    name: string;
-    category: any;
-    difficulty: any;
-    target: string;
-    description: string;
-    workingDirectory?: string;
-    platformName?: string;
-    requiresRoot?: boolean;
-    flagPattern?: string;
-    maxIterations?: number;
-    maxMinutes?: number;
-    instanceExpiryMinutes?: number;
-    attachedFilePaths?: string[];
-  }) => {
-    const tempId = `ch-${Date.now()}`;
-    pendingTempIdsRef.current.add(tempId);
-
-    const createdLocally: Challenge = {
-      id: tempId,
-      name: newCh.name,
-      category: newCh.category,
-      difficulty: newCh.difficulty,
-      target: newCh.target,
-      status: 'RUNNING',
-      progress: 0,
-      lastActivity: 'Just now',
-      flagStatus: 'UNFOUND',
-      description: newCh.description,
-      workingDirectory: newCh.workingDirectory,
-      platformName: newCh.platformName
-    };
-    setChallenges((prev) => [createdLocally, ...prev]);
-
-    const newTargetObj: Target = {
-      id: `TARGET-${Math.floor(1000 + Math.random() * 9000)}`,
-      currentIp: newCh.target,
-      hostname: `${newCh.name.toLowerCase()}.ctf`,
-      services: [
-        { port: 80, proto: 'tcp', service: 'HTTP', version: 'Target Server' }
-      ],
-      technologies: ['HTTP', 'Linux'],
-      status: 'VERIFIED',
-      discoveryMethod: 'FORGE Auto Ingest',
-      lastVerified: 'Just now',
-      addressHistory: [newCh.target],
-      challengeId: tempId
-    };
-    setTargets((prev) => [newTargetObj, ...prev]);
-
-    try {
-      const resp = await apiService.createChallenge({
-        name: newCh.name,
-        category: newCh.category,
-        difficulty: newCh.difficulty,
-        description: newCh.description,
-        target_address: newCh.target,
-        working_directory: newCh.workingDirectory,
-        platform_name: newCh.platformName,
-        requires_root: newCh.requiresRoot,
-        flag_pattern: newCh.flagPattern,
-        max_iterations: newCh.maxIterations,
-        max_minutes: newCh.maxMinutes,
-        instance_expiry_minutes: newCh.instanceExpiryMinutes,
-        attached_file_paths: newCh.attachedFilePaths
-      });
-      if (resp && resp.id) {
-        pendingTempIdsRef.current.delete(tempId);
-        setChallenges((prev) =>
-          prev.map((c) => (c.id === tempId ? { ...c, id: resp.id } : c))
-        );
-        setActiveChallenge((prev) =>
-          prev && prev.id === tempId ? { ...prev, id: resp.id } : prev
-        );
-        setTargets((prev) =>
-          prev.map((t) => (t.challengeId === tempId ? { ...t, challengeId: resp.id } : t))
-        );
-        // Resync from the API: the mission plan can race past the optimistic-id swap,
-        // so pull the freshly generated plan instead of relying on the WS event alone.
-        fetchBackendData();
-      }
-    } catch (e) {
-      console.warn('Backend API challenge creation offline fallback:', e);
-    }
-  };
-
   const handleToggleChallengeStatus = async (id: string) => {
     const current = challenges.find((c) => c.id === id);
     const isRunning = current?.status === 'RUNNING';
@@ -1082,6 +998,15 @@ export default function App() {
 
   const handleClearActiveChallenge = () => {
     setActiveChallenge(null);
+  };
+
+  const handleOpenChatCreation = () => {
+    setShowChatCreation(true);
+    setActiveTab('challenges');
+  };
+
+  const handleCloseChatCreation = () => {
+    setShowChatCreation(false);
   };
 
   // Newest RUNNING challenge first (avoids the dashboard locking onto the oldest zombie run);
@@ -1234,7 +1159,7 @@ export default function App() {
                     // Resync full state from backend to get canonical lineage
                     fetchBackendData();
                   }}
-                  onCreateTarget={handleCreateChallenge}
+                  onOpenChatCreation={handleOpenChatCreation}
                   onNavigateTab={(tab) => setActiveTab(tab)}
                 />
               )}
@@ -1323,6 +1248,16 @@ export default function App() {
         onRespond={handleRespondCommandApproval}
         onDismiss={handleDismissCommandApproval}
       />
+
+      {/* 8. Conversational Challenge Creation Modal */}
+      {showChatCreation && (
+        <NewChallengeChat
+          onOpenWorkspace={handleOpenChallengeWorkspace}
+          onRefreshBackendData={fetchBackendData}
+          setActiveTab={setActiveTab}
+          onClose={handleCloseChatCreation}
+        />
+      )}
     </div>
   );
 }

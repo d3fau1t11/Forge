@@ -517,7 +517,7 @@ class StrategicPlanner:
         # 2. Fallback to Next Best Model (AgentRouter Codex DeepSeek-V4-Flash / GLM-5.3)
         if not primary_success:
             try:
-                logger.info(f"[StrategicPlanner] Gemini unavailable or escalated; routing stuck review to AgentRouter Codex...")
+                logger.info(f"[StrategicPlanner] Primary model unavailable; routing stuck review to AgentRouter Codex...")
                 review_resp = await model_router.route_request(
                     prompt=prompt,
                     capability="code_analysis",
@@ -619,7 +619,7 @@ class StrategicPlanner:
         mutating any caller data.  Called once per exhausted strategy event;
         the caller writes the result to ``board.pivot_directive``.
 
-        Uses the same Gemini-first / DeepSeek-fallback chain as
+        Uses the same solving-chain / DeepSeek-fallback chain as
         ``review_and_adapt_plan``.
         """
         logger.info(

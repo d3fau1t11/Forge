@@ -38,5 +38,37 @@ class TestFlagBraceGuard(unittest.TestCase):
             self.assertEqual(m.group(0), real)
             self.assertFalse(FALSE_FLAG_PATTERNS.search(real), real)
 
+
+class TestAnswerResolverPlaceholderGuard(unittest.TestCase):
+    """The verifier must not promote templated bodies to real flags.
+
+    `picoCTF{$content}`, `FLAG{...}` and friends appear in tool output and LLM
+    prose as templates; capturing one yields a bogus "flag captured". The body
+    of a real flag is still accepted.
+    """
+
+    def setUp(self):
+        from backend.agent_runtime.verifier import AnswerResolver
+        self.resolver = AnswerResolver()
+
+    def _candidates(self, text):
+        return self.resolver.extract_candidates(text, task_context={"category": "web"})
+
+    def test_placeholder_bodies_rejected(self):
+        for placeholder in (
+            "picoCTF{$content}", "FLAG{...}", "FLAG{<name>}", "flag{your_flag_here}",
+            "picoCTF{flag}", "FLAG{value}", "picoCTF{%s}", "FLAG{{var}}",
+            "HTB{content}", "CTF{answer}",
+        ):
+            self.assertEqual(self._candidates(placeholder), [], placeholder)
+
+    def test_real_flags_accepted(self):
+        for real in (
+            "picoCTF{a1b2c3d4e5f6}", "FLAG{abcdef1234567890}",
+            "HTB{deadbeefcafebabe}", "flag{random123456789}",
+        ):
+            self.assertTrue(self._candidates(real), real)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,7 @@ _PATH_PATTERN = re.compile(
 )
 
 # Root-relative or directory-structured path: e.g. /app/data, /api/v1/user/123, uploads/2026/
+# Must have at least one path segment that is NOT a bare HTML tag or version number.
 _DIR_PATH_PATTERN = re.compile(
     r"""
     (?:\b|(?<=['"\s:=<>]))
@@ -53,6 +54,19 @@ _DIR_PATH_PATTERN = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+# HTML tags and version-like strings that should NEVER be treated as endpoints
+_DIR_PATH_BLOCKLIST = frozenset({
+    "/", "//", "/.", "/..",
+    # HTML tags
+    "/html", "/body", "/head", "/title", "/div", "/span", "/p", "/a", "/img", "/br", "/hr",
+    "/meta", "/link", "/script", "/style", "/input", "/form", "/button", "/select", "/option",
+    "/ul", "/ol", "/li", "/table", "/tr", "/td", "/th", "/thead", "/tbody", "/tfoot",
+    "/h1", "/h2", "/h3", "/h4", "/h5", "/h6", "/header", "/footer", "/nav", "/main",
+    "/section", "/article", "/aside", "/figure", "/figcaption", "/details", "/summary",
+    # Version-like patterns (single segment, dotted numbers)
+    # These are caught by the regex check below, but listed here for clarity
+})
 
 # Generic token / identifier pattern: e.g. 16+ hex chars, 20+ base64/url-safe token chars, UUIDs
 _UUID_PATTERN = re.compile(
@@ -298,12 +312,19 @@ def extract_generic_artifacts(text: str, base_url: str = "") -> List[CandidateAr
         clean = _clean_path(m)
         if not clean or clean in seen_values or clean.strip("/") in seen_values or len(clean) < 2:
             continue
-        if clean in ("/", "//", "/.", "/..", "/html", "/body", "/head"):
+        if clean in _DIR_PATH_BLOCKLIST:
             continue
+        # Reject single-segment paths that look like version numbers (e.g. /1.1, /3.12.3, /1.1.1f)
+        if re.match(r"^/\d+(?:\.\d+)+[a-z]?$", clean, re.IGNORECASE):
+            continue
+        # HTML-like single-segment paths (e.g. /title, /div, /body) are already
+        # covered by _DIR_PATH_BLOCKLIST above. Do NOT reject single lowercase
+        # segments by shape — that drops real endpoints (/flag, /login, /admin).
         seen_values.add(clean)
         seen_values.add(clean.strip("/"))
         norm_target = clean
-        if base_url:
+        # Do not resolve absolute local filesystem paths against a remote base URL
+        if base_url and not (clean.startswith("/") and re.match(r"^/[a-z]:", clean, re.IGNORECASE)):
             norm_target = urllib.parse.urljoin(base_url, clean.lstrip("/"))
 
         candidates.append(CandidateArtifact(

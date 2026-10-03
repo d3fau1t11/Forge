@@ -43,7 +43,7 @@ from backend.database.session import (
 # backend/database/session.py's MIGRATIONS list without updating this file. Deriving it
 # from len(MIGRATIONS) would make the test agree with whatever it found, which is the
 # opposite of what it is for.
-MIGRATION_COUNT = 21
+MIGRATION_COUNT = 22
 LOGGER_NAME = "forge.database.session"
 
 
@@ -183,11 +183,14 @@ class PreexistingDatabaseTests(SchemaMigrationTestBase):
             "every already-present migration must still be recorded",
         )
         # Proves the duplicate-column branch — not the failure branch — handled every
-        # migration, rather than the runner silently skipping them.
+        # ALTER TABLE migration, rather than the runner silently skipping them.
+        # Migration 22 is a CREATE TABLE IF NOT EXISTS which succeeds silently
+        # without raising "duplicate column name", so it doesn't log "already applied".
+        alter_table_migrations = sum(1 for v, sql in MIGRATIONS if sql.strip().upper().startswith("ALTER TABLE"))
         already_present = [
             r for r in captured.records if "already applied" in r.getMessage()
         ]
-        self.assertEqual(len(already_present), MIGRATION_COUNT)
+        self.assertEqual(len(already_present), alter_table_migrations)
         self.assertEqual(
             [r for r in captured.records if r.levelno >= logging.ERROR], [],
             "an already-migrated database must not log any errors",

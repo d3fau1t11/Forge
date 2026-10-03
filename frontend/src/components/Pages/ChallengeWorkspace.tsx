@@ -25,12 +25,16 @@ import {
   Bot,
   User,
   Loader2,
-  Sliders
+  Sliders,
+  ChevronDown,
+  ChevronUp,
+  Activity
 } from 'lucide-react';
 import { Challenge, Target, EvidenceItem, AiDecision, TerminalLog, Finding, WorkflowNode, AgentInfo, ChallengeChatMessage, ChallengeTab } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
 import { computeElapsedSeconds, formatDuration } from '../../utils/timeUtils';
 import { apiService } from '../../services/api';
+import { MarkdownRenderer, MessageCopyButton } from '../UI/MarkdownRenderer';
 
 interface ChallengeWorkspaceProps {
   challenge: Challenge;
@@ -47,64 +51,6 @@ interface ChallengeWorkspaceProps {
   onToggleStatus: (id: string) => void;
   wsStatus?: 'CONNECTING' | 'CONNECTED' | 'DISCONNECTED' | 'RECONNECTING' | 'ERROR';
   backendError?: string | null;
-}
-
-function renderMarkdownContent(text: string): React.ReactNode {
-  if (!text) return null;
-  const codeBlockRegex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
-  const parts: Array<{ type: 'text' | 'codeblock'; lang?: string; content: string }> = [];
-  let lastIndex = 0;
-  let match;
-
-  while ((match = codeBlockRegex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push({ type: 'text', content: text.substring(lastIndex, match.index) });
-    }
-    parts.push({ type: 'codeblock', lang: match[1] || 'bash', content: match[2] });
-    lastIndex = codeBlockRegex.lastIndex;
-  }
-  if (lastIndex < text.length) {
-    parts.push({ type: 'text', content: text.substring(lastIndex) });
-  }
-
-  return parts.map((part, idx) => {
-    if (part.type === 'codeblock') {
-      return (
-        <div key={idx} className="my-2.5 bg-obsidian-950 border border-cyber-cyan/30 rounded-lg overflow-hidden font-mono text-[11px]">
-          {part.lang && (
-            <div className="bg-obsidian-900 px-3 py-1 border-b border-slate-800 text-[10px] text-cyber-cyan font-bold uppercase tracking-wider flex justify-between items-center">
-              <span>{part.lang}</span>
-            </div>
-          )}
-          <pre className="p-3 text-slate-200 overflow-x-auto whitespace-pre-wrap select-all">{part.content}</pre>
-        </div>
-      );
-    }
-
-    const inlineParts = part.content.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
-    return (
-      <span key={idx} className="leading-relaxed">
-        {inlineParts.map((sub, sIdx) => {
-          if (sub.startsWith('**') && sub.endsWith('**')) {
-            return <strong key={sIdx} className="text-cyber-cyan font-bold">{sub.slice(2, -2)}</strong>;
-          }
-          if (sub.startsWith('`') && sub.endsWith('`')) {
-            return (
-              <code key={sIdx} className="bg-obsidian-900 border border-cyber-amber/30 text-amber-300 px-1.5 py-0.5 rounded text-[11px] font-mono">
-                {sub.slice(1, -1)}
-              </code>
-            );
-          }
-          return sub.split('\n').map((line, lineIdx, arr) => (
-            <React.Fragment key={`${sIdx}-${lineIdx}`}>
-              {line}
-              {lineIdx < arr.length - 1 && <br />}
-            </React.Fragment>
-          ));
-        })}
-      </span>
-    );
-  });
 }
 
 export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
@@ -262,6 +208,105 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   const [selectedWorkflowNode, setSelectedWorkflowNode] = useState<WorkflowNode | null>(activeWorkflowNodes[0]);
   const [copiedReadme, setCopiedReadme] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // ── Live Execution Stream Narration & Expansion ──────────────────────────────
+  const [expandedLogIds, setExpandedLogIds] = useState<Set<string>>(new Set());
+
+  const toggleLogExpand = (logId: string) => {
+    soundEngine.playClick();
+    setExpandedLogIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(logId)) next.delete(logId);
+      else next.add(logId);
+      return next;
+    });
+  };
+
+  // Generate human-readable narration from command + output
+  const narrateExecution = (command: string, output: string, exitCode: number | undefined, agent?: string): string => {
+    const cmd = command.toLowerCase().trim();
+    const out = output.toLowerCase();
+
+    // Port scanning / recon
+    if (cmd.includes('nmap') || cmd.includes('masscan') || cmd.includes('rustscan')) {
+      if (out.includes('open') || out.includes('port')) return 'Recon: scanning target ports & services…';
+      return 'Recon: initiating port scan…';
+    }
+    if (cmd.includes('nc ') || cmd.includes('netcat') || cmd.includes('telnet')) {
+      return 'Recon: testing TCP connectivity…';
+    }
+
+    // Directory enumeration / web discovery
+    if (cmd.includes('gobuster') || cmd.includes('feroxbuster') || cmd.includes('ffuf') || cmd.includes('dirb') || cmd.includes('dirsearch')) {
+      if (out.includes('200') || out.includes('301') || out.includes('302') || out.includes('found')) return 'Directory enumeration: discovered web paths…';
+      return 'Directory enumeration: fuzzing web surface…';
+    }
+    if (cmd.includes('nikto') || cmd.includes('whatweb') || cmd.includes('wappalyzer')) {
+      return 'Web fingerprinting: identifying technologies…';
+    }
+    if (cmd.includes('curl') || cmd.includes('wget') || cmd.includes('http')) {
+      if (out.includes('upload') || out.includes('/upload')) return 'Probing: testing file upload endpoint…';
+      if (out.includes('login') || out.includes('/login')) return 'Probing: testing authentication endpoint…';
+      return 'Web recon: fetching HTTP responses…';
+    }
+
+    // Exploitation / payload delivery
+    if (cmd.includes('sqlmap') || cmd.includes('sql')) {
+      return 'Exploitation: testing SQL injection vectors…';
+    }
+    if (cmd.includes('msfconsole') || cmd.includes('metasploit') || cmd.includes('exploit')) {
+      return 'Exploitation: executing payload…';
+    }
+    if (cmd.includes('hydra') || cmd.includes('medusa') || cmd.includes('brute') || cmd.includes('john') || cmd.includes('hashcat')) {
+      return 'Credential attack: brute-forcing authentication…';
+    }
+    if (cmd.includes('ssh') || cmd.includes('rdp') || cmd.includes('smb') || cmd.includes('ftp')) {
+      return 'Lateral movement: testing remote access…';
+    }
+
+    // File system / artifact extraction
+    if (cmd.includes('cat ') || cmd.includes('less ') || cmd.includes('more ') || cmd.includes('head ') || cmd.includes('tail ')) {
+      if (out.includes('flag') || out.includes('FLAG') || out.includes('{') && out.includes('}')) return 'Extracting artifact from response…';
+      return 'Reading file contents…';
+    }
+    if (cmd.includes('find ') || cmd.includes('locate ') || cmd.includes('ls ') || cmd.includes('dir ')) {
+      return 'File system: enumerating directories…';
+    }
+    if (cmd.includes('base64') || cmd.includes('xxd') || cmd.includes('hexdump') || cmd.includes('strings')) {
+      return 'Decoding: extracting encoded artifact…';
+    }
+    if (cmd.includes('gzip') || cmd.includes('tar') || cmd.includes('zip') || cmd.includes('unzip')) {
+      return 'Archive: extracting compressed artifact…';
+    }
+
+    // Privilege escalation
+    if (cmd.includes('sudo') || cmd.includes('su ') || cmd.includes('pkexec') || cmd.includes('doas')) {
+      return 'Privilege escalation: attempting elevation…';
+    }
+    if (cmd.includes('linpeas') || cmd.includes('winpeas') || cmd.includes('pspy') || cmd.includes('enum4linux')) {
+      return 'Post-exploit: enumerating privilege vectors…';
+    }
+
+    // Flag verification
+    if (cmd.includes('flag') || (out.includes('flag') && (out.includes('{') || out.includes('FLAG')))) {
+      return 'Verifying candidate flag…';
+    }
+
+    // Agent context fallback
+    if (agent) {
+      const role = agent.toUpperCase();
+      if (role.includes('RECON')) return `${role}: gathering target intelligence…`;
+      if (role.includes('CRYPTO') || role.includes('CODE')) return `${role}: analyzing encoded data…`;
+      if (role.includes('PWN') || role.includes('EXPLOIT')) return `${role}: testing exploitation path…`;
+    }
+
+    // Generic fallback based on exit code
+    if (exitCode === 0) {
+      if (out.length > 100) return 'Command executed — analyzing output…';
+      return 'Command completed successfully.';
+    }
+    return 'Command failed — investigating error…';
+  };
 
   // ── HITL checkpoint (hard pause & wait) local UI state ──────────────────────
   const [checkpointPaste, setCheckpointPaste] = useState('');
@@ -778,7 +823,7 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
           </div>
 
           {/* Chat Messages Timeline Container */}
-          <div className="glass-panel border border-slate-800 rounded-xl p-4 space-y-4 max-h-[580px] min-h-[440px] overflow-y-auto custom-scrollbar bg-obsidian-950/80 shadow-inner">
+          <div className="glass-panel border border-slate-800 rounded-2xl p-4 space-y-5 max-h-[580px] min-h-[440px] overflow-y-auto custom-scrollbar bg-obsidian-950/60 shadow-inner">
             {chatLoading && chatMessages.length === 0 && (
               <div className="flex items-center justify-center space-x-2 py-12 text-slate-400">
                 <Loader2 className="w-5 h-5 text-cyber-cyan animate-spin" />
@@ -803,9 +848,9 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
 
             {/* Empty state welcome card */}
             {!chatLoading && chatMessages.length === 0 && (
-              <div className="p-6 bg-obsidian-900/60 border border-slate-800 rounded-xl text-center space-y-2">
-                <Sparkles className="w-6 h-6 text-cyber-cyan mx-auto animate-pulse" />
-                <h3 className="font-display font-bold text-slate-200 text-sm">FORGE OPERATIONAL ASSISTANT INITIALIZED</h3>
+              <div className="p-8 bg-obsidian-900/40 border border-slate-800/50 rounded-2xl text-center space-y-3">
+                <Sparkles className="w-8 h-8 text-cyber-cyan mx-auto animate-pulse" />
+                <h3 className="font-display font-bold text-slate-200 text-base">FORGE OPERATIONAL ASSISTANT INITIALIZED</h3>
                 <p className="text-slate-400 text-xs max-w-lg mx-auto leading-relaxed">
                   Ask questions about the challenge objective, investigate reconnaissance telemetry, inspect discovered vulnerabilities, or coordinate exploitation strategies.
                 </p>
@@ -818,43 +863,50 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
               return (
                 <div
                   key={msg.id || idx}
-                  className={`flex items-start space-x-3 ${isUser ? 'flex-row-reverse space-x-reverse' : 'flex-row'}`}
+                  className={`flex items-end space-x-3 gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}
                 >
-                  {/* Avatar Icon */}
+                  {/* Avatar */}
                   <div
-                    className={`w-8 h-8 rounded-lg shrink-0 flex items-center justify-center text-xs font-bold ${
+                    className={`w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-xs font-bold flex-shrink-0 ${
                       isUser
-                        ? 'bg-cyan-950 border border-cyber-cyan text-cyber-cyan shadow-[0_0_10px_rgba(0,240,255,0.3)]'
-                        : 'bg-purple-950 border border-purple-500 text-purple-300 shadow-[0_0_10px_rgba(168,85,247,0.3)]'
+                        ? 'bg-cyan-950 border border-cyber-cyan/50 text-cyber-cyan'
+                        : 'bg-purple-950 border border-purple-500/50 text-purple-300'
                     }`}
                   >
                     {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
                   </div>
 
-                  {/* Message Card */}
-                  <div
-                    className={`max-w-3xl rounded-xl p-3.5 space-y-1.5 shadow-md border ${
-                      isUser
-                        ? 'bg-obsidian-900/90 border-cyan-500/40 text-slate-100 rounded-tr-none'
-                        : 'bg-obsidian-950/90 border-purple-500/30 text-slate-200 rounded-tl-none'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between text-[10px] border-b border-slate-800/80 pb-1 mb-1 gap-4">
-                      <span className={`font-bold uppercase tracking-wider ${isUser ? 'text-cyber-cyan' : 'text-purple-300'}`}>
-                        {isUser ? 'Operator' : 'Forge Assistant'}
-                      </span>
-                      {msg.created_at && (
-                        <span className="text-slate-500 text-[9.5px]">
-                          {new Date(msg.created_at).toLocaleTimeString()}
+                  {/* Message Bubble */}
+                  <div className={`flex-1 min-w-0 max-w-[85%] ${isUser ? 'order-last' : 'order-first'}`}>
+                    <div
+                      className={`rounded-2xl px-4 py-3 shadow-sm border transition-all ${
+                        isUser
+                          ? 'bg-cyan-950/50 border-cyan-500/30 text-slate-100 rounded-br-md'
+                          : 'bg-obsidian-950/80 border-purple-500/20 text-slate-200 rounded-bl-md'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <span className={`font-medium text-[11px] uppercase tracking-wider ${isUser ? 'text-cyan-300' : 'text-purple-300'}`}>
+                          {isUser ? 'Operator' : 'Forge Assistant'}
                         </span>
-                      )}
-                    </div>
-                    <div className="text-xs leading-relaxed font-mono select-text">
-                      {isUser ? (
-                        <div className="whitespace-pre-wrap">{msg.content}</div>
-                      ) : (
-                        renderMarkdownContent(msg.content)
-                      )}
+                        <div className="flex items-center gap-1.5 ml-auto">
+                          {msg.created_at && (
+                            <span className="text-slate-500 text-[10px] whitespace-nowrap">
+                              {new Date(msg.created_at).toLocaleTimeString()}
+                            </span>
+                          )}
+                          {!isUser && (
+                            <MessageCopyButton content={msg.content} className="opacity-0 group-hover:opacity-100 transition-opacity" />
+                          )}
+                        </div>
+                      </div>
+                      <div className="text-xs leading-relaxed font-sans select-text prose prose-invert prose-sm max-w-none m-0">
+                        {isUser ? (
+                          <div className="whitespace-pre-wrap font-mono">{msg.content}</div>
+                        ) : (
+                          <MarkdownRenderer content={msg.content} className="font-sans" />
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -888,30 +940,58 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
                   </div>
                 )}
 
-                {/* Recent Tool Executions */}
-                {logs.slice(0, 4).map((l) => (
-                  <div
-                    key={l.id}
-                    className="p-2.5 rounded-lg bg-obsidian-900/80 border border-slate-800/80 flex flex-col space-y-1 text-[11px] hover:border-cyber-cyan/40 transition-colors"
-                  >
-                    <div className="flex justify-between items-center text-[10px] text-slate-400">
-                      <span className="text-cyber-cyan font-bold flex items-center space-x-1">
-                        <Terminal className="w-3 h-3 text-cyber-cyan" />
-                        <span>$ {l.command}</span>
-                      </span>
-                      <span className={`px-1.5 py-0.2 rounded font-bold text-[9px] ${
-                        l.exitCode === 0 ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-rose-950 text-rose-400 border border-rose-800'
-                      }`}>
-                        EXIT {l.exitCode ?? 0}
-                      </span>
+                {/* Recent Tool Executions — Narrated Stream with Expandable Raw Output */}
+                {logs.slice(0, 6).map((l) => {
+                  const isExpanded = expandedLogIds.has(l.id);
+                  const narration = narrateExecution(l.command, l.output || '', l.exitCode, l.agent);
+                  const statusClass = l.exitCode === 0
+                    ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
+                    : 'bg-rose-950 text-rose-400 border border-rose-800';
+                  const activityClass = isExpanded ? 'text-cyber-emerald animate-pulse' : '';
+                  const narrationClass = isExpanded ? 'text-cyber-emerald' : 'text-cyber-cyan';
+                  return (
+                    <div
+                      key={l.id}
+                      className="p-2.5 rounded-lg bg-obsidian-900/80 border border-slate-800/80 flex flex-col space-y-1.5 text-[11px] hover:border-cyber-cyan/40 transition-colors"
+                    >
+                      {/* Narrated Primary View */}
+                      <div
+                        className="flex items-center justify-between gap-2 cursor-pointer"
+                        onClick={() => toggleLogExpand(l.id)}
+                      >
+                        <div className="flex items-center space-x-2 min-w-0 flex-1">
+                          <span className={`flex items-center space-x-1 font-bold ${narrationClass}`}>
+                            <Activity className={`w-3 h-3 ${activityClass}`} />
+                            <span className="truncate">{narration}</span>
+                          </span>
+                          <span className={`px-1.5 py-0.2 rounded font-bold text-[9px] shrink-0 ${statusClass}`}>
+                            {l.exitCode === 0 ? 'OK' : 'ERR'}
+                          </span>
+                        </div>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); toggleLogExpand(l.id); }}
+                          className="p-1 rounded hover:bg-slate-800 text-slate-500 hover:text-cyber-cyan transition-colors shrink-0"
+                          aria-label={isExpanded ? 'Collapse raw output' : 'Expand raw output'}
+                        >
+                          {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        </button>
+                      </div>
+
+                      {/* Expandable Raw Output */}
+                      {isExpanded && l.output && (
+                        <div className="mt-1.5 pl-6 border-l-2 border-cyber-cyan/40 animate-slideDown">
+                          <div className="flex items-center justify-between text-[9px] text-slate-500 mb-1">
+                            <span className="font-mono text-cyber-cyan">$ {l.command}</span>
+                            <span>EXIT {l.exitCode ?? 0} • {l.duration || '—'}</span>
+                          </div>
+                          <pre className="text-[10px] text-slate-300 bg-obsidian-950 p-2 rounded border border-slate-900 overflow-x-auto max-h-40 whitespace-pre-wrap select-all font-mono">
+                            {l.output}
+                          </pre>
+                        </div>
+                      )}
                     </div>
-                    {l.output && (
-                      <pre className="text-[10px] text-slate-300 bg-obsidian-950 p-1.5 rounded border border-slate-900 overflow-x-auto max-h-16 whitespace-pre-wrap select-all">
-                        {l.output.slice(0, 240)}
-                      </pre>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
 
                 {/* Recent Evidence Vault Additions */}
                 {evidenceList.slice(0, 2).map((ev) => (
@@ -932,13 +1012,17 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
 
             {/* Assistant Thinking / Typing Indicator */}
             {chatSending && (
-              <div className="flex items-center space-x-3">
-                <div className="w-8 h-8 rounded-lg bg-purple-950 border border-purple-500 flex items-center justify-center text-purple-300 shadow-[0_0_10px_rgba(168,85,247,0.3)]">
+              <div className="flex items-end space-x-3">
+                <div className="w-8 h-8 rounded-full bg-purple-950 border border-purple-500/50 flex items-center justify-center text-purple-300 flex-shrink-0">
                   <Bot className="w-4 h-4 animate-bounce" />
                 </div>
-                <div className="p-3 rounded-xl bg-obsidian-950 border border-purple-500/40 text-cyber-cyan text-xs flex items-center space-x-2 animate-pulse">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin text-cyber-cyan" />
-                  <span>FORGE Assistant analyzing challenge telemetry & formulating response…</span>
+                <div className="flex-1 min-w-0 max-w-[85%]">
+                  <div className="rounded-2xl px-4 py-3 shadow-sm border bg-obsidian-950/80 border-purple-500/20 text-slate-200 rounded-bl-md">
+                    <div className="flex items-center space-x-2 text-purple-300">
+                      <Loader2 className="w-4 h-4 animate-spin text-cyber-cyan" />
+                      <span className="font-medium text-[11px] uppercase tracking-wider animate-pulse">Forge Assistant is thinking…</span>
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
@@ -947,8 +1031,9 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
           </div>
 
           {/* Quick Prompt Suggestions */}
-          <div className="flex items-center space-x-2 overflow-x-auto pb-1 text-[11px]">
-            <span className="text-slate-500 font-bold text-[10px] uppercase shrink-0">Suggestions:</span>
+          <div className="flex items-center space-x-2 overflow-x-auto pb-2 px-1 text-[11px]">
+            <span className="text-slate-500 font-medium text-[10px] uppercase shrink-0 tracking-wide">Suggestions</span>
+            <div className="flex items-center space-x-2 flex-1">
             {[
               "What is the current run status?",
               "What open ports and web services did recon find?",
@@ -959,11 +1044,12 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
                 key={idx}
                 onClick={() => handleSendMessage(s)}
                 disabled={chatSending}
-                className="px-2.5 py-1 rounded-lg bg-obsidian-900 hover:bg-slate-800 border border-slate-800 hover:border-cyber-cyan/50 text-slate-300 hover:text-cyber-cyan text-[10.5px] font-bold whitespace-nowrap transition-all disabled:opacity-40"
+                className="px-3 py-1.5 rounded-full bg-obsidian-900/80 hover:bg-slate-800 border border-slate-800 hover:border-cyber-cyan/50 text-slate-300 hover:text-cyber-cyan text-[11px] font-medium whitespace-nowrap transition-all disabled:opacity-40"
               >
                 {s}
               </button>
             ))}
+            </div>
           </div>
 
           {/* Chat Input Bar */}
@@ -972,34 +1058,36 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
               e.preventDefault();
               handleSendMessage();
             }}
-            className="glass-panel border border-slate-800 p-2.5 rounded-xl flex items-center space-x-2 bg-obsidian-950 shadow-lg"
+            className="glass-panel border border-slate-800/50 p-3 rounded-2xl flex items-end space-x-3 bg-obsidian-950/80 shadow-xl"
           >
-            <textarea
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSendMessage();
-                }
-              }}
-              rows={2}
-              placeholder="Ask Forge AI about this challenge, tool executions, next attack vector, or run telemetry… (Enter to send, Shift+Enter for newline)"
-              className="flex-1 bg-obsidian-900 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-cyber-cyan focus:ring-1 focus:ring-cyber-cyan/30 resize-none font-mono custom-scrollbar"
-              disabled={chatSending}
-            />
+            <div className="flex-1 relative">
+              <textarea
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSendMessage();
+                  }
+                }}
+                rows={1}
+                placeholder="Ask Forge AI about this challenge, tool executions, next attack vector, or run telemetry… (Enter to send, Shift+Enter for newline)"
+                className="w-full bg-obsidian-900/80 border border-slate-800 hover:border-slate-700 focus:border-cyber-cyan/50 focus:ring-1 focus:ring-cyber-cyan/20 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none resize-none font-mono custom-scrollbar min-h-[44px] max-h-32"
+                disabled={chatSending}
+              />
+            </div>
 
             <button
               type="submit"
               disabled={chatSending || !chatInput.trim()}
-              className="px-4 py-3 rounded-lg bg-cyber-cyan hover:bg-cyan-300 disabled:opacity-40 disabled:cursor-not-allowed text-obsidian-950 font-display font-bold text-xs uppercase tracking-wider flex items-center space-x-1.5 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all h-full"
+              className="flex-shrink-0 p-3 rounded-xl bg-cyber-cyan hover:bg-cyan-300 disabled:opacity-40 disabled:cursor-not-allowed text-obsidian-950 font-display font-bold text-xs uppercase tracking-wider flex items-center space-x-1.5 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all h-10"
             >
               {chatSending ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
               ) : (
                 <>
                   <Send className="w-4 h-4" />
-                  <span className="hidden sm:inline">SEND</span>
+                  <span className="hidden sm:inline">Send</span>
                 </>
               )}
             </button>

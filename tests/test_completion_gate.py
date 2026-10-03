@@ -19,7 +19,7 @@ from backend.database.session import SessionLocal
 from backend.database.models import (
     ChallengeModel, RunModel, TargetProfileModel, AgentStateModel,
     CheckpointModel, ToolExecutionModel, FindingModel, EvidenceModel,
-    ReportModel
+    ReportModel, ChatMessageModel
 )
 
 class TestDualGatedCompletion(unittest.TestCase):
@@ -37,9 +37,9 @@ class TestDualGatedCompletion(unittest.TestCase):
         # IntegrityError (DELETE FROM challenges) and error every test in this class.
         try:
             for model in (
-                CheckpointModel, ToolExecutionModel, AgentStateModel,
-                EvidenceModel, FindingModel, ReportModel, TargetProfileModel,
-                RunModel, ChallengeModel,
+                ChatMessageModel, CheckpointModel, ToolExecutionModel,
+                AgentStateModel, EvidenceModel, FindingModel, ReportModel,
+                TargetProfileModel, RunModel, ChallengeModel,
             ):
                 self.db.query(model).delete()
             self.db.commit()
