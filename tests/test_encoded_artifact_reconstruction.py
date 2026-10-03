@@ -21,6 +21,7 @@ import hashlib
 import os
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 
 # Pinned above the first backend import on purpose. Importing backend used to repoint
 # DATABASE_URL at production forge.db (load_dotenv override=True) at import time, so
@@ -210,6 +211,17 @@ class TestPersistence(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 class TestSwarmEscalation(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        # The escalation directive must be testable without live provider calls:
+        # stub the vision analysis step so no real network/model request happens.
+        patcher = patch(
+            "backend.agents.swarm_orchestrator.SwarmOrchestrator.analyze_derived_artifact",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _fresh_board(self) -> SwarmBlackboard:
         return SwarmBlackboard("chal-recon-test", "run-recon-test", "local-artifact")

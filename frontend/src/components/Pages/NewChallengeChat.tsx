@@ -213,9 +213,11 @@ export const NewChallengeChat: React.FC<NewChallengeChatProps> = ({
         target_address?: string;
         description?: string;
         attached_file_paths?: string[];
+        raw_message?: string;
       } = {
         attached_file_paths: sentFiles.map((f) => f.path)
       };
+      payload.raw_message = text;
 
       // We don't know which fields the backend still needs — send everything
       // the operator has provided so far. The backend will ignore extras and
@@ -242,16 +244,6 @@ export const NewChallengeChat: React.FC<NewChallengeChatProps> = ({
       if (currentStep === 1) {
         // Try to extract structured fields from the user's message
         // This is best-effort; the backend will ask for whatever's missing
-        const lower = text.toLowerCase();
-        
-        // Extract name if it looks like a name (first message, short)
-        if (!messages.some(m => m.meta?.name)) {
-          // Heuristic: if message is short and doesn't contain common field keywords
-          if (text.length < 80 && !lower.includes('platform') && !lower.includes('type') && !lower.includes('category') && !lower.includes('difficulty') && !lower.includes('easy') && !lower.includes('medium') && !lower.includes('hard') && !lower.includes('insane')) {
-            payload.challenge_name = text;
-          }
-        }
-        
         // Try to extract platform
         const platformMatch = text.match(/(?:platform|event)[:\s]+([^\n,]+)/i);
         if (platformMatch) payload.platform_name = platformMatch[1].trim();

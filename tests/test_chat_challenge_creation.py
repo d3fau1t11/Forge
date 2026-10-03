@@ -1,8 +1,10 @@
 """Workstream F: chat-driven challenge creation — conversational missing-field
 collection, category/difficulty normalization, and the '+' multi-target convention."""
+import json
 import os
 import sys
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
@@ -10,6 +12,7 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 from fastapi.testclient import TestClient
 from backend.main import app
 from backend.database.session import init_db
+from backend.providers.base import ProviderResponse
 from backend.utils.challenge_normalize import (
     normalize_category, normalize_difficulty, normalize_targets,
 )
@@ -46,6 +49,13 @@ class TestConversationalCreationFlow(unittest.TestCase):
     def setUpClass(cls):
         init_db()
         cls.client = TestClient(app)
+
+    def _make_response(self, content: str, is_refusal: bool = False) -> MagicMock:
+        resp = MagicMock(spec=ProviderResponse)
+        resp.content = content
+        resp.is_refusal = is_refusal
+        resp.refusal_reason = "refused" if is_refusal else None
+        return resp
 
     @classmethod
     def tearDownClass(cls):
@@ -84,8 +94,14 @@ class TestConversationalCreationFlow(unittest.TestCase):
         finally:
             db.close()
 
-    def test_incremental_missing_field_collection(self):
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    def test_incremental_missing_field_collection(self, mock_route_request):
         # 1. Start a session.
+        mock_route_request.return_value = self._make_response(json.dumps({
+            "reply": "Could you also tell me the category and difficulty?",
+            "fields": {k: None for k in ["name", "platform", "category", "difficulty", "target_address", "description"]},
+            "ready_to_create": False,
+        }))
         start = self.client.post("/api/challenges/chat-session")
         self.assertEqual(start.status_code, 200)
         sid = start.json()["session_id"]
@@ -109,8 +125,19 @@ class TestConversationalCreationFlow(unittest.TestCase):
         self.assertIn("pwn", body2["bot_message"])         # category normalized
         self.assertIn("INSANE", body2["bot_message"])      # difficulty normalized
 
-    def test_client_contract_includes_difficulty(self):
-        """Ensure the backend's opening prompt mentions difficulty and the request model accepts it."""
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    def test_client_contract_includes_difficulty(self, mock_route_request):
+        """Ensure the opening prompt mentions difficulty and the request model accepts it."""
+        opener = (
+            "Let's set up your challenge. Please tell me the **challenge name**, "
+            "the **category**, and the **difficulty** (EASY, MEDIUM, HARD or INSANE). "
+            "Platform is optional."
+        )
+        mock_route_request.return_value = self._make_response(json.dumps({
+            "reply": opener,
+            "fields": {k: None for k in ["name", "platform", "category", "difficulty", "target_address", "description"]},
+            "ready_to_create": False,
+        }))
         start = self.client.post("/api/challenges/chat-session")
         self.assertEqual(start.status_code, 200)
         body = start.json()
@@ -130,8 +157,14 @@ class TestConversationalCreationFlow(unittest.TestCase):
         # Should advance to step 2 since all required fields provided
         self.assertEqual(body2["step"], 2)
 
-    def test_full_conversation_creates_challenge(self):
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    def test_full_conversation_creates_challenge(self, mock_route_request):
         """End-to-end: name-only -> asks for remaining -> type+description+difficulty -> completes."""
+        mock_route_request.return_value = self._make_response(json.dumps({
+            "reply": "Got it — still need the remaining intake details.",
+            "fields": {k: None for k in ["name", "platform", "category", "difficulty", "target_address", "description"]},
+            "ready_to_create": False,
+        }))
         start = self.client.post("/api/challenges/chat-session")
         self.assertEqual(start.status_code, 200)
         sid = start.json()["session_id"]

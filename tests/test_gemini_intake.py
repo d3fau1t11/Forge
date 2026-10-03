@@ -13,6 +13,7 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
 from backend.agents.challenge_intake import (
     INTAKE_SYSTEM_INSTRUCTION,
+    _parse_model_json,
     build_intake_prompt,
     interpret_operator_message,
 )
@@ -218,6 +219,74 @@ class TestInterpretOperatorMessage(unittest.IsolatedAsyncioTestCase):
 
 
 import json  # needed for test helpers
+
+
+class TestParseModelJson(unittest.TestCase):
+    """Guards the _parse_model_json refactor: same rejections as the old inline logic."""
+
+    def test_rejects_non_json_prose(self):
+        self.assertIsNone(_parse_model_json("I cannot help with that request."))
+
+    def test_rejects_missing_reply(self):
+        self.assertIsNone(_parse_model_json(json.dumps({"fields": {}, "ready_to_create": False})))
+
+    def test_rejects_unknown_fields_key(self):
+        self.assertIsNone(_parse_model_json(json.dumps({
+            "reply": "OK",
+            "fields": {"name": "test", "unknown_field": "value"},
+            "ready_to_create": False,
+        })))
+
+    def test_rejects_non_bool_ready_to_create(self):
+        self.assertIsNone(_parse_model_json(json.dumps({
+            "reply": "OK",
+            "fields": {},
+            "ready_to_create": "true",
+        })))
+
+    def test_rejects_numeric_field_value(self):
+        self.assertIsNone(_parse_model_json(json.dumps({
+            "reply": "OK",
+            "fields": {"name": 123},
+            "ready_to_create": False,
+        })))
+
+    def test_accepts_and_normalizes_valid_json(self):
+        parsed = _parse_model_json(json.dumps({
+            "reply": "Great, creating challenge",
+            "fields": {
+                "name": "SQL Injection",
+                "platform": "",
+                "category": "web exploitation",
+                "difficulty": "hard",
+                "target_address": "http://example.com\nhttp://test.com",
+                "description": "A SQLi challenge",
+            },
+            "ready_to_create": True,
+        }))
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["reply"], "Great, creating challenge")
+        self.assertEqual(parsed["fields"]["category"], "web")
+        self.assertEqual(parsed["fields"]["difficulty"], "HARD")
+        self.assertIsNone(parsed["fields"]["platform"])
+        self.assertEqual(parsed["fields"]["target_address"], "http://example.com + http://test.com")
+        self.assertTrue(parsed["ready_to_create"])
+
+    def test_strips_markdown_fences(self):
+        parsed = _parse_model_json(
+            "```json\n"
+            '{"reply": "OK", "fields": {"name": "Test"}, "ready_to_create": false}\n'
+            "```"
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["reply"], "OK")
+        self.assertEqual(parsed["fields"]["name"], "Test")
+
+    def test_never_raises(self):
+        # A non-dict top level, malformed JSON, and empty input all return None.
+        self.assertIsNone(_parse_model_json("[1, 2, 3]"))
+        self.assertIsNone(_parse_model_json("not valid json {"))
+        self.assertIsNone(_parse_model_json(""))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from backend.database.models import (
     EvidenceModel, ReportModel, IntakeSessionModel, IntakeTurnModel,
 )
 from backend.providers.base import ProviderResponse
+from backend.api.routes.challenges import _INTAKE_OPENING_PROMPT
 import json
 
 
@@ -151,6 +152,9 @@ class TestIntakePersistence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(start.status_code, 200)
         sid = start.json()["session_id"]
 
+        # The opening message consults the model exactly once.
+        calls_after_start = mock_route_request.call_count
+
         # Send ALL required fields in one request - should hit fast path
         r = self.client.post(f"/api/challenges/chat-session/{sid}/message",
                              json={
@@ -163,8 +167,8 @@ class TestIntakePersistence(unittest.IsolatedAsyncioTestCase):
         body = r.json()
         self.assertEqual(body["step"], 2)
 
-        # LLM should NOT have been called (fast path)
-        mock_route_request.assert_not_called()
+        # LLM should NOT have been called for the fast-path message
+        self.assertEqual(mock_route_request.call_count, calls_after_start)
 
         # Verify session has correct fields in DB
         session = self.db.query(IntakeSessionModel).filter(IntakeSessionModel.id == sid).first()
@@ -173,6 +177,41 @@ class TestIntakePersistence(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.fields.get("type"), "pwn")
         self.assertEqual(session.fields.get("difficulty"), "HARD")
         self.assertEqual(session.fields.get("platform"), "HTB")
+
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    async def test_step1_raw_message_reaches_model(self, mock_route_request):
+        """A step-1 request carrying only raw_message must reach the model prompt."""
+        mock_route_request.return_value = self._make_response(json.dumps({
+            "reply": "Thanks — could you also tell me the category?",
+            "fields": {k: None for k in ["name", "platform", "category", "difficulty", "target_address", "description"]},
+            "ready_to_create": False
+        }))
+
+        start = self.client.post("/api/challenges/chat-session")
+        self.assertEqual(start.status_code, 200)
+        sid = start.json()["session_id"]
+
+        raw = "it's a web challenge called WebApp50"
+        r = self.client.post(f"/api/challenges/chat-session/{sid}/message",
+                             json={"raw_message": raw})
+        self.assertEqual(r.status_code, 200)
+
+        # The model router must have been called for this message (the opener
+        # call also hits the router), and the message prompt must contain the
+        # operator's raw text (not a placeholder).
+        self.assertGreaterEqual(mock_route_request.call_count, 2)
+        message_calls = [
+            c for c in mock_route_request.call_args_list
+            if raw in c.kwargs.get("prompt", "")
+        ]
+        self.assertEqual(len(message_calls), 1)
+
+        # Persisted turn content must be the raw sentence too
+        turns = self.db.query(IntakeTurnModel).filter(
+            IntakeTurnModel.session_id == sid,
+            IntakeTurnModel.role == "user",
+        ).all()
+        self.assertTrue(any(t.content == raw for t in turns))
 
     @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
     async def test_malformed_llm_output_falls_back_to_gate(self, mock_route_request):
@@ -320,8 +359,15 @@ class TestIntakePersistence(unittest.IsolatedAsyncioTestCase):
                              json={"challenge_name": "Test"})
         self.assertEqual(r.status_code, 404)
 
-    async def test_404_on_committed_session(self):
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    async def test_404_on_committed_session(self, mock_route_request):
         """Committed session cannot be reused."""
+        mock_route_request.return_value = self._make_response(json.dumps({
+            "reply": "Challenge created!",
+            "fields": {},
+            "ready_to_create": True
+        }))
+
         start = self.client.post("/api/challenges/chat-session")
         sid = start.json()["session_id"]
 
@@ -335,6 +381,55 @@ class TestIntakePersistence(unittest.IsolatedAsyncioTestCase):
         r = self.client.post(f"/api/challenges/chat-session/{sid}/message",
                              json={"description": "Again"})
         self.assertEqual(r.status_code, 404)
+
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    async def test_opener_uses_model_reply(self, mock_route_request):
+        """A valid model JSON reply becomes the opening bot_message."""
+        model_reply = "Welcome! What is the challenge name, category, and difficulty?"
+        mock_route_request.return_value = self._make_response(json.dumps({
+            "reply": model_reply,
+            "fields": {k: None for k in ["name", "platform", "category", "difficulty", "target_address", "description"]},
+            "ready_to_create": False
+        }))
+
+        start = self.client.post("/api/challenges/chat-session")
+        self.assertEqual(start.status_code, 200)
+        body = start.json()
+        self.assertEqual(body["step"], 1)
+        self.assertEqual(body["bot_message"], model_reply)
+        self.assertNotEqual(body["bot_message"], _INTAKE_OPENING_PROMPT)
+
+        # Persisted opening turn must match the returned message.
+        turns = self.db.query(IntakeTurnModel).filter(
+            IntakeTurnModel.session_id == body["session_id"],
+            IntakeTurnModel.role == "assistant",
+        ).all()
+        self.assertEqual([t.content for t in turns], [model_reply])
+
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    async def test_opener_malformed_output_falls_back(self, mock_route_request):
+        """Malformed model output falls back to the fixed opening prompt."""
+        mock_route_request.return_value = self._make_response("I cannot help with that request.")
+
+        start = self.client.post("/api/challenges/chat-session")
+        self.assertEqual(start.status_code, 200)
+        body = start.json()
+        self.assertEqual(body["bot_message"], _INTAKE_OPENING_PROMPT)
+
+        turns = self.db.query(IntakeTurnModel).filter(
+            IntakeTurnModel.session_id == body["session_id"],
+            IntakeTurnModel.role == "assistant",
+        ).all()
+        self.assertEqual([t.content for t in turns], [_INTAKE_OPENING_PROMPT])
+
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    async def test_opener_router_exception_falls_back(self, mock_route_request):
+        """A router exception falls back to the fixed opening prompt, still HTTP 200."""
+        mock_route_request.side_effect = Exception("Network error")
+
+        start = self.client.post("/api/challenges/chat-session")
+        self.assertEqual(start.status_code, 200)
+        self.assertEqual(start.json()["bot_message"], _INTAKE_OPENING_PROMPT)
 
     @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
     async def test_llm_exception_returns_none_falls_back(self, mock_route_request):
@@ -360,9 +455,21 @@ class TestIntakePersistence(unittest.IsolatedAsyncioTestCase):
         1. Category is stored as fields["type"] (not fields["category"])
         2. Session advances to step 2 in the same turn (not on a later message)
         """
-        # First call (turn 1): model returns None (no category extracted)
-        # Second call (turn 2): model returns category
+        # First call is the opening message; then turn 1 (no category);
+        # then turn 2 (model returns category).
         mock_route_request.side_effect = [
+            self._make_response(json.dumps({
+                "reply": "What is the challenge name, category, and difficulty?",
+                "fields": {
+                    "name": None,
+                    "platform": None,
+                    "category": None,
+                    "difficulty": None,
+                    "target_address": None,
+                    "description": None
+                },
+                "ready_to_create": False
+            })),
             self._make_response(json.dumps({
                 "reply": "I need more info.",
                 "fields": {
@@ -420,6 +527,72 @@ class TestIntakePersistence(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("category", session.fields, "Session should not have 'category' key")
         self.assertEqual(session.fields.get("name"), "Conv Category Test")
         self.assertEqual(session.fields.get("difficulty"), "EASY")
+
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    async def test_step1_advance_keeps_model_reply_and_guidance(self, mock_route_request):
+        """When intake completes on the slow path, bot_message keeps the model's
+        reply AND still carries the step-2 guidance."""
+        distinctive = "Great, that's everything I need."
+        mock_route_request.side_effect = [
+            self._make_response(json.dumps({
+                "reply": "What is the challenge name, category, and difficulty?",
+                "fields": {}, "ready_to_create": False,
+            })),
+            self._make_response(json.dumps({
+                "reply": "I still need the difficulty.",
+                "fields": {}, "ready_to_create": False,
+            })),
+            self._make_response(json.dumps({
+                "reply": distinctive,
+                "fields": {}, "ready_to_create": False,
+            })),
+        ]
+
+        start = self.client.post("/api/challenges/chat-session")
+        sid = start.json()["session_id"]
+
+        r1 = self.client.post(f"/api/challenges/chat-session/{sid}/message",
+                              json={"challenge_name": "Model Reply Test",
+                                    "challenge_type": "web"})
+        self.assertEqual(r1.json()["step"], 1)
+
+        r2 = self.client.post(f"/api/challenges/chat-session/{sid}/message",
+                              json={"difficulty": "EASY"})
+        self.assertEqual(r2.status_code, 200)
+        body2 = r2.json()
+        self.assertEqual(body2["step"], 2)
+        self.assertIn(distinctive, body2["bot_message"])
+        self.assertIn("what is your goal for this challenge", body2["bot_message"])
+
+    @patch("backend.agents.challenge_intake.model_router.route_request", new_callable=AsyncMock)
+    async def test_step1_advance_without_model_reply_keeps_guidance(self, mock_route_request):
+        """When the model returns None, bot_message still carries step-2 guidance."""
+        mock_route_request.side_effect = [
+            self._make_response(json.dumps({
+                "reply": "What is the challenge name, category, and difficulty?",
+                "fields": {}, "ready_to_create": False,
+            })),
+            self._make_response(json.dumps({
+                "reply": "I still need the difficulty.",
+                "fields": {}, "ready_to_create": False,
+            })),
+            Exception("Network error"),
+        ]
+
+        start = self.client.post("/api/challenges/chat-session")
+        sid = start.json()["session_id"]
+
+        r1 = self.client.post(f"/api/challenges/chat-session/{sid}/message",
+                              json={"challenge_name": "No Reply Test",
+                                    "challenge_type": "crypto"})
+        self.assertEqual(r1.json()["step"], 1)
+
+        r2 = self.client.post(f"/api/challenges/chat-session/{sid}/message",
+                              json={"difficulty": "MEDIUM"})
+        self.assertEqual(r2.status_code, 200)
+        body2 = r2.json()
+        self.assertEqual(body2["step"], 2)
+        self.assertIn("what is your goal for this challenge", body2["bot_message"])
 
 
 if __name__ == "__main__":

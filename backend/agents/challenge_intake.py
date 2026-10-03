@@ -83,43 +83,15 @@ def build_intake_prompt(transcript: list[dict], fields: dict) -> str:
     return "\n".join(lines)
 
 
-async def interpret_operator_message(transcript: list[dict], fields: dict) -> Optional[dict]:
-    """Interpret the operator's latest message and update intake state.
+def _parse_model_json(content: str) -> Optional[dict]:
+    """Parse and validate a raw model JSON response.
 
-    Calls the model router with the chat_creation capability, parses the JSON
-    response, validates it, normalizes category/difficulty/target_address, and
-    returns a structured dict — or None on ANY failure.
-
-    Args:
-        transcript: Full conversation history including the latest user message.
-        fields: Current field values before this turn.
-
-    Returns:
-        {"reply": str, "fields": dict, "ready_to_create": bool} on success,
-        None on any parsing/validation error or model refusal.
+    Strips optional ``` fences, parses JSON, validates the intake shape, converts
+    empty-string field values to None, and normalizes category/difficulty/
+    target_address. Returns None on ANY failure; never raises.
     """
-    # Build the prompt
-    prompt = build_intake_prompt(transcript, fields)
-
-    try:
-        # Route to the model with chat_creation capability
-        response = await model_router.route_request(
-            prompt=prompt,
-            system_instruction=INTAKE_SYSTEM_INSTRUCTION,
-            capability="chat_creation",
-        )
-    except Exception:
-        # Any exception from the router -> treat as failure
-        return None
-
-    # Validate response object
-    if response is None:
-        return None
-    if response.is_refusal:
-        return None
-
-    # Parse JSON content (strip optional markdown fences)
-    content = response.content.strip()
+    # Strip optional markdown fences
+    content = (content or "").strip()
     if content.startswith("```"):
         # Strip ```json ... ``` or ``` ... ```
         lines = content.splitlines()
@@ -184,3 +156,79 @@ async def interpret_operator_message(transcript: list[dict], fields: dict) -> Op
         "fields": normalized_fields,
         "ready_to_create": ready_to_create,
     }
+
+
+async def interpret_operator_message(transcript: list[dict], fields: dict) -> Optional[dict]:
+    """Interpret the operator's latest message and update intake state.
+
+    Calls the model router with the chat_creation capability, parses the JSON
+    response, validates it, normalizes category/difficulty/target_address, and
+    returns a structured dict — or None on ANY failure.
+
+    Args:
+        transcript: Full conversation history including the latest user message.
+        fields: Current field values before this turn.
+
+    Returns:
+        {"reply": str, "fields": dict, "ready_to_create": bool} on success,
+        None on any parsing/validation error or model refusal.
+    """
+    # Build the prompt
+    prompt = build_intake_prompt(transcript, fields)
+
+    try:
+        # Route to the model with chat_creation capability
+        response = await model_router.route_request(
+            prompt=prompt,
+            system_instruction=INTAKE_SYSTEM_INSTRUCTION,
+            capability="chat_creation",
+        )
+    except Exception:
+        # Any exception from the router -> treat as failure
+        return None
+
+    # Validate response object
+    if response is None:
+        return None
+    if response.is_refusal:
+        return None
+
+    return _parse_model_json(response.content)
+
+
+async def generate_opening_message() -> Optional[str]:
+    """Generate the opening intake question with the model.
+
+    Asks the model for the first question of a new intake session, then parses
+    its response with the same validation used for operator turns. Returns the
+    parsed reply string, or None on ANY failure (router error, refusal, or
+    unparseable response). Never raises.
+    """
+    prompt = (
+        "This is the very start of a new challenge intake session. There is no "
+        "conversation history yet and no fields collected. Produce the opening JSON "
+        "response now: greet the operator and ask for the three required fields — the "
+        "challenge name, the category, and the difficulty. You may mention that the "
+        "platform is optional. Do not ask for targets or a description yet. Ask for "
+        "the opening information in a natural, conversational way."
+    )
+
+    try:
+        response = await model_router.route_request(
+            prompt=prompt,
+            system_instruction=INTAKE_SYSTEM_INSTRUCTION,
+            capability="chat_creation",
+        )
+    except Exception:
+        # Any exception from the router -> treat as failure
+        return None
+
+    if response is None:
+        return None
+    if response.is_refusal:
+        return None
+
+    parsed = _parse_model_json(response.content)
+    if parsed is None:
+        return None
+    return parsed["reply"]

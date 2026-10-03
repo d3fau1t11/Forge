@@ -184,6 +184,8 @@ class ChatSessionMessageRequest(BaseModel):
     description: Optional[str] = None
     # Paths returned by POST /challenges/upload — already staged on disk
     attached_file_paths: Optional[List[str]] = None
+    # Operator's raw typed message (used on turn 1 so the model sees it)
+    raw_message: Optional[str] = None
 
 
 class PostChallengeChatMessageRequest(BaseModel):
@@ -213,6 +215,17 @@ _INTAKE_OPENING_PROMPT = (
 _MODEL_FIELD_ALIASES = {"category": "type"}
 
 
+_STEP2_GUIDANCE = (
+    "Now, optionally:\n"
+    "• Paste one or more **target addresses** (IP, URL, or `nc host port`; "
+    "separate several with `+`) if you have them.\n"
+    "• Attach a **challenge file** using the upload button.\n\n"
+    "And in one sentence or more: **what is your goal for this challenge?** "
+    "(This becomes the challenge description.)\n\n"
+    "Send your message when ready — the challenge will be created immediately."
+)
+
+
 def _step1_missing_fields(session: IntakeSessionModel) -> list[tuple[str, str]]:
     """Return list of (field_key, human_label) for missing required step-1 fields."""
     from backend.utils.challenge_normalize import CATEGORIES
@@ -238,8 +251,16 @@ async def start_chat_session(_req: ChatSessionStartRequest = None, db: Session =
     """Open a new durable intake session.
 
     Creates an IntakeSessionModel row and the first assistant turn.
-    Returns session_id, step=1, and the fixed opening bot_message.
+    Returns session_id, step=1, and the model-generated (or fallback) opening
+    bot_message.
     """
+    # Ask the model for a fresh opener; fall back to the fixed prompt when the
+    # model is unavailable, refuses, or returns something unparseable.
+    from backend.agents.challenge_intake import generate_opening_message
+    opener = await generate_opening_message()
+    if not (isinstance(opener, str) and opener.strip()):
+        opener = _INTAKE_OPENING_PROMPT
+
     session_id = _uuid_mod.uuid4().hex
     session = IntakeSessionModel(
         id=session_id,
@@ -254,7 +275,7 @@ async def start_chat_session(_req: ChatSessionStartRequest = None, db: Session =
         id=_uuid_mod.uuid4().hex,
         session_id=session_id,
         role="assistant",
-        content=_INTAKE_OPENING_PROMPT,
+        content=opener,
     )
     db.add(turn)
     db.commit()
@@ -262,7 +283,7 @@ async def start_chat_session(_req: ChatSessionStartRequest = None, db: Session =
     return {
         "session_id": session_id,
         "step": 1,
-        "bot_message": _INTAKE_OPENING_PROMPT,
+        "bot_message": opener,
     }
 
 
@@ -332,13 +353,7 @@ async def send_chat_message(
             bot_message = (
                 f"Got it — **{fields['name']}** on **{platform_display}** "
                 f"({fields['type']}, {fields['difficulty']}).\n\n"
-                "Now, optionally:\n"
-                "• Paste one or more **target addresses** (IP, URL, or `nc host port`; "
-                "separate several with `+`) if you have them.\n"
-                "• Attach a **challenge file** using the upload button.\n\n"
-                "And in one sentence or more: **what is your goal for this challenge?** "
-                "(This becomes the challenge description.)\n\n"
-                "Send your message when ready — the challenge will be created immediately."
+                + _STEP2_GUIDANCE
             )
             bot_turn = IntakeTurnModel(
                 id=_uuid_mod.uuid4().hex,
@@ -375,23 +390,28 @@ async def send_chat_message(
             user_provided["difficulty"] = normalize_difficulty(req.difficulty)
             fields["difficulty"] = normalize_difficulty(req.difficulty)
 
-        user_content_parts = []
-        if req.challenge_name and req.challenge_name.strip():
-            user_content_parts.append(f"Challenge Name: {req.challenge_name.strip()}")
-        if req.platform_name and req.platform_name.strip():
-            user_content_parts.append(f"Platform: {req.platform_name.strip()}")
-        if req.challenge_type and req.challenge_type.strip():
-            user_content_parts.append(f"Category: {req.challenge_type.strip()}")
-        if req.difficulty and req.difficulty.strip():
-            user_content_parts.append(f"Difficulty: {req.difficulty.strip()}")
-        if not user_content_parts:
-            user_content_parts.append("(no structured fields provided)")
+        raw = (req.raw_message or "").strip()
+        if raw:
+            user_turn_content = raw
+        else:
+            user_content_parts = []
+            if req.challenge_name and req.challenge_name.strip():
+                user_content_parts.append(f"Challenge Name: {req.challenge_name.strip()}")
+            if req.platform_name and req.platform_name.strip():
+                user_content_parts.append(f"Platform: {req.platform_name.strip()}")
+            if req.challenge_type and req.challenge_type.strip():
+                user_content_parts.append(f"Category: {req.challenge_type.strip()}")
+            if req.difficulty and req.difficulty.strip():
+                user_content_parts.append(f"Difficulty: {req.difficulty.strip()}")
+            if not user_content_parts:
+                user_content_parts.append("(no structured fields provided)")
+            user_turn_content = "\n".join(user_content_parts)
 
         user_turn = IntakeTurnModel(
             id=_uuid_mod.uuid4().hex,
             session_id=session_id,
             role="user",
-            content="\n".join(user_content_parts),
+            content=user_turn_content,
         )
         db.add(user_turn)
 
@@ -450,17 +470,19 @@ async def send_chat_message(
         session.updated_at = utcnow()
 
         platform_display = fields.get("platform") or "Unknown"
-        bot_message = (
+        lead_in = (
             f"Got it — **{fields['name']}** on **{platform_display}** "
-            f"({fields['type']}, {fields['difficulty']}).\n\n"
-            "Now, optionally:\n"
-            "• Paste one or more **target addresses** (IP, URL, or `nc host port`; "
-            "separate several with `+`) if you have them.\n"
-            "• Attach a **challenge file** using the upload button.\n\n"
-            "And in one sentence or more: **what is your goal for this challenge?** "
-            "(This becomes the challenge description.)\n\n"
-            "Send your message when ready — the challenge will be created immediately."
+            f"({fields['type']}, {fields['difficulty']})."
         )
+        model_reply = (
+            model_result.get("reply")
+            if model_result is not None and isinstance(model_result.get("reply"), str)
+                and model_result.get("reply").strip()
+            else None
+        )
+        if model_reply:
+            lead_in = f"{lead_in}\n\n{model_reply}"
+        bot_message = f"{lead_in}\n\n{_STEP2_GUIDANCE}"
         bot_turn = IntakeTurnModel(
             id=_uuid_mod.uuid4().hex,
             session_id=session_id,
