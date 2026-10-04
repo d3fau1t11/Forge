@@ -360,6 +360,9 @@ async def install_package(req: PackageInstallRequest):
         pending_install_requests.pop(req.request_id, None)
 
         # Signal orchestrator to resume if it was waiting
+        # Inert today: the legacy ReAct loop that registers the resolve_install_request
+        # waiter never runs in production (see backend/agents/orchestrator_loop.py), so
+        # there is normally nothing waiting here.  Kept only for the legacy-loop tests.
         from backend.agents.orchestrator_loop import orchestrator_loop
         orchestrator_loop.resolve_install_request(req.request_id, success)
 
@@ -389,6 +392,9 @@ async def skip_package_install(req: PackageSkipRequest):
     """User skipped or rejected package installation."""
     from backend.agents.orchestrator_loop import orchestrator_loop
     pending_install_requests.pop(req.request_id, None)
+    # Inert today: the legacy ReAct loop that registers the resolve_install_request
+    # waiter never runs in production (see backend/agents/orchestrator_loop.py), so
+    # there is normally nothing waiting here.  Kept only for the legacy-loop tests.
     orchestrator_loop.resolve_install_request(req.request_id, False)
     return {"status": "SKIPPED", "request_id": req.request_id}
 

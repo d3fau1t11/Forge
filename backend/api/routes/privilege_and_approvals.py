@@ -189,6 +189,9 @@ async def approve_privilege_execution(req: PrivilegeApprovalRequest):
         "output": (tool_res.stdout or tool_res.stderr)[:2000]
     })
 
+    # Inert today: the legacy ReAct loop that registers the resolve_root_request
+    # waiter never runs in production (see backend/agents/orchestrator_loop.py), so
+    # there is normally nothing waiting here.  Kept only for the legacy-loop tests.
     orchestrator_loop.resolve_root_request(
         request_id=req.request_id,
         success=True,
@@ -211,6 +214,9 @@ async def reject_privilege_execution(req: PrivilegeRejectRequest):
     logger = logging.getLogger("forge.privilege")
     logger.info(f"Operator rejected root elevation for request: {req.request_id}")
 
+    # Inert today: the legacy ReAct loop that registers the resolve_root_request
+    # waiter never runs in production (see backend/agents/orchestrator_loop.py), so
+    # there is normally nothing waiting here.  Kept only for the legacy-loop tests.
     orchestrator_loop.resolve_root_request(
         request_id=req.request_id,
         success=False,

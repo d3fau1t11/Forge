@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState } from 'react';
 import { 
   Terminal as TerminalIcon, 
   Search, 
@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import { TerminalLog } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
-import { apiService } from '../../services/api';
+import { useTerminalLogs } from '../../hooks/useTerminalLogs';
 
 interface TerminalViewProps {
   logs: TerminalLog[];
@@ -26,40 +26,15 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [commandInput, setCommandInput] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
-  const [isExecuting, setIsExecuting] = useState(false);
 
-  const [userLogs, setUserLogs] = useState<TerminalLog[]>([]);
-  const [historyLogs, setHistoryLogs] = useState<TerminalLog[]>([]);
-  const historyLoadedRef = useRef<Set<string>>(new Set());
-
-  // Fetch terminal history on mount and when challenge changes
-  useEffect(() => {
-    if (!activeChallengeId || historyLoadedRef.current.has(activeChallengeId)) return;
-
-    const loadHistory = async () => {
-      try {
-        const history = await apiService.getTerminalHistory(activeChallengeId, 200);
-        const mappedLogs: TerminalLog[] = history.map((entry: any) => ({
-          id: entry.id,
-          timestamp: entry.created_at ? new Date(entry.created_at).toLocaleTimeString() : '--:--:--',
-          type: 'FORGE TOOL EXECUTION' as const,
-          command: entry.command,
-          output: entry.stdout || entry.stderr || '',
-          exitCode: entry.exit_code ?? 0,
-          duration: entry.duration_ms ? `${(entry.duration_ms / 1000).toFixed(1)}s` : '0.0s',
-          privilege: 'SAFE' as const,
-          agent: 'operator',
-          challengeId: entry.challenge_id,
-        }));
-        setHistoryLogs(mappedLogs);
-        historyLoadedRef.current.add(activeChallengeId);
-      } catch (err) {
-        console.warn('Failed to load terminal history:', err);
-      }
-    };
-
-    loadHistory();
-  }, [activeChallengeId]);
+  // Shared fetch/merge/execute logic — same hook used by the embedded
+  // challenge-workspace terminal, so the two views cannot drift.
+  const {
+    logs: currentLogs,
+    isExecuting,
+    executeCommand,
+    clearLocalLogs,
+  } = useTerminalLogs(logs, activeChallengeId);
 
   const handleCopy = (id: string, text: string) => {
     soundEngine.playClick();
@@ -70,7 +45,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
   const handleClear = () => {
     soundEngine.playClick();
-    setUserLogs([]);
+    clearLocalLogs();
   };
 
   const handleRun = async (e: React.FormEvent) => {
@@ -80,21 +55,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     soundEngine.playClick();
     const cmd = commandInput;
     setCommandInput('');
-    setIsExecuting(true);
-
-    try {
-      await apiService.executeTerminalCommand(cmd, activeChallengeId);
-    } catch (err) {
-      console.warn('Fallback execution via API error:', err);
-    } finally {
-      setIsExecuting(false);
-      if (onExecuteCommand) onExecuteCommand(cmd);
-    }
+    await executeCommand(cmd);
+    if (onExecuteCommand) onExecuteCommand(cmd);
   };
-
-  // Combine history logs (older) with live logs (newer)
-  // Live logs from websocket come in via `logs` prop, user logs from manual execution
-  const currentLogs = [...historyLogs, ...(logs && logs.length > 0 ? logs : userLogs)];
 
   const filteredLogs = currentLogs.filter((l) => {
     if (activeTab === 'forge_tools' && l.type !== 'FORGE TOOL EXECUTION' && l.type !== 'EXECUTION') return false;

@@ -1,3 +1,23 @@
+"""LEGACY / NOT PART OF THE PRODUCTION EXECUTION PATH.
+
+This is the legacy ReAct loop.  ``run_autonomous_loop()`` has **zero production
+callers** — nothing in the dashboard, API, or frontend ever starts it.  Only
+``resolve_install_request()`` / ``resolve_root_request()`` are invoked, from
+``backend/api/routes/system.py`` and
+``backend/api/routes/privilege_and_approvals.py``; those simply wake an
+``asyncio.Event`` on state that nothing ever populates in production, because the
+loop that would register those waiters never runs.  They are effectively inert
+today.
+
+The live dashboard execution engine is :mod:`backend.swarm.coordinator`
+(``SwarmCoordinator``), driven through ``backend/api/runner.py``.  Do not "fix
+bugs" in this module expecting them to affect live runs — the only things that
+exercise it are the four tests that call it directly (``tests/test_privilege_gate.py``,
+``tests/test_competition_harness.py``, ``tests/test_phase2_phase5.py``,
+``tests/test_candidate_resolution.py``).  Removal is a separate future decision
+once the live path has proven out; this module is quarantined, not yet deleted.
+"""
+
 import asyncio
 import json
 import re

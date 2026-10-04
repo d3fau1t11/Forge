@@ -35,6 +35,7 @@ import { soundEngine } from '../../utils/soundEngine';
 import { computeElapsedSeconds, formatDuration } from '../../utils/timeUtils';
 import { apiService } from '../../services/api';
 import { MarkdownRenderer, MessageCopyButton } from '../UI/MarkdownRenderer';
+import { useTerminalLogs } from '../../hooks/useTerminalLogs';
 
 interface ChallengeWorkspaceProps {
   challenge: Challenge;
@@ -79,6 +80,23 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
   );
   const [modeUpdating, setModeUpdating] = useState<boolean>(false);
   const chatBottomRef = useRef<HTMLDivElement>(null);
+
+  // ── Terminal Tab State (operator-typed commands + live agent executions) ──
+  const [terminalInput, setTerminalInput] = useState<string>('');
+  const {
+    logs: terminalLogs,
+    isExecuting: terminalExecuting,
+    executeCommand: executeTerminalCommand,
+  } = useTerminalLogs(logs, challenge.id);
+
+  const handleTerminalRun = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!terminalInput.trim() || terminalExecuting) return;
+    soundEngine.playClick();
+    const cmd = terminalInput;
+    setTerminalInput('');
+    await executeTerminalCommand(cmd);
+  };
 
   // Sync mode whenever challenge prop updates from parent or WS
   useEffect(() => {
@@ -1413,14 +1431,14 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
         <div className="bg-obsidian-950 border border-slate-800 rounded-xl p-5 font-mono text-xs space-y-4 shadow-inner">
           <div className="flex items-center justify-between border-b border-slate-800 pb-3">
             <span className="font-display font-bold text-cyber-cyan text-sm">TERMINAL STREAM FOR {challenge.name}</span>
-            <span className="text-[10px] text-slate-400 font-bold">{logs.length} COMMANDS LOGGED</span>
+            <span className="text-[10px] text-slate-400 font-bold">{terminalLogs.length} COMMANDS LOGGED</span>
           </div>
 
           <div className="space-y-3 max-h-96 overflow-y-auto">
-            {logs.map((l) => (
+            {terminalLogs.map((l) => (
               <div key={l.id} className="p-3.5 bg-obsidian-900 border border-slate-800/80 rounded-lg space-y-1.5 hover:border-cyber-cyan/30 transition-colors">
                 <div className="flex justify-between text-[10px] text-slate-400">
-                  <span>[{l.timestamp}] {l.type}</span>
+                  <span>[{l.timestamp}] {l.type}{l.agent ? ` • ${l.agent}` : ''}</span>
                   <span>EXIT: {l.exitCode} • DURATION: {l.duration}</span>
                 </div>
                 <div className="text-cyber-cyan font-bold font-mono">forge@parrot:~$ {l.command}</div>
@@ -1428,6 +1446,27 @@ export const ChallengeWorkspace: React.FC<ChallengeWorkspaceProps> = ({
               </div>
             ))}
           </div>
+
+          {/* Interactive Command Line Bar (operator-typed, scoped to this challenge) */}
+          <form onSubmit={handleTerminalRun} className="flex items-center space-x-3 border-2 border-cyber-cyan/40 p-2.5 rounded-xl shadow-[0_0_20px_rgba(0,240,255,0.15)]">
+            <span className="text-cyber-cyan font-bold text-xs pl-2 font-mono">forge@parrot:~$</span>
+            <input
+              type="text"
+              placeholder="Execute controlled tool capability or CLI provider command..."
+              value={terminalInput}
+              disabled={terminalExecuting}
+              onChange={(e) => setTerminalInput(e.target.value)}
+              className="flex-1 bg-transparent border-0 text-slate-100 text-xs font-mono focus:outline-none placeholder:text-slate-600 disabled:opacity-50"
+            />
+            <button
+              type="submit"
+              disabled={terminalExecuting}
+              className="px-5 py-2 rounded-lg bg-cyber-cyan hover:bg-cyan-300 text-obsidian-950 font-display font-bold text-xs uppercase flex items-center space-x-2 shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all disabled:opacity-50"
+            >
+              <Play className="w-3.5 h-3.5 fill-current" />
+              <span>{terminalExecuting ? 'EXECUTING...' : 'EXECUTE'}</span>
+            </button>
+          </form>
         </div>
       )}
 

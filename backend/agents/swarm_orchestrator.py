@@ -1,4 +1,16 @@
 """FORGE Autonomous Swarm Intelligence Orchestrator.
+
+QUARANTINED — NOT REACHABLE FROM THE LIVE DASHBOARD.
+``run_swarm()`` is reachable only via an explicit non-default ``?engine=<name>``
+query parameter on ``POST /api/runs/{id}/start``.  No current frontend path ever
+sends that parameter — ``startRun()`` in ``frontend/src/services/api.ts`` passes
+no engine argument — and the default engine is the Swarm Coordinator in
+``backend/swarm/coordinator.py``, which is the live execution engine.  Do not
+"fix bugs" here expecting them to affect dashboard runs; the only things that
+exercise this module are the tests that call it directly.  Removal is a separate
+future decision once the live path has proven out; this module is quarantined,
+not yet deleted.
+
 Dispatches specialized parallel agent workers (Recon, Code Audit, Exploit Solver) on a shared blackboard.
 Features:
 - Dynamic claim-and-solve task pool
