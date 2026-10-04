@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from backend.database.session import SessionLocal
-from backend.database.models import RunModel, ChallengeModel, ToolExecutionModel, CheckpointModel, TrajectoryEventModel
+from backend.database.models import RunModel, ChallengeModel, ToolExecutionModel, TrajectoryEventModel
 from backend.providers.router import model_router
 from backend.tools.manager import tool_manager, LOCAL_EXEC_CATEGORIES
 from backend.privilege.classify import classify_command_privilege
@@ -40,10 +40,6 @@ from backend.config import settings
 from backend.environment.detector import environment_detector
 from backend.agents.agent_prompt import AgentContext, build_agent_prompt, make_context_from_env
 from backend.agents.artifact_acquisition import acquire_artifacts
-from backend.agents import checkpoint_pipeline
-from backend.agents.checkpoint_pipeline import (
-    SuggestionDecision,
-)
 from backend.agent_runtime.verifier import (
     AnswerSource, FLAG_REGEX, FALSE_FLAG_PATTERNS,
 )
@@ -308,24 +304,22 @@ class SwarmOrchestrator:
                 for i, aid in enumerate(board.agent_ids)
             ]
 
-            # Run agents concurrently until flag capture, all-budget-exhaustion, or
-            # cancellation. ensure_future (not create_task) wraps the gather Future so
-            # it can sit in asyncio.wait() alongside the flag + checkpoint tasks.
+            # Run agents concurrently until flag capture or all-budget-exhaustion.
+            # ensure_future (not create_task) wraps the gather Future so it can sit
+            # in asyncio.wait() alongside the flag task.
             worker_task = asyncio.ensure_future(asyncio.gather(*agents, return_exceptions=True))
             flag_task = asyncio.create_task(board.flag_event.wait())
-            checkpoint_task = asyncio.create_task(self._checkpoint_coordinator(board, working_directory))
 
-            _append_to_challenge_log(challenge_id, "orchestrator", f"{pool_size} flexible-agent workers + checkpoint coordinator dispatched")
+            _append_to_challenge_log(challenge_id, "orchestrator", f"{pool_size} flexible-agent workers dispatched")
 
-            # Wait for flag event, all agents finishing, or coordinator exit.
+            # Wait for flag event or all agents finishing.
             done, pending = await asyncio.wait(
-                [flag_task, worker_task, checkpoint_task],
+                [flag_task, worker_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
 
-            # Stop everything and release any coordinator hard-wait so it can exit.
+            # Stop everything and cancel any task still in flight.
             board.is_stopped = True
-            board.checkpoint_response_event.set()
             for p in pending:
                 p.cancel()
 
@@ -456,9 +450,6 @@ class SwarmOrchestrator:
             if board.challenge_id == challenge_id and not board.is_stopped:
                 board.pause_requested = True
                 board.is_stopped = True
-                # Release a coordinator that is hard-waiting at a checkpoint so it
-                # can observe is_stopped and exit cleanly instead of hanging.
-                board.checkpoint_response_event.set()
                 try:
                     await board._persist_progress_if_due(force=True)
                 except Exception:
@@ -539,19 +530,6 @@ class SwarmOrchestrator:
         MAX_CONSECUTIVE_NO_PROGRESS = 10  # ~10 steps with zero knowledge growth triggers stop
 
         while not board.flag_captured and not board.is_stopped:
-            # Hard-pause at a checkpoint: idle until the operator response resumes us.
-            # Time spent idle here is accumulated and subtracted from the work budget so a
-            # multi-minute operator pause never counts against the M working-minute clock.
-            if board.checkpoint_pause:
-                pause_started = time.time()
-                await board.update_worker_state(agent_id, status="IDLE", current_task="Paused at operator checkpoint")
-                while board.checkpoint_pause and not board.is_stopped and not board.flag_captured:
-                    await asyncio.sleep(1.0)
-                board.agent_paused_seconds[agent_id] = (
-                    board.agent_paused_seconds.get(agent_id, 0.0) + (time.time() - pause_started)
-                )
-                continue
-
             # Instance-expiry hard wind-down — the CTF platform kills the target on its own
             # timer (as short as ~15 min). Stop and report best findings a buffer before that
             # deadline rather than being cut off mid-command.
@@ -1153,300 +1131,6 @@ class SwarmOrchestrator:
                 await asyncio.sleep(min(3 * consecutive_errors, 15))
 
         await board.update_worker_state(agent_id, status="DONE", current_task="Agent finished")
-
-    # ── HITL checkpoint coordinator (hard pause & wait) ─────────────────────────
-
-    def _make_summarizer(self):
-        """Async callable for the strictly-extractive narrative pass. Returns
-        None on any failure so the report still renders deterministically.
-
-        Routed through the general_reasoning chain (NOT Gemini): Gemini is reserved
-        for vision + final report authoring (Workstream C), and its safety filters
-        refuse often enough on red-team context to make it unreliable mid-run."""
-        async def _summarize(prompt: str) -> Optional[str]:
-            try:
-                resp = await model_router.route_request(
-                    prompt=prompt, capability="general_reasoning")
-                if resp and not resp.is_refusal:
-                    return resp.content
-            except Exception:
-                return None
-            return None
-        return _summarize
-
-    def _wind_down_for_expiry(self, board: "SwarmBlackboard"):
-        """Stop the run cleanly as the platform instance-expiry deadline nears. Agents
-        self-stop on the same deadline (see _agent_worker); this signals run_swarm to
-        finalize with best findings instead of the coordinator hard-waiting on a paste."""
-        board.stall_reason = board.stall_reason or "Platform instance expiry reached"
-        _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                 "Instance expiry within wind-down buffer — stopping run with best findings")
-        board.is_stopped = True
-        board.checkpoint_response_event.set()
-
-    async def _checkpoint_coordinator(self, board: "SwarmBlackboard", workdir: str):
-        """Every CHECKPOINT_INTERVAL_SECONDS (or as the instance timer nears expiry,
-        or immediately on a verified flag), hard-pause all agents, emit ONE
-        consolidated report, and wait for the operator's pasted guidance."""
-        _append_to_challenge_log(board.challenge_id, "checkpoint", "Checkpoint coordinator started")
-        while not board.flag_captured and not board.is_stopped:
-            interval = int(getattr(settings, "CHECKPOINT_INTERVAL_SECONDS", 300))
-            buffer = int(getattr(settings, "INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
-            # Too close to instance expiry to run an interactive (operator-paste) checkpoint
-            # — wind down instead of hard-waiting for a paste that can't complete in time.
-            if board.instance_expiry_ts and (board.instance_expiry_ts - time.time()) <= buffer:
-                self._wind_down_for_expiry(board)
-                break
-            if board.instance_expiry_ts:
-                secs_left = board.instance_expiry_ts - time.time()
-                if secs_left > 0:
-                    interval = min(interval, max(10, int(secs_left - buffer)))
-            try:
-                await asyncio.wait_for(board.flag_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
-            if board.flag_captured or board.is_stopped:
-                break
-            # Crossed into the expiry buffer while waiting → wind down, don't hard-wait.
-            if board.instance_expiry_ts and (board.instance_expiry_ts - time.time()) <= buffer:
-                self._wind_down_for_expiry(board)
-                break
-            try:
-                await self._run_checkpoint_cycle(board, workdir)
-            except Exception as e:
-                logger.warning(f"[checkpoint] cycle error (non-fatal): {e}")
-                _append_to_challenge_log(board.challenge_id, "checkpoint", f"Cycle error (non-fatal): {e}")
-                board.checkpoint_pause = False
-                board.checkpoint_active = False
-        _append_to_challenge_log(board.challenge_id, "checkpoint", "Checkpoint coordinator stopped")
-
-    async def _run_checkpoint_cycle(self, board: "SwarmBlackboard", workdir: str):
-        cycle_start = board.cycle_window_start_ts
-        board.checkpoint_pause = True
-        board.checkpoint_active = True
-        board.cycle_n += 1
-        board.checkpoint_response_event.clear()
-        board.latest_pasted_response = None
-        _append_to_challenge_log(board.challenge_id, "checkpoint", f"=== Checkpoint cycle {board.cycle_n}: pausing agents ===")
-        # Passive provider-headroom summary (from real response headers; no extra calls).
-        try:
-            from backend.providers.quota_manager import quota_manager as _qm
-            _append_to_challenge_log(board.challenge_id, "checkpoint", f"Provider headroom: {_qm.ratelimit_summary()}")
-        except Exception:
-            pass
-        await asyncio.sleep(2.0)  # brief quiesce so in-flight steps land
-
-        records = board.snapshot_agent_records()
-        start_str = datetime.fromtimestamp(cycle_start, tz=timezone.utc).strftime("%H:%M:%S")
-        end_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        report = await checkpoint_pipeline.build_consolidated_report(
-            challenge_name=board.challenge_name, category=board.category, difficulty=board.difficulty,
-            target=board.target_scope, cycle_n=board.cycle_n, start_time=start_str, end_time=end_str,
-            records=records, summarizer=self._make_summarizer(),
-        )
-        board.last_checkpoint_report = report
-
-        db = SessionLocal()
-        try:
-            db.add(CheckpointModel(
-                run_id=board.run_id,
-                state_snapshot={"kind": "hitl_checkpoint", "cycle_n": board.cycle_n,
-                                "report": report, "agent_ids": list(board.agent_ids)},
-                last_successful_action=f"checkpoint_cycle_{board.cycle_n}",
-                resumable=True,
-            ))
-            run_obj = db.query(RunModel).filter(RunModel.id == board.run_id).first()
-            if run_obj:
-                run_obj.status = "WAITING_FOR_USER"
-            ch_obj = db.query(ChallengeModel).filter(ChallengeModel.id == board.challenge_id).first()
-            if ch_obj:
-                ch_obj.status = "WAITING_FOR_USER"
-            db.commit()
-        except Exception as e:
-            logger.debug(f"[checkpoint] persist skip: {e}")
-        finally:
-            db.close()
-
-        await ws_manager.broadcast({
-            "event": "CHECKPOINT_REACHED", "challenge_id": board.challenge_id, "run_id": board.run_id,
-            "cycle": board.cycle_n, "report": report,
-        })
-        _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                 f"Report emitted for cycle {board.cycle_n}; awaiting operator paste")
-
-        # Bounded wait for operator's pasted external-model response.
-        # Concurrently monitors operator response, flag capture, and cancellation/pause
-        # while respecting CHECKPOINT_TIMEOUT_SECONDS and instance wind-down buffer.
-        timeout = float(getattr(settings, "CHECKPOINT_TIMEOUT_SECONDS", 30))
-        buffer = float(getattr(settings, "INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
-        if board.instance_expiry_ts:
-            secs_left = board.instance_expiry_ts - time.time() - buffer
-            if secs_left > 0:
-                timeout = min(timeout, max(0.1, secs_left))
-            else:
-                self._wind_down_for_expiry(board)
-                board.checkpoint_pause = False
-                board.checkpoint_active = False
-                return
-
-        resp_wait = asyncio.create_task(board.checkpoint_response_event.wait())
-        flag_wait = asyncio.create_task(board.flag_event.wait())
-        timed_out = False
-        try:
-            if timeout > 0:
-                done, pending = await asyncio.wait(
-                    [resp_wait, flag_wait],
-                    timeout=timeout,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                if not done:
-                    timed_out = True
-            else:
-                timed_out = True
-        except asyncio.CancelledError:
-            board.checkpoint_pause = False
-            board.checkpoint_active = False
-            raise
-        except Exception:
-            timed_out = True
-        finally:
-            resp_wait.cancel()
-            flag_wait.cancel()
-
-        if board.is_stopped or board.flag_captured:
-            board.checkpoint_pause = False
-            board.checkpoint_active = False
-            return
-
-        if board.instance_expiry_ts and (board.instance_expiry_ts - time.time()) <= buffer:
-            self._wind_down_for_expiry(board)
-            board.checkpoint_pause = False
-            board.checkpoint_active = False
-            return
-
-        pasted = board.latest_pasted_response
-        if timed_out or not pasted:
-            _append_to_challenge_log(
-                board.challenge_id, "checkpoint",
-                f"No operator guidance received within timeout ({timeout:.1f}s) — resuming autonomous execution"
-            )
-            await ws_manager.broadcast({
-                "event": "CHECKPOINT_RESUMED", "challenge_id": board.challenge_id, "run_id": board.run_id,
-                "cycle": board.cycle_n, "routed": [], "timeout": True,
-            })
-        else:
-            pasted_str = pasted or ""
-            parsed = checkpoint_pipeline.parse_suggestions(pasted_str, board.agent_ids)
-
-            # -- Pull state for evaluation from the shared mission (best-effort) --
-            # We use the board's own fields where available; the suggestion evaluator
-            # gracefully handles None/empty iterables.
-            _ms = getattr(board, "mission_state", None)
-            _exh = list(board.exhausted_strategies) if hasattr(board, "exhausted_strategies") else []
-            _fail = list(getattr(_ms, "failed_techniques", []) or []) if _ms else []
-            _eps = list(getattr(_ms, "endpoints", []) or getattr(_ms, "known_endpoints", []) or []) if _ms else []
-            _files = list(getattr(_ms, "known_files", []) or []) if _ms else []
-            _flags = list(getattr(_ms, "flag_candidates", []) or []) if _ms else []
-
-            def _evaluate_and_inject(aid: str, directive: str) -> None:
-                """Evaluate one directive; inject only if ACCEPTED or MODIFIED."""
-                ev = checkpoint_pipeline.evaluate_suggestion(
-                    directive,
-                    exhausted_strategies=_exh,
-                    failed_techniques=_fail,
-                    known_endpoints=_eps,
-                    known_files=_files,
-                    flag_candidates=_flags,
-                )
-                if ev.decision == SuggestionDecision.REJECT:
-                    _append_to_challenge_log(
-                        board.challenge_id, "checkpoint",
-                        f"[SUGGESTION_REJECTED:{aid}] {ev.reason} | original: {directive[:120]}",
-                    )
-                    return  # Do NOT inject rejected suggestions
-                action_text = ev.suggested_action or directive
-                prev = board.agent_directives.get(aid, "")
-                if ev.decision == SuggestionDecision.MODIFY:
-                    _append_to_challenge_log(
-                        board.challenge_id, "checkpoint",
-                        f"[SUGGESTION_MODIFIED:{aid}] {ev.reason}",
-                    )
-                board.agent_directives[aid] = (prev + "\n\n" + action_text).strip() if prev else action_text
-
-            if parsed.parsed:
-                async with board._lock:
-                    for aid, directive in parsed.directives.items():
-                        _evaluate_and_inject(aid, directive)
-                injected = [aid for aid in parsed.directives if board.agent_directives.get(aid)]
-                _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                         f"Routed evaluated directives to: {', '.join(sorted(parsed.directives.keys()))}"
-                                         + (f" | {parsed.note}" if parsed.note else ""))
-                await ws_manager.broadcast({
-                    "event": "CHECKPOINT_RESUMED", "challenge_id": board.challenge_id, "run_id": board.run_id,
-                    "cycle": board.cycle_n, "routed": sorted(parsed.directives.keys()),
-                    "unknown_labels": parsed.unknown_labels,
-                })
-            else:
-                if parsed.fallback and parsed.fallback_text:
-                    async with board._lock:
-                        for aid in board.agent_ids:
-                            _evaluate_and_inject(aid, "[GENERAL GUIDANCE] " + parsed.fallback_text)
-                _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                         f"UNPARSEABLE paste — {parsed.note} Applied as general guidance to all agents.")
-                await ws_manager.broadcast({
-                    "event": "CHECKPOINT_PARSE_ERROR", "challenge_id": board.challenge_id, "run_id": board.run_id,
-                    "cycle": board.cycle_n, "note": parsed.note, "applied_as_general": bool(parsed.fallback_text),
-                })
-
-        # Refresh each agent's budget for the new cycle. The operator just re-authorized
-        # continuation at the checkpoint, so directives get a fresh iteration/minute window
-        # instead of dying instantly on a budget that was already spent before the pause
-        # (the checkpoint-interval == budget trap). The dedup set is deliberately NOT reset,
-        # so agents still never re-run an identical command.
-        now_ts = time.time()
-        for aid in board.agent_ids:
-            board.agent_started_ts[aid] = now_ts
-            board.agent_paused_seconds[aid] = 0.0
-            board.agent_iterations[aid] = 0
-            board.agent_local_fail_streak[aid] = 0
-        _append_to_challenge_log(
-            board.challenge_id, "checkpoint",
-            f"Budget refreshed for {len(board.agent_ids)} agents on resume (fresh cycle window)")
-
-        board.checkpoint_pause = False
-        board.checkpoint_active = False
-        board.latest_pasted_response = None
-        db = SessionLocal()
-        try:
-            run_obj = db.query(RunModel).filter(RunModel.id == board.run_id).first()
-            if run_obj:
-                run_obj.status = "RUNNING"
-            ch_obj = db.query(ChallengeModel).filter(ChallengeModel.id == board.challenge_id).first()
-            if ch_obj:
-                ch_obj.status = "RUNNING"
-            db.commit()
-        except Exception:
-            pass
-        finally:
-            db.close()
-        board.cycle_window_start_ts = time.time()
-        _append_to_challenge_log(board.challenge_id, "checkpoint", f"=== Checkpoint cycle {board.cycle_n}: agents resumed ===")
-
-    async def submit_checkpoint_response(self, challenge_id: str, text: str) -> Dict[str, Any]:
-        """Deliver the operator's pasted external-model response to a waiting swarm.
-        Called by the API. Parsing/injection happens in the coordinator on wake."""
-        for board in list(self.active_swarms.values()):
-            if board.challenge_id == challenge_id and board.checkpoint_active:
-                board.latest_pasted_response = text or ""
-                preview = checkpoint_pipeline.parse_suggestions(text or "", board.agent_ids)
-                board.checkpoint_response_event.set()
-                return {
-                    "accepted": True, "parsed": preview.parsed,
-                    "routed": sorted(preview.directives.keys()),
-                    "fallback": preview.fallback, "unknown_labels": preview.unknown_labels,
-                    "note": preview.note,
-                }
-        return {"accepted": False, "reason": "No active checkpoint is awaiting a response for this challenge."}
 
     async def submit_approval_response(self, request_id: str, decision: str, sudo_password: Optional[str] = None) -> Dict[str, Any]:
         """Deliver operator's approve/deny decision for a pending privileged command.

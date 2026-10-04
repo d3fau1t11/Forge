@@ -252,22 +252,6 @@ export class ApiService {
     return await res.json();
   }
 
-  public async getCheckpoint(challengeId: string) {
-    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  }
-
-  public async respondToCheckpoint(challengeId: string, text: string) {
-    const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint/respond`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  }
-
   public async respondApproval(requestId: string, decision: 'approve' | 'deny', sudoPassword?: string): Promise<{ accepted: boolean; reason?: string }> {
     const body: Record<string, string> = { decision };
     if (sudoPassword !== undefined && sudoPassword !== '') {

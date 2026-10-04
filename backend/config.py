@@ -87,14 +87,6 @@ try:
         AGENT_MAX_ITERATIONS: int = 40      # default tool-call budget per run
         AGENT_MAX_MINUTES: int = 30         # default wall-clock ceiling per run (minutes)
 
-        # HITL checkpoint interval in seconds (default: 5 minutes).
-        CHECKPOINT_INTERVAL_SECONDS: int = 300
-
-        # HITL checkpoint wait timeout in seconds. If no operator guidance is supplied
-        # within this window, the checkpoint times out and agents resume autonomously.
-        # Set to 0 for non-blocking / immediate resume. Default: 30 seconds.
-        CHECKPOINT_TIMEOUT_SECONDS: int = 30
-
         # Per-command operator-approval mode for PRIVILEGED/DANGEROUS commands.
         #   "manual" (default) — every PRIVILEGED/DANGEROUS command waits (with no
         #                        timeout) for an explicit operator approve/deny.
@@ -103,7 +95,6 @@ try:
         #                        needs `sudo`, which waits (no timeout) for the
         #                        password only, not a yes/no decision.
         # Defaults to the safer "manual" so an unconfigured deployment keeps asking.
-        # NOTE: this is NOT the cycle-level HITL checkpoint timeout above.
         FORGE_APPROVAL_MODE: str = "manual"
         AUTO_APPROVE_PRIVILEGED: bool = False
 
@@ -190,8 +181,6 @@ except ImportError:
             self.SESSION_BUDGET_USD = float(os.getenv("SESSION_BUDGET_USD", 2.0))
             self.AGENT_MAX_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", 40))
             self.AGENT_MAX_MINUTES = int(os.getenv("AGENT_MAX_MINUTES", 30))
-            self.CHECKPOINT_INTERVAL_SECONDS = int(os.getenv("CHECKPOINT_INTERVAL_SECONDS", 300))
-            self.CHECKPOINT_TIMEOUT_SECONDS = int(os.getenv("CHECKPOINT_TIMEOUT_SECONDS", 30))
             # Per-command operator-approval mode: "manual" (ask, no timeout) or "auto"
             # (run unattended; only a literal `sudo` command waits, for the password).
             self.FORGE_APPROVAL_MODE = os.getenv("FORGE_APPROVAL_MODE", "manual").strip().lower()
