@@ -192,6 +192,51 @@ export default function App() {
     }
   };
 
+  // Reconcile live SwarmCoordinator (swarm_coord) state for a challenge. This is the
+  // REST reconciliation fallback for the SWARM_* WebSocket family and mirrors the
+  // status/flag transitions the legacy RUN_*/FLAG_* branches apply. The endpoint
+  // reports status "NONE" for legacy/non-coordinator challenges, so it is skipped.
+  const fetchSwarmReconcile = async (challengeId: string) => {
+    if (!challengeId) return;
+    const swarmState = await apiService.fetchSwarmState(challengeId);
+    if (!swarmState || swarmState.status === 'NONE') return;
+
+    const isComplete = swarmState.status === 'COMPLETED';
+    const isFailed = swarmState.status === 'FAILED' || swarmState.status === 'CANCELLED';
+    const nextStatus: Challenge['status'] = isComplete ? 'COMPLETED' : (isFailed ? 'FAILED' : 'RUNNING');
+
+    setChallenges((prev) =>
+      prev.map((c) =>
+        c.id === challengeId
+          ? {
+              ...c,
+              status: nextStatus,
+              progress: isComplete ? 100 : (typeof swarmState.progress === 'number' ? swarmState.progress : c.progress),
+              flagStatus: swarmState.verified_flag ? 'CAPTURED' : c.flagStatus,
+              flag: swarmState.verified_flag || c.flag
+            }
+          : c
+      )
+    );
+    setActiveChallenge((prev) =>
+      prev && prev.id === challengeId
+        ? {
+            ...prev,
+            status: nextStatus,
+            progress: isComplete ? 100 : (typeof swarmState.progress === 'number' ? swarmState.progress : prev.progress),
+            flagStatus: swarmState.verified_flag ? 'CAPTURED' : prev.flagStatus,
+            flag: swarmState.verified_flag || prev.flag
+          }
+        : prev
+    );
+
+    if (Array.isArray(swarmState.agents) && swarmState.agents.length > 0) {
+      // Coordinator agents carry agent_id (not worker_id); normalize so mapSwarmAgents
+      // yields stable React ids instead of regenerating them on every poll.
+      setAgents(mapSwarmAgents(swarmState.agents.map((a) => ({ ...a, worker_id: a.worker_id || a.agent_id }))));
+    }
+  };
+
   useEffect(() => {
     if (activeChallenge?.id) {
       fetchActiveChallengeData(activeChallenge.id);
@@ -221,6 +266,7 @@ export default function App() {
           fetchBackendData();
           if (activeChallengeRef.current?.id) {
             fetchActiveChallengeData(activeChallengeRef.current.id);
+            fetchSwarmReconcile(activeChallengeRef.current.id);
           }
         };
 
@@ -379,6 +425,130 @@ export default function App() {
             } else if (data.event === 'SWARM_BLACKBOARD_UPDATE') {
               if (data.challenge_id) {
                 fetchActiveChallengeData(data.challenge_id);
+              }
+            } else if (data.event === 'SWARM_MISSION_STARTED') {
+              // SwarmCoordinator equivalent of the legacy RUN_STARTED branch.
+              setChallenges((prev) =>
+                prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
+              );
+              setActiveChallenge((prev) => (prev && prev.id === data.challenge_id ? { ...prev, status: 'RUNNING' } : prev));
+              if (data.challenge_id) fetchActiveChallengeData(data.challenge_id);
+            } else if (data.event === 'SWARM_MISSION_COMPLETE') {
+              // SwarmCoordinator equivalent of RUN_COMPLETED plus FLAG_CAPTURED; the
+              // coordinator's completion payload carries the verified flag directly.
+              setChallenges((prev) =>
+                prev.map((c) =>
+                  c.id === data.challenge_id
+                    ? {
+                        ...c,
+                        status: 'COMPLETED',
+                        progress: 100,
+                        flagStatus: data.flag ? 'CAPTURED' : c.flagStatus,
+                        flag: data.flag || c.flag
+                      }
+                    : c
+                )
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id
+                  ? {
+                      ...prev,
+                      status: 'COMPLETED',
+                      progress: 100,
+                      flagStatus: data.flag ? 'CAPTURED' : prev.flagStatus,
+                      flag: data.flag || prev.flag
+                    }
+                  : prev
+              );
+              if (data.flag) {
+                const newFinding: Finding = {
+                  id: `find-${Date.now()}`,
+                  title: `Flag Extracted`,
+                  severity: 'CRITICAL',
+                  endpoint: 'Target System',
+                  status: 'VERIFIED',
+                  description: `Successfully extracted flag: ${data.flag}`,
+                  challengeId: data.challenge_id
+                };
+                setFindings((prev) => [newFinding, ...prev]);
+              }
+              if (data.challenge_id) fetchActiveChallengeData(data.challenge_id);
+            } else if (data.event === 'SWARM_MISSION_FAILED') {
+              // SwarmCoordinator equivalent of the legacy RUN_STALLED/RUN_FAILED branch.
+              setChallenges((prev) =>
+                prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'FAILED' } : c))
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id ? { ...prev, status: 'FAILED' } : prev
+              );
+            } else if (
+              data.event === 'SWARM_TASK_STARTED' ||
+              data.event === 'SWARM_TASK_COMPLETED' ||
+              data.event === 'SWARM_TASK_FAILED'
+            ) {
+              // Task lifecycle events do not change mission-level status (a failed task is
+              // retried/reassigned), so resync the challenge-scoped view with the same
+              // helper the legacy SWARM_BLACKBOARD_UPDATE branch uses.
+              if (data.challenge_id) fetchActiveChallengeData(data.challenge_id);
+            } else if (data.event === 'SWARM_FLAG_VERIFIED') {
+              // SwarmCoordinator equivalent of the legacy FLAG_CAPTURED branch.
+              setChallenges((prev) =>
+                prev.map((c) =>
+                  c.id === data.challenge_id
+                    ? {
+                        ...c,
+                        flagStatus: 'CAPTURED',
+                        flag: data.flag,
+                        status: 'COMPLETED',
+                        progress: 100
+                      }
+                    : c
+                )
+              );
+              setActiveChallenge((prev) =>
+                prev && prev.id === data.challenge_id
+                  ? {
+                      ...prev,
+                      flagStatus: 'CAPTURED',
+                      flag: data.flag,
+                      status: 'COMPLETED',
+                      progress: 100
+                    }
+                  : prev
+              );
+              const verifiedFinding: Finding = {
+                id: `find-${Date.now()}`,
+                title: `Flag Extracted`,
+                severity: 'CRITICAL',
+                endpoint: 'Target System',
+                status: 'VERIFIED',
+                description: `Successfully extracted flag: ${data.flag}`,
+                challengeId: data.challenge_id
+              };
+              setFindings((prev) => [verifiedFinding, ...prev]);
+              if (data.challenge_id) fetchActiveChallengeData(data.challenge_id);
+            } else if (data.event === 'SWARM_AGENT_STATUS') {
+              // SwarmCoordinator equivalent of the legacy AGENT_UPDATE branch. The payload
+              // is one agent, so merge it into the fleet via the existing mapSwarmAgents().
+              if (data.agent_id) {
+                setAgents((prev) => {
+                  const incoming = mapSwarmAgents([{
+                    worker_id: data.agent_id,
+                    status: data.status,
+                    current_task: data.current_task
+                  }])[0];
+                  const idx = prev.findIndex((a) => a.id === data.agent_id);
+                  if (idx >= 0) {
+                    const next = [...prev];
+                    next[idx] = {
+                      ...next[idx],
+                      status: incoming.status,
+                      currentObjective: incoming.currentObjective
+                    };
+                    return next;
+                  }
+                  return [...prev, incoming];
+                });
               }
             } else if (data.event === 'MEMORY_RETRIEVED') {
               const newDec: AiDecision = {
@@ -659,6 +829,14 @@ export default function App() {
         if (activeChallengeRef.current?.id) {
           fetchActiveChallengeData(activeChallengeRef.current.id);
         }
+        // Coordinator (swarm_coord) reconciliation — the endpoint self-reports status
+        // "NONE" for legacy-engine challenges, so this is a no-op for them.
+        challenges
+          .filter((c) =>
+            c.status === 'RUNNING' || c.status === 'AWAITING_FLAG' ||
+            c.status === 'WAITING' || c.status === 'WAITING_FOR_USER'
+          )
+          .forEach((c) => fetchSwarmReconcile(c.id));
       }
     }, 10000);
 

@@ -89,6 +89,7 @@ class AutonomousOrchestrator:
         # verbatim for backward compatibility, and delegates only via run_with_runtime.
         self._runtime = None
         self._session_manager = None
+        self._runtime_key = None
 
     # ------------------------------------------------------------------ #
     # Agent-runtime facade (Step 5). The orchestrator is becoming a thin
@@ -97,11 +98,20 @@ class AutonomousOrchestrator:
     # provider-agnostic) while the legacy run_autonomous_loop remains available.
     # ------------------------------------------------------------------ #
 
-    def _ensure_runtime(self):
-        if self._runtime is None:
+    def _ensure_runtime(self, challenge_id: Optional[str] = None,
+                        run_id: Optional[str] = None):
+        # The executor binds the PER-MISSION approval context (challenge_id/run_id)
+        # to the operator gate. This orchestrator is a process-wide singleton, so
+        # the runtime is cached per (challenge_id, run_id) rather than once — reusing
+        # a runtime built for mission A on mission B would make B's approval requests
+        # carry A's challenge id and resolve A's approval_mode.
+        key = (challenge_id, run_id)
+        if self._runtime is None or self._runtime_key != key:
             from backend.agent_runtime import AgentRuntime, RealToolExecutor, session_manager
             self._session_manager = session_manager
-            self._runtime = AgentRuntime(tool_executor=RealToolExecutor())
+            self._runtime = AgentRuntime(
+                tool_executor=RealToolExecutor(challenge_id=challenge_id, run_id=run_id))
+            self._runtime_key = key
         return self._runtime
 
     async def run_with_runtime(
@@ -120,7 +130,7 @@ class AutonomousOrchestrator:
         Challenge metadata is read from the DB so the runtime prompt matches the swarm's.
         Non-fatal to the legacy path — callers may still use run_autonomous_loop.
         """
-        runtime = self._ensure_runtime()
+        runtime = self._ensure_runtime(challenge_id=challenge_id, run_id=run_id)
         sm = self._session_manager
 
         db = SessionLocal()

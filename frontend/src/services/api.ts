@@ -1,4 +1,4 @@
-import { ChallengeChatMessage } from '../types';
+import { ChallengeChatMessage, SwarmState } from '../types';
 
 // Operator API key for the backend's X-Forge-Key gate. Empty in local dev, where the
 // backend runs with FORGE_API_KEY unset and accepts unauthenticated calls.
@@ -121,6 +121,20 @@ export class ApiService {
   public async getChallengePlan(challengeId: string) {
     try {
       const res = await apiFetch(`${API_BASE_URL}/challenges/${challengeId}/plan`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Live/durable SwarmCoordinator (swarm_coord engine) state for a challenge.
+   * Returns null on any failure so callers can treat it as a missing reconciliation.
+   */
+  public async fetchSwarmState(challengeId: string): Promise<SwarmState | null> {
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/swarm/challenges/${challengeId}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {

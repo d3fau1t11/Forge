@@ -267,4 +267,56 @@ export interface ChallengeChatMessage {
   created_at?: string;
 }
 
+// Live/durable snapshot returned by GET /api/swarm/challenges/{challenge_id}
+// (SwarmCoordinator.snapshot() + evidence/live, or the persisted assemble view).
+export interface SwarmStateAgent {
+  agent_id: string;
+  role?: string;
+  status?: string;
+  current_task?: string | null;
+  task_id?: string | null;
+  [key: string]: any;
+}
+
+export interface SwarmStateTask {
+  id: string;
+  mission_id?: string;
+  role?: string;
+  assigned_agent?: string;
+  objective?: string;
+  priority?: number;
+  status?: string;
+  dependencies?: string[];
+  evidence_ids?: string[];
+  retry_count?: number;
+  parent_task_id?: string | null;
+  failure_reason?: string | null;
+  agent_session_id?: string | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+  [key: string]: any;
+}
+
+export interface SwarmState {
+  mission_id: string | null;
+  run_id?: string;
+  challenge_id?: string;
+  status: string;
+  progress?: number;
+  strategy?: string;
+  verified_flag?: string | null;
+  target?: string;
+  target_reconciliation?: any;
+  shared_state?: any;
+  agents: SwarmStateAgent[];
+  tasks: SwarmStateTask[];
+  task_counts: Record<string, number>;
+  evidence_count: number;
+  evidence: any[];
+  quota?: any;
+  limits?: any;
+  reasoning?: any;
+  live: boolean;
+}
+
 

@@ -3,6 +3,8 @@ import logging
 import os
 from typing import Dict, Any, Optional
 
+from backend.websocket.manager import ws_manager
+
 logger = logging.getLogger("forge.runner")
 
 class WorkflowRunner:
@@ -162,9 +164,114 @@ class WorkflowRunner:
         except RuntimeError as e:
             import traceback as tb
             logger.error(f"Failed to create run task for run {run_id}: {e}\n{tb.format_exc()}")
+
+            # --- STARTUP FAILURE HANDLING -----------------------------------------
+            # A run_config / loop / task-creation failure leaves the challenge
+            # committed as RUNNING by the caller before we got here. Mark every
+            # layer FAILED so nothing stays stuck reporting RUNNING.
+            self.active_runs[run_id]["status"] = "FAILED"
+            self.active_runs[run_id]["failure_reason"] = str(e)
+
+            # Persist FAILED to the DB. Wrapped in its own try/except so a DB
+            # failure during failure-handling cannot raise out of start_run().
+            try:
+                from backend.database.session import SessionLocal
+                from backend.database.models import ChallengeModel, RunModel
+
+                db = SessionLocal()
+                try:
+                    ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+                    run = db.query(RunModel).filter(RunModel.id == run_id).first()
+                    if ch:
+                        ch.status = "FAILED"
+                    if run:
+                        run.status = "FAILED"
+                    db.commit()
+                finally:
+                    db.close()
+            except Exception as db_err:
+                logger.error(
+                    f"[WorkflowRunner] Failed to persist FAILED status for run {run_id}: {db_err}",
+                    exc_info=True,
+                )
+
+            # Mirror the failure into the challenge log file (same import pattern
+            # already used by _on_task_done below).
+            try:
+                from backend.agents.swarm_helpers import _append_to_challenge_log
+                _append_to_challenge_log(challenge_id, "runner", f"STARTUP FAILED: {e}")
+            except Exception:
+                pass
+
+            # Fire-and-forget WebSocket broadcast. start_run() is sync, so schedule
+            # the coroutine on the running loop rather than awaiting it. Scheduling
+            # was chosen over an async wrapper because it needs NO change to the
+            # existing await-free call site in routes/runs_and_checkpoints.py.
+            try:
+                try:
+                    _loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    _loop = asyncio.get_event_loop()
+                _loop.create_task(ws_manager.broadcast({
+                    "event": "RUN_FAILED",
+                    "run_id": run_id,
+                    "challenge_id": challenge_id,
+                    "target": target,
+                    "reason": str(e),
+                }))
+            except Exception as ws_err:
+                logger.error(f"[WorkflowRunner] Failed to broadcast RUN_FAILED for run {run_id}: {ws_err}")
         except Exception as e:
             import traceback as tb
             logger.error(f"Unexpected error starting run task for run {run_id}: {e}\n{tb.format_exc()}")
+
+            # --- STARTUP FAILURE HANDLING -----------------------------------------
+            # Same remediation as the RuntimeError branch above, for unexpected
+            # failures (bad run_config, workspace resolution, DB error, etc.).
+            self.active_runs[run_id]["status"] = "FAILED"
+            self.active_runs[run_id]["failure_reason"] = str(e)
+
+            try:
+                from backend.database.session import SessionLocal
+                from backend.database.models import ChallengeModel, RunModel
+
+                db = SessionLocal()
+                try:
+                    ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+                    run = db.query(RunModel).filter(RunModel.id == run_id).first()
+                    if ch:
+                        ch.status = "FAILED"
+                    if run:
+                        run.status = "FAILED"
+                    db.commit()
+                finally:
+                    db.close()
+            except Exception as db_err:
+                logger.error(
+                    f"[WorkflowRunner] Failed to persist FAILED status for run {run_id}: {db_err}",
+                    exc_info=True,
+                )
+
+            try:
+                from backend.agents.swarm_helpers import _append_to_challenge_log
+                _append_to_challenge_log(challenge_id, "runner", f"STARTUP FAILED: {e}")
+            except Exception:
+                pass
+
+            try:
+                try:
+                    _loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    _loop = asyncio.get_event_loop()
+                _loop.create_task(ws_manager.broadcast({
+                    "event": "RUN_FAILED",
+                    "run_id": run_id,
+                    "challenge_id": challenge_id,
+                    "target": target,
+                    "reason": str(e),
+                }))
+            except Exception as ws_err:
+                logger.error(f"[WorkflowRunner] Failed to broadcast RUN_FAILED for run {run_id}: {ws_err}")
 
     def activate_kill_switch(self, run_id: Optional[str] = None):
         """Emergency Kill Switch - immediately halts autonomous operations."""

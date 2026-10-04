@@ -87,13 +87,17 @@ class SpecialistAgent:
 
     # ------------------------------------------------------------------ #
 
-    def _get_runtime(self) -> AgentRuntime:
+    def _get_runtime(self, challenge_id: Optional[str] = None,
+                     run_id: Optional[str] = None) -> AgentRuntime:
         if self._runtime is not None:
             return self._runtime
         if self._runtime_factory is not None:
             return self._runtime_factory(self.role)
         # Production default: the real tool executor (ToolManager → ExecutionService).
-        return AgentRuntime(tool_executor=RealToolExecutor())
+        # Bind the mission's challenge/run so the operator-approval gate can resolve
+        # the challenge's own approval_mode and attribute the request correctly.
+        return AgentRuntime(
+            tool_executor=RealToolExecutor(challenge_id=challenge_id, run_id=run_id))
 
     def _agent_cwd(self, task: Task) -> Optional[str]:
         if not self.workspace_root:
@@ -137,7 +141,7 @@ class SpecialistAgent:
         session_manager.save(sess)
 
         # 3) Run the unmodified AgentRuntime loop.
-        runtime = self._get_runtime()
+        runtime = self._get_runtime(challenge_id=sess.challenge_id, run_id=sess.run_id)
         cwd = self._agent_cwd(task)
         try:
             run_result = await runtime.run(

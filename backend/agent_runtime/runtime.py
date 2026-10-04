@@ -250,12 +250,18 @@ class RealToolExecutor:
     # command line — so it must be classified and gated as a command.
     _SHELL_CAPABILITIES = frozenset({"interactive_open", "interactive_start"})
 
-    def __init__(self, tool_manager=None, approval_gate=None):
+    def __init__(self, tool_manager=None, approval_gate=None,
+                 challenge_id: Optional[str] = None, run_id: Optional[str] = None):
         if tool_manager is None:
             from backend.tools.manager import tool_manager as tm
             tool_manager = tm
         self.tool_manager = tool_manager
         self._approval_gate = approval_gate
+        # Per-mission approval context. Passed through to require_approval so the
+        # gate can resolve the challenge's own approval_mode and so the operator
+        # console can attribute the request to the right challenge/run.
+        self._challenge_id = challenge_id
+        self._run_id = run_id
 
     async def _gate(self, cmd: str) -> Optional[ExecResult]:
         """Gate *cmd*. Returns None when approved, else a blocked ExecResult."""
@@ -265,8 +271,8 @@ class RealToolExecutor:
             agent_id="agent_runtime",
             pending_approvals=SHARED_PENDING_APPROVALS,
             broadcast_fn=ws_manager.broadcast,
-            challenge_id=None,
-            run_id=None,
+            challenge_id=self._challenge_id,
+            run_id=self._run_id,
         )
         if approved:
             return None
