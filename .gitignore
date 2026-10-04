@@ -42,6 +42,7 @@ scratch/
 .serena/
 .agents/
 CLAUDE.md
+AGENTS.md
 backend/knowledge/playbooks/
 !backend/knowledge/playbooks/.gitkeep
 hacktricks/
@@ -65,3 +66,11 @@ frontend/.vite/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Agent scratch & transient test artifacts (do not publish)
+/agents/
+/debug_*.py
+/swarm_output.txt
+/test_output*.txt
+/test_feedback_output.txt
+/test_flag.txt

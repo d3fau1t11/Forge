@@ -968,6 +968,39 @@ export class ApiService {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
+
+  public async startMission(req: {
+    target_address: string;
+    objective: string;
+    attached_file_paths?: string[];
+  }): Promise<{
+    challenge_id: string;
+    challenge_name: string;
+    category: string;
+    objective: string;
+    target: string;
+    target_type: string;
+    status: string;
+    progress: number;
+    message: string;
+    hypotheses: string[];
+    initial_actions: string[];
+    progress_detail: string;
+    budget: { spent: number; limit: number };
+    flag_status: 'UNFOUND' | 'CAPTURED' | 'VERIFYING';
+    final_flag?: string;
+  }> {
+    const res = await apiFetch(`${getApiBaseUrl()}/challenges/start-mission`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return await res.json();
+  }
 }
 
 export const apiService = new ApiService();

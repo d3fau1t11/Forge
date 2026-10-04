@@ -3,6 +3,7 @@
 2. Checkpoint human responses (HITL) still work and inject evaluated directives.
 3. Mission stop / pause during checkpoint exits cleanly without orphan pauses.
 4. Competition harness and UI start paths resolve to the same production engine (swarm).
+5. Flag capture during checkpoint wait aborts wait immediately.
 """
 
 import os
@@ -21,7 +22,7 @@ import time
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
 from backend.database.session import init_db, SessionLocal
-from backend.database.models import ChallengeModel, RunModel, CheckpointModel
+from backend.database.models import ChallengeModel, RunModel, SwarmEvidenceModel
 from backend.agents.swarm_orchestrator import (
     SwarmOrchestrator,
     swarm_orchestrator,
@@ -30,8 +31,10 @@ from backend.agents.swarm_state import SwarmBlackboard
 from backend.api.runner import workflow_runner
 from backend.config import settings
 
+
 def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
+
 
 class TestProductionCheckpointAndHarness(unittest.TestCase):
 
@@ -58,7 +61,6 @@ class TestProductionCheckpointAndHarness(unittest.TestCase):
             board = SwarmBlackboard(ch_id, run_id, "http://127.0.0.1:8888")
             board.agent_ids = ["agent_1", "agent_2"]
             board.agent_started_ts = {"agent_1": time.time(), "agent_2": time.time()}
-            board.agent_iterations = {"agent_1": 10, "agent_2": 10}
 
             # Create DB records
             db = SessionLocal()
@@ -207,15 +209,14 @@ class TestProductionCheckpointAndHarness(unittest.TestCase):
     # ── Test 4: Competition Harness & WorkflowRunner Production Engine Execution Path ──
     def test_workflow_runner_and_harness_use_production_engine(self):
         """Verify that WorkflowRunner.start_run with default engine_type (None)
-        actually executes swarm_orchestrator.run_swarm(), proving the full runtime
-        execution path from UI start to swarm orchestrator."""
+        uses SwarmCoordinator as the production engine, and that explicit
+        legacy engine_type="swarm" still selects the flexible-agent swarm."""
         async def scenario():
             import uuid
             from unittest.mock import patch
 
             uid = uuid.uuid4().hex[:8]
             ch_id = f"ch_engine_{uid}"
-            run_id = f"run_engine_{uid}"
 
             db = SessionLocal()
             try:
@@ -223,44 +224,95 @@ class TestProductionCheckpointAndHarness(unittest.TestCase):
                 db.add(ch)
                 db.commit()
 
-                run = RunModel(id=run_id, challenge_id=ch_id, status="RUNNING", current_phase="recon", current_agent="swarm")
-                db.add(run)
-                db.commit()
-
-                # Spy on swarm_orchestrator.run_swarm to prove it is called by start_run
+                # Reset shared state between test halves
+                workflow_runner.reset()
                 from backend.agents.swarm_orchestrator import swarm_orchestrator
+                swarm_orchestrator.active_swarms.clear()
+
+                # Save original run_swarm to call it directly
                 original_run_swarm = swarm_orchestrator.run_swarm
-                called_args = []
 
-                async def spied_run_swarm(*args, **kwargs):
-                    called_args.append((args, kwargs))
-                    # Also invoke real run_swarm to verify actual runtime initialization
-                    return await original_run_swarm(*args, **kwargs)
+                # Test 1: Default engine_type=None uses SwarmCoordinator
+                run_id_1 = f"run_coord_{uid}"
+                workflow_runner.start_run(
+                    run_id=run_id_1, challenge_id=ch_id, target="http://127.0.0.1:8888/",
+                    engine_type=None,  # default - should use SwarmCoordinator
+                )
 
-                with patch.object(swarm_orchestrator, "run_swarm", side_effect=spied_run_swarm):
-                    # Start run with engine_type=None (exact default UI start path)
-                    workflow_runner.start_run(run.id, ch.id, "http://127.0.0.1:8888/", engine_type=None)
+                self.assertIn(run_id_1, workflow_runner.active_runs)
+                # Verify SwarmCoordinator is used: no legacy swarm_orchestrator board should exist
+                self.assertIsNone(swarm_orchestrator.active_swarms.get(run_id_1),
+                                  "Default engine should be SwarmCoordinator, not swarm_orchestrator")
 
-                    self.assertIn(run.id, workflow_runner.active_runs)
-                    task = workflow_runner.tasks.get(run.id)
-                    self.assertIsNotNone(task)
+                # Clean up
+                workflow_runner.reset()
+                swarm_orchestrator.active_swarms.clear()
 
-                    # Allow the event loop to execute run_swarm entry
-                    await asyncio.sleep(0.2)
+                # Test 2: Explicit engine_type="swarm" uses legacy swarm_orchestrator
+                run_id_2 = f"run_legacy_{uid}"
+                called_kwargs = None
 
-                    # Verify that run_swarm was ACTUALLY executed with run_id and challenge_id
-                    self.assertEqual(len(called_args), 1)
-                    _, kwargs = called_args[0]
-                    self.assertEqual(kwargs.get("run_id"), run_id)
-                    self.assertEqual(kwargs.get("challenge_id"), ch_id)
+                async def spied_run_swarm(run_id, challenge_id, target_scope, working_directory,
+                                          category="WEB", difficulty="EASY", resume=False,
+                                          challenge_name="", platform="", description="",
+                                          flag_pattern="", max_iterations=0, max_minutes=0,
+                                          max_tokens=0, attached_file_paths=None,
+                                          instance_expiry_ts=None):
+                    nonlocal called_kwargs
+                    called_kwargs = {
+                        'run_id': run_id,
+                        'challenge_id': challenge_id,
+                        'target_scope': target_scope,
+                        'working_directory': working_directory,
+                        'category': category,
+                        'difficulty': difficulty,
+                        'resume': resume,
+                        'challenge_name': challenge_name,
+                        'platform': platform,
+                        'description': description,
+                        'flag_pattern': flag_pattern,
+                        'max_iterations': max_iterations,
+                        'max_minutes': max_minutes,
+                        'max_tokens': max_tokens,
+                        'attached_file_paths': attached_file_paths or [],
+                        'instance_expiry_ts': instance_expiry_ts,
+                    }
+                    # Call the REAL run_swarm (not the patched version)
+                    return await original_run_swarm(
+                        run_id=run_id, challenge_id=challenge_id, target_scope=target_scope,
+                        working_directory=working_directory, category=category, difficulty=difficulty,
+                        resume=resume, challenge_name=challenge_name, platform=platform,
+                        description=description, flag_pattern=flag_pattern,
+                        max_iterations=max_iterations, max_minutes=max_minutes,
+                        max_tokens=max_tokens, attached_file_paths=attached_file_paths or [],
+                        instance_expiry_ts=instance_expiry_ts
+                    )
 
-                    # Verify that the active blackboard was instantiated by run_swarm
-                    active_board = swarm_orchestrator.active_swarms.get(run_id)
-                    self.assertIsNotNone(active_board)
-                    self.assertEqual(active_board.challenge_id, ch_id)
+                # Patch run_swarm with our spied version
+                swarm_orchestrator.run_swarm = spied_run_swarm
 
-                    # Cancel run to clean up
-                    workflow_runner.activate_kill_switch(run_id)
+                workflow_runner.start_run(
+                    run_id=run_id_2, challenge_id=ch_id, target="http://127.0.0.1:8888/",
+                    engine_type="swarm",  # explicit legacy engine
+                )
+
+                self.assertIn(run_id_2, workflow_runner.active_runs)
+                # Verify legacy engine: swarm_orchestrator board should exist
+                # (give it a moment to spawn agents)
+                await asyncio.sleep(0.3)
+                active_board = swarm_orchestrator.active_swarms.get(run_id_2)
+                self.assertIsNotNone(active_board,
+                                    "Explicit engine_type='swarm' should use swarm_orchestrator")
+                self.assertEqual(active_board.challenge_id, ch_id)
+
+                # Verify that run_swarm was actually executed with run_id and challenge_id
+                self.assertIsNotNone(called_kwargs, "run_swarm should have been called")
+                self.assertEqual(called_kwargs.get("run_id"), run_id_2)
+                self.assertEqual(called_kwargs.get("challenge_id"), ch_id)
+
+                # Cancel run to clean up
+                workflow_runner.activate_kill_switch(run_id_2)
+
             finally:
                 db.close()
 
@@ -314,6 +366,7 @@ class TestProductionCheckpointAndHarness(unittest.TestCase):
                 orch.active_swarms.pop(board.run_id, None)
 
         _run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

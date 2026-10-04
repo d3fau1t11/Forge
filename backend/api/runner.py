@@ -40,11 +40,10 @@ class WorkflowRunner:
         }
         self.kill_switches[run_id] = False
 
-        # Engine selection. The legacy blackboard swarm remains the DEFAULT so all
-        # existing behavior/tests are unchanged. Phase 4 adds the coordinated engine
-        # (supervisor + specialist AgentRuntime agents + evidence bus), selectable via
-        # engine_type in {coord, team, supervisor, coordinated, swarm_coord}.
-        engine = (engine_type or "swarm").strip().lower()
+        # Engine selection. The coordinated swarm (SwarmCoordinator) is the DEFAULT
+        # production engine. The legacy blackboard swarm remains selectable via
+        # engine_type="swarm".
+        engine = (engine_type or "swarm_coord").strip().lower()
         coordinated = engine in ("coord", "team", "supervisor", "coordinated", "swarm_coord")
 
         try:
@@ -107,6 +106,10 @@ class WorkflowRunner:
                     flag_format=run_config.get("flag_pattern", ""),
                     workspace_root=workdir, limits=limits, enable_report=True,
                     kill_switch=lambda: self.is_kill_switch_active(run_id),
+                    attached_file_paths=run_config.get("attached_file_paths", []),
+                    max_iterations=int(run_config.get("max_iterations", 0) or 0),
+                    max_minutes=int(run_config.get("max_minutes", 0) or 0),
+                    max_tokens=int(run_config.get("max_tokens", 0) or 0),
                 )
                 task = loop.create_task(coordinator.run(resume=resume))
                 selected_engine = "swarm_coord"

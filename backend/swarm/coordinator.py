@@ -114,6 +114,10 @@ class SwarmCoordinator:
         candidate_generator: Optional[CandidateGenerator] = None,
         stagnation_limit: int = 5,
         max_replan_actions: int = 2,
+        attached_file_paths: Optional[List[str]] = None,
+        max_iterations: int = 0,
+        max_minutes: int = 0,
+        max_tokens: int = 0,
     ):
         self.limits = limits or SwarmLimits()
         self.persist = persist
@@ -128,6 +132,10 @@ class SwarmCoordinator:
             pass
         self.verifier_agent = VerifierAgent(resolver=self.verifier, router=router)
         self.workspace_root = workspace_root
+        self.attached_file_paths = attached_file_paths or []
+        self.max_iterations = max_iterations
+        self.max_minutes = max_minutes
+        self.max_tokens = max_tokens
 
         self.mission_id = mission_id or str(uuid.uuid4())
         self._stopped = False
@@ -137,13 +145,17 @@ class SwarmCoordinator:
         # generator. All deterministic; reasoning can be disabled for pure Phase-4 behaviour.
         self.enable_reasoning = enable_reasoning
         # Set budget caps based on swarm limits so the coordinated engine can stop on budget.
+        # Incorporate run_config max_minutes as wall-clock timeout if not already set by limits.
+        wall_seconds = self.limits.task_timeout_seconds * self.limits.max_total_tasks
+        if wall_seconds <= 0:
+            # Use the per-run max_minutes if no timeout per task is configured
+            wall_seconds = self.max_minutes * 60 if self.max_minutes else 0
+        if wall_seconds <= 0:
+            wall_seconds = 0  # 0 = unbounded
         max_agent_calls = self.limits.max_total_tasks * self.limits.max_turns_per_task
         max_tool_execs = max_agent_calls * 3  # ~3 tool calls per agent turn
         max_failed = self.limits.max_total_tasks * 2
         max_dupes = self.limits.max_total_tasks
-        wall_seconds = self.limits.task_timeout_seconds * self.limits.max_total_tasks
-        if wall_seconds <= 0:
-            wall_seconds = 0  # 0 = unbounded
         self.budget = budget or MissionBudget(
             max_agent_calls=max_agent_calls,
             max_tool_executions=max_tool_execs,

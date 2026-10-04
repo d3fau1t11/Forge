@@ -207,16 +207,16 @@ async def run_competition_simulation(engine_type=None):
         results["Target Manager"] = "PASS"
 
         # 12. Launch Production Swarm Run via WorkflowRunner (matches UI start path: engine_type=None)
-        run = RunModel(challenge_id=ch.id, status="RUNNING", current_phase="recon", current_agent=(engine_type or "swarm"))
+        run = RunModel(challenge_id=ch.id, status="RUNNING", current_phase="recon", current_agent=(engine_type or "swarm_coord"))
         db.add(run)
         db.commit()
 
-        # Start run using WorkflowRunner with default production engine (engine_type=None -> "swarm")
+        # Start run using WorkflowRunner with default production engine (engine_type=None -> "swarm_coord")
         workflow_runner.start_run(run.id, ch.id, "http://127.0.0.1:8888/", engine_type=engine_type)
         results["WorkflowRunner"] = "PASS" if run.id in workflow_runner.active_runs else "FAIL"
 
         runner_task = workflow_runner.tasks.get(run.id)
-        active_engine = (engine_type or "swarm").strip().lower()
+        active_engine = (engine_type or "swarm_coord").strip().lower()
         is_coord = active_engine in ("coord", "team", "supervisor", "coordinated", "swarm_coord")
         resolved_engine = "swarm_coord" if is_coord else "swarm"
         print(f"\nProduction engine: {resolved_engine}")

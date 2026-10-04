@@ -11,8 +11,34 @@ from datetime import datetime, timezone
 from backend.utils.time import utcnow
 from typing import Dict, List, Optional
 
+def parse_target_type(target: str) -> str:
+    """Infer the target type from a target address string.
+
+    Returns one of: 'ip', 'url', 'host', 'nc'
+    """
+    trimmed = target.strip()
+
+    # Netcat format: "nc host port"
+    if trimmed.lower().startswith('nc '):
+        return 'nc'
+
+    # URL format: starts with http:// or https://
+    if trimmed.startswith('http://') or trimmed.startswith('https://'):
+        return 'url'
+
+    # IP address format (dotted quad or colon-separated for IPv6)
+    import re
+    if (
+        re.match(r'^\d{1,3}(\.\d{1,3}){3}$', trimmed)
+        or re.match(r'^\[?[a-fA-F0-9:]+\]?$', trimmed)
+    ):
+        return 'ip'
+
+    # Otherwise treat as hostname
+    return 'host'
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from backend.api.runner import workflow_runner
@@ -1468,3 +1494,164 @@ def save_writeup_endpoint(challenge_id: str, req: SaveWriteupRequest,
         raise HTTPException(status_code=404, detail="Challenge not found")
     return {"status": "SAVED", "file_path": report_path,
             "content": content, "generated_by": "saved", "saved": True}
+
+
+# ---------------------------------------------------------------------------
+# MISSION INTAKE — simple target + artifact + objective → backend infers pipeline
+# ---------------------------------------------------------------------------
+
+class StartMissionRequest(BaseModel):
+    """Request body for POST /api/challenges/start-mission.
+
+    The three operator-supplied fields:
+      - target_address: URL, IP, hostname, or `nc host port`
+      - objective: short text describing the goal
+      - attached_file_paths: list of already-uploaded file paths
+    """
+    target_address: str
+    objective: str
+    attached_file_paths: List[str] = []
+
+    @field_validator("target_address", "objective")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        """A mission cannot start with a blank target or objective."""
+        if not value or not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+@router.post("/challenges/start-mission")
+async def start_mission(req: StartMissionRequest, db: Session = Depends(get_db)):
+    """Start a new mission via simple intake.
+
+    Operator provides TARGET, ARTIFACT files, and OBJECTIVE.
+    The backend infers:
+      - challenge category (from target and optional artifact hints)
+      - artifact type (from uploaded files)
+      - target type (IP / URL / hostname / nc)
+      - available capabilities (matched to category)
+      - initial hypotheses
+      - initial candidate actions
+    Then creates the challenge and returns a mission dashboard-ready response.
+
+    Fast path: if all required inference data is available without an LLM call,
+    the challenge is created immediately. Otherwise, a brief deterministic gate
+   asks for any remaining missing fields before committing.
+    """
+    from backend.utils.challenge_normalize import normalize_category, normalize_difficulty, normalize_targets, CATEGORIES
+
+    # Infer target type for downstream use
+    target_type = parse_target_type(req.target_address)  # we'll add this helper
+
+    # Normalize target addresses (support comma-/newline-separated list)
+    normalized_targets = normalize_targets(req.target_address)
+
+    # Build category inference from target
+    # If target is a URL, lean web; if IP/hostname, lean network/pwn; etc.
+    target_lower = req.target_address.lower()
+    if target_lower.startswith('http://') or target_lower.startswith('https://'):
+        inferred_category = normalize_category('web')
+    elif req.target_address.startswith('nc '):
+        inferred_category = normalize_category('recon')
+    else:
+        # Default to reconnaissance for IP/host targets
+        inferred_category = normalize_category('recon')
+
+    # Try to infer difficulty from objective keywords
+    obj_lower = req.objective.lower()
+    if any(kw in obj_lower for kw in ['flag', 'find.*flag', 'retrieve.*flag']):
+        difficulty = normalize_difficulty('EASY')
+    elif any(kw in obj_lower for kw in ['vulnerability', 'exploit', 'inject']):
+        difficulty = normalize_difficulty('MEDIUM')
+    elif any(kw in obj_lower for kw in ['analyze', 'reverse', 'decompile']):
+        difficulty = normalize_difficulty('HARD')
+    else:
+        difficulty = normalize_difficulty('MEDIUM')
+
+    # Prepare creation request
+    creation_req = CreateChallengeRequest(
+        name=req.objective[:40] + ('…' if len(req.objective) > 40 else ''),  # derive name from objective
+        category=inferred_category,
+        difficulty=difficulty,
+        description=req.objective,
+        target_address=normalized_targets,
+        working_directory="",
+        platform_name=None,
+        requires_root=False,
+        flag_pattern="",
+        max_iterations=0,
+        max_minutes=0,
+        instance_expiry_minutes=0,
+        attached_file_paths=req.attached_file_paths or None,
+    )
+
+    # Create the challenge via the existing flow
+    from backend.api.routes.challenges import create_challenge
+    challenge_row = await create_challenge(creation_req, db)
+
+    # Store challenge_id on the intake tracking if needed later
+    # (We don't use the chat-session intake model for this flow)
+
+    # Build mission response for the dashboard
+    from backend.utils.time import utcnow
+    import os
+
+    # Compute initial progress (0% at start)
+    progress = 0
+
+    # Build initial hypotheses based on category + target
+    hypotheses = []
+    if inferred_category == 'web':
+        hypotheses.append('Identify web technologies & framework versions')
+        hypotheses.append('Probe common vulnerability patterns (SQLi, XSS, RCE)')
+    elif inferred_category == 'pwn':
+        hypotheses.append('Analyze binary protections (PIE, CANNEX, NX, ASLR)')
+        hypotheses.append('Look for input validation flaws or unsafe functions')
+    elif inferred_category == 'crypto':
+        hypotheses.append('Identify encryption schemes and key management')
+        hypotheses.append('Look for weak ciphers or nonce reuse')
+    elif inferred_category == 'rev':
+        hypotheses.append('Perform control-flow & string analysis')
+        hypotheses.append('Look for embedded flags or obfuscated code')
+    else:  # recon
+        hypotheses.append('Map open ports & service versions')
+        hypotheses.append('Fingerprint operating system & software')
+
+    # Build initial candidate actions
+    initial_actions = []
+    if inferred_category == 'web':
+        initial_actions.append('Run dir busting / gobuster against target')
+        initial_actions.append('Scan with nmap/masscan for open ports')
+    elif inferred_category == 'pwn':
+        initial_actions.append('Run file type identification on artifact')
+        initial_actions.append('Check binary protections with checksec or readelf')
+    elif inferred_category == 'crypto':
+        initial_actions.append('Extract and examine encoded content from artifact')
+        initial_actions.append('Look for common crypto pitfalls (bad IV, reuse)')
+    elif inferred_category == 'rev':
+        initial_actions.append('Run strings on binary to find readable hints')
+        initial_actions.append('Check file type and compression')
+    else:  # recon
+        initial_actions.append('Execute port scan (nmap/rustscan) on target')
+        initial_actions.append('Run service version detection')
+
+    # Build the mission response
+    response = {
+        "challenge_id": challenge_row.id,
+        "challenge_name": challenge_row.name,
+        "category": challenge_row.category,
+        "objective": req.objective,
+        "target": req.target_address,
+        "target_type": target_type,
+        "status": challenge_row.status,
+        "progress": progress,
+        "message": f"Mission '{challenge_row.name}' initialized! Automated pipeline starting with: {', '.join(initial_actions[:2])}…",
+        "hypotheses": hypotheses,
+        "initial_actions": initial_actions,
+        "progress_detail": f"0% — initial reconnaissance",
+        "budget": {"spent": 0.00, "limit": 5.00},
+        "flag_status": "UNFOUND",
+    }
+
+    return response

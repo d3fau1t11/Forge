@@ -12,10 +12,12 @@ import {
   Folder,
   Trash2,
   X,
+  Zap,
 } from 'lucide-react';
 import { Challenge } from '../../types';
 import { soundEngine } from '../../utils/soundEngine';
 import { NewChallengeChat } from './NewChallengeChat';
+import { MissionIntake } from './MissionIntake';
 
 interface ChallengesProps {
   challenges: Challenge[];
@@ -37,6 +39,7 @@ export const Challenges: React.FC<ChallengesProps> = ({
   const [showChatModal, setShowChatModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('ALL');
+  const [showMissionIntake, setShowMissionIntake] = useState(false);
 
   const filteredChallenges = challenges.filter((c) => {
     const matchesSearch =
@@ -122,6 +125,18 @@ export const Challenges: React.FC<ChallengesProps> = ({
           >
             <Plus className="w-4 h-4" />
             <span>[ NEW CHALLENGE ]</span>
+          </button>
+
+          <button
+            id="new-mission-btn"
+            onClick={() => {
+              soundEngine.playClick();
+              setShowMissionIntake(true);
+            }}
+            className="px-5 py-2.5 rounded-lg bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 font-display font-bold text-xs flex items-center justify-center space-x-2 shadow-[0_0_20px_rgba(16,185,129,0.3)] hover:scale-105 transition-all uppercase tracking-wider shrink-0"
+          >
+            <Zap className="w-4 h-4" />
+            <span>[ NEW MISSION ]</span>
           </button>
         </div>
       </div>
@@ -295,7 +310,7 @@ export const Challenges: React.FC<ChallengesProps> = ({
       </div>
 
       {/* â”€â”€ New Challenge Chat Modal Overlay â”€â”€ */}
-      {showChatModal && (
+      {showChatModal && ((
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-fadeIn">
           <div className="w-full max-w-5xl max-h-[92vh] flex flex-col bg-obsidian-950 border-2 border-cyber-cyan/40 rounded-2xl shadow-[0_0_80px_rgba(0,240,255,0.2)] overflow-hidden">
             {/* Thin close-button strip â€” chat content owns the real header */}
@@ -315,6 +330,39 @@ export const Challenges: React.FC<ChallengesProps> = ({
                 onOpenWorkspace={handleChatCreated}
                 onRefreshBackendData={onRefreshBackendData}
                 onClose={handleCloseModal}
+              />
+            </div>
+          </div>
+        </div>
+      ))}
+      
+      {/* â”€â”€ New Mission Intake Modal Overlay â”€â”€ */}
+      {showMissionIntake && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-fadeIn">
+          <div className="w-full max-w-5xl max-h-[92vh] flex flex-col bg-obsidian-950 border-2 border-cyan-500/40 rounded-2xl shadow-[0_0_80px_rgba(0,240,255,0.2)] overflow-hidden">
+            {/* Thin close-button strip â€” mission intake owns the real header */}
+            <div className="flex items-center justify-end px-4 pt-3 pb-1 shrink-0">
+              <button
+                onClick={() => {
+                  soundEngine.playClick();
+                  setShowMissionIntake(false);
+                }}
+                className="p-2 rounded-lg border border-slate-800 hover:border-cyber-cyan/60 bg-obsidian-900 text-slate-400 hover:text-cyber-cyan transition-colors"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Mission intake form */}
+            <div className="flex-1 overflow-hidden px-4 pb-4">
+              <MissionIntake
+                onOpenMissionDashboard={onSelectChallenge}
+                onRefreshBackendData={onRefreshBackendData}
+                onClose={() => {
+                  soundEngine.playClick();
+                  setShowMissionIntake(false);
+                }}
               />
             </div>
           </div>

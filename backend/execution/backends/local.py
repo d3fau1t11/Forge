@@ -24,6 +24,7 @@ import shutil
 import sys
 from typing import Optional
 
+from backend.agents.stream_condenser import stream_condenser
 from backend.execution.base import (
     ExecutionRequest,
     ExecutionResult,
@@ -116,6 +117,18 @@ class LocalBackend:
             status = STATUS_SUCCESS
         else:
             status = STATUS_FAILED
+
+        # Condense long output to preserve important findings without overwhelming
+        stdout = stream_condenser.condense_output(
+            req.tool_name or (req.command.split()[0] if req.command else ""),
+            stdout,
+            max_lines=50,
+        )
+        stderr = stream_condenser.condense_output(
+            req.tool_name or (req.command.split()[0] if req.command else ""),
+            stderr,
+            max_lines=20,
+        )
 
         from backend.tools.manager import classify_tool_execution  # lazy — breaks import cycle
         classification = classify_tool_execution(

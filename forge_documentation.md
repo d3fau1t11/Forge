@@ -145,9 +145,9 @@ The monolithic API router exposes ~40 endpoints:
 ### 3.5 Workflow Runner ([`backend/api/runner.py`](file:///c:/Users/habte/OneDrive/Documents/VS%20code/Project/Forge/backend/api/runner.py))
 
 Lightweight orchestrator that:
-1. Determines execution engine (`swarm` or `orchestrator_loop`).
+1. Determines execution engine. The **production default** is `engine_type=None` → `"swarm_coord"` → **SwarmCoordinator** (coordinated swarm with Supervisor + ActionScorer + CandidateGenerator + TaskScheduler). The legacy `engine_type="swarm"` selects the flexible-agent blackboard swarm, and `engine_type="orchestrator_loop"` selects the single-agent ReAct loop.
 2. Resolves a safe working directory (via `workspace.py` allowlist).
-3. Spawns the swarm as an `asyncio.Task` on the running event loop.
+3. Spawns the selected engine as an `asyncio.Task` on the running event loop.
 4. Maintains a kill-switch registry (per-run and global `__global__`).
 
 ### 3.6 Swarm Intelligence Engine ([`backend/agents/swarm_orchestrator.py`](file:///c:/Users/habte/OneDrive/Documents/VS%20code/Project/Forge/backend/agents/swarm_orchestrator.py) — 1268 lines)
@@ -227,7 +227,7 @@ Handles AgentRouter's batch quota system:
 | [`recon/turbo_recon.py`](file:///c:/Users/habte/OneDrive/Documents/VS%20code/Project/Forge/backend/recon/turbo_recon.py) | Pre-warmed fast recon (curl probe + header/endpoint extraction) run immediately on challenge creation. |
 | [`knowledge/playbook_vault.py`](file:///c:/Users/habte/OneDrive/Documents/VS%20code/Project/Forge/backend/knowledge/playbook_vault.py) | Ingests CTF writeups and HackTricks playbooks into a searchable knowledge base. |
 | [`agents/strategic_planner.py`](file:///c:/Users/habte/OneDrive/Documents/VS%20code/Project/Forge/backend/agents/strategic_planner.py) | Generates an initial multi-phase mission plan via LLM before the swarm starts. |
-| [`agents/orchestrator_loop.py`](file:///c:/Users/habte/OneDrive/Documents/VS%20code/Project/Forge/backend/agents/orchestrator_loop.py) | Legacy single-agent ReAct loop (alternative engine, largely superseded by swarm). |
+| [`agents/orchestrator_loop.py`](file:///c:/Users/habte/OneDrive/Documents/VS%20code/Project/Forge/backend/agents/orchestrator_loop.py) | Legacy single-agent ReAct loop (alternative engine, superseded by the coordinated SwarmCoordinator). |
 | [`engine/keep_awake.py`](file:///c:/Users/habte/OneDrive/Documents/VS%20code/Project/Forge/backend/engine/keep_awake.py) | Prevents OS sleep during active swarm runs. |
 | [`reporting/generator.py`](file:///c:/Users/habte/OneDrive/Documents/VS%20code/Project/Forge/backend/reporting/generator.py) | Generates Markdown CTF writeup reports post-run. |
 
@@ -253,9 +253,9 @@ sequenceDiagram
     participant Planner as Strategic Planner
     participant Recon as Turbo Recon
     participant Runner as WorkflowRunner
-    participant Swarm as SwarmOrchestrator
-    participant Workers as 3 Parallel Workers
-    participant LLM as LLM Providers
+    participant Coordinator as SwarmCoordinator
+    participant Specialist as SpecialistAgent
+    participant Runtime as AgentRuntime
     participant Tools as Host CLI Tools
     participant WS as WebSocket
 
@@ -266,17 +266,16 @@ sequenceDiagram
     Planner->>LLM: "Plan a multi-phase attack for..."
     LLM-->>Planner: Mission plan JSON
     Planner-->>API: Save plan to Challenge.mission_plan
-    API->>Recon: Start turbo recon (background)
-    Recon->>Tools: curl -s -i <target>
-    Tools-->>Recon: HTTP response
     API->>Runner: start_run(run_id, challenge_id, target)
-    Runner->>Swarm: run_swarm(run_id, challenge_id, target)
+    Runner->>Coordinator: SwarmCoordinator.run(resume=False)
     
-    Swarm->>Workers: Launch 3 workers + task refiller
-    
-    loop Until flag captured or stopped
-        Workers->>Swarm: Claim task from pool
-        Workers->>LLM: "Generate a bash command for..."
+    Coordinator->>Specialist: SpecialistAgent(role)
+    Specialist->>Runtime: AgentRuntime(task, tool_manager)
+    Runtime->>Tools: tool execution (python3, curl, etc.)
+    Tools-->>Runtime: execution result
+    Runtime-->>Coordinator: observation / evidence
+    Coordinator-->>User: verified_flag + status
+```
         LLM-->>Workers: ```bash curl -s ...```
         Workers->>Tools: Execute command (subprocess)
         Tools-->>Workers: stdout/stderr
