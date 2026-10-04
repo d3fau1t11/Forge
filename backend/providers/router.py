@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -34,6 +35,50 @@ async def _notify_fallback(failed_provider: str, reason: str, next_candidate: Op
         })
     except Exception as e:
         logger.debug(f"[ModelRouter] WS notification skip: {e}")
+
+
+def _record_provider_usage(
+    provider_name: str,
+    model_name: str,
+    success: bool,
+    latency_ms: float = 0.0,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cost_usd: float = 0.0,
+) -> None:
+    """Best-effort durable record of one provider call outcome.
+
+    Before this, a provider attempt existed only as a log line and (for fallbacks) a
+    transient WebSocket banner — so a call that quietly succeeded, or failed without
+    triggering a visible fallback, left no queryable history. Every attempt now writes
+    one ``provider_usage`` row.
+
+    Mirrors ``breaker_store``'s lazy-import pattern: ``SessionLocal``/``ProviderUsageModel``
+    are imported inside the function so this provider-layer module never imports the
+    database layer at import time (avoiding an import cycle), and the whole write is
+    wrapped so a logging-DB failure can never break a live provider call or mask its
+    real result. Never raises.
+    """
+    try:
+        from backend.database.session import SessionLocal
+        from backend.database.models import ProviderUsageModel
+
+        db = SessionLocal()
+        try:
+            db.add(ProviderUsageModel(
+                provider_name=provider_name or "unknown",
+                model_name=model_name or "unknown",
+                prompt_tokens=int(prompt_tokens or 0),
+                completion_tokens=int(completion_tokens or 0),
+                cost_usd=float(cost_usd or 0.0),
+                latency_ms=float(latency_ms or 0.0),
+                success=bool(success),
+            ))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"[ModelRouter] provider usage persist skip: {e}")
 
 class ModelRouter:
     """Model Router selecting appropriate provider/model based on capability, cost, budget, and CLI routing."""
@@ -425,6 +470,7 @@ class ModelRouter:
             if not gemini_blocked and not quota_manager.is_blacklisted_for_session(provider_name):
                 provider = self.providers.get(provider_name)
                 if provider and await provider.is_available():
+                    _t0 = time.perf_counter()
                     try:
                         logger.info(f"[ModelRouter] Direct routing model '{target_model}' to provider '{provider_name}' (target: {target_model_id})")
                         res = await provider.generate_response(
@@ -434,8 +480,14 @@ class ModelRouter:
                             model=target_model_id,
                             **kwargs
                         )
+                        latency_ms = float(getattr(res, "latency_ms", 0.0) or 0.0) or (time.perf_counter() - _t0) * 1000.0
                         if not res.is_refusal:
                             quota_manager.record_successful_request(target_model)
+                            _record_provider_usage(
+                                provider_name, res.model_name or target_model_id, True,
+                                latency_ms, res.prompt_tokens, res.completion_tokens,
+                                res.estimated_cost_usd,
+                            )
                             return res
 
                         # Separate a transient 429 rate-limit from real 402/budget quota exhaustion.
@@ -445,6 +497,11 @@ class ModelRouter:
                         is_rate_limit = ("429" in refusal or "rate limit" in refusal.lower() or "rate_limited" in refusal.lower()) and "402" not in refusal
                         is_quota = ("402" in refusal or "budget" in refusal.lower() or "insufficient_quota" in refusal.lower()
                                     or "quota has been exhausted" in refusal.lower() or "budget pool" in refusal.lower())
+                        _record_provider_usage(
+                            provider_name, res.model_name or target_model_id, False,
+                            latency_ms, res.prompt_tokens, res.completion_tokens,
+                            res.estimated_cost_usd,
+                        )
 
                         if is_rate_limit and not is_quota:
                             # Persistent 429 (e.g. free-tier model gated to limit=0) trips a cooldown after N hits.
@@ -463,6 +520,7 @@ class ModelRouter:
                             fb_provider_name, fb_model_id = self.MODEL_PROVIDER_MAP.get(fallback_model, ("openrouter", "deepseek/deepseek-chat"))
                             fb_provider = self.providers.get(fb_provider_name)
                             if fb_provider and await fb_provider.is_available():
+                                fb_t0 = time.perf_counter()
                                 try:
                                     fb_res = await fb_provider.generate_response(
                                         prompt=prompt,
@@ -471,11 +529,26 @@ class ModelRouter:
                                         model=fb_model_id,
                                         **kwargs
                                     )
+                                    fb_latency_ms = float(getattr(fb_res, "latency_ms", 0.0) or 0.0) or (time.perf_counter() - fb_t0) * 1000.0
                                     if not fb_res.is_refusal:
                                         quota_manager.record_successful_request(fallback_model)
+                                        _record_provider_usage(
+                                            fb_provider_name, fb_res.model_name or fb_model_id, True,
+                                            fb_latency_ms, fb_res.prompt_tokens, fb_res.completion_tokens,
+                                            fb_res.estimated_cost_usd,
+                                        )
                                         return fb_res
+                                    _record_provider_usage(
+                                        fb_provider_name, fb_res.model_name or fb_model_id, False,
+                                        fb_latency_ms, fb_res.prompt_tokens, fb_res.completion_tokens,
+                                        fb_res.estimated_cost_usd,
+                                    )
                                 except Exception as fb_err:
                                     logger.warning(f"[ModelRouter] Fallback model '{fallback_model}' also failed: {fb_err}")
+                                    _record_provider_usage(
+                                        fb_provider_name, fb_model_id, False,
+                                        (time.perf_counter() - fb_t0) * 1000.0,
+                                    )
                         else:
                             # Generic refusal (not rate-limit, not quota) — just cascade to the capability chain.
                             logger.warning(f"Provider '{provider_name}' failed for model '{target_model}': {res.refusal_reason}. Falling back to capability chain...")
@@ -485,6 +558,10 @@ class ModelRouter:
                         # Direct model path crashed (network error, timeout, etc.) — fall through to capability chain
                         error_str = str(direct_err)
                         logger.warning(f"[ModelRouter] Direct model '{target_model}' via '{provider_name}' raised exception: {error_str}. Falling back to capability chain...")
+                        _record_provider_usage(
+                            provider_name, target_model, False,
+                            (time.perf_counter() - _t0) * 1000.0,
+                        )
                         # Blacklist only on confirmed quota/auth failure; a bare 429 is transient (count it instead).
                         is_rl = ("429" in error_str or "rate limit" in error_str.lower() or "rate_limited" in error_str.lower()) and "402" not in error_str
                         if "402" in error_str or "401" in error_str or (quota_manager.detect_quota_error(error_str) and not is_rl):
@@ -585,6 +662,7 @@ class ModelRouter:
                 # Note: Budget restrictions removed - cost is tracked for telemetry without halting runs.
 
             if await provider.is_available():
+                _t0 = time.perf_counter()
                 try:
                     response = await provider.generate_response(
                         prompt=prompt,
@@ -592,9 +670,15 @@ class ModelRouter:
                         capability=capability,
                         **kwargs
                     )
-                    
+                    latency_ms = float(getattr(response, "latency_ms", 0.0) or 0.0) or (time.perf_counter() - _t0) * 1000.0
+
                     if response.is_refusal:
                         refusal = response.refusal_reason or ""
+                        _record_provider_usage(
+                            provider_name, response.model_name or getattr(provider, "default_model", ""), False,
+                            latency_ms, response.prompt_tokens, response.completion_tokens,
+                            response.estimated_cost_usd,
+                        )
                         # Confirmed quota exhaustion (402) or auth failure (401) → immediate blacklist.
                         if ("402" in refusal or "budget" in refusal.lower()) and quota_manager.detect_quota_error(refusal):
                             quota_manager.blacklist_for_session(provider_name, refusal)
@@ -622,9 +706,18 @@ class ModelRouter:
 
                     quota_manager.record_successful_request(response.model_name)
                     quota_manager.record_successful_request(provider_name)
+                    _record_provider_usage(
+                        provider_name, response.model_name or getattr(provider, "default_model", ""), True,
+                        latency_ms, response.prompt_tokens, response.completion_tokens,
+                        response.estimated_cost_usd,
+                    )
                     return response
                 except Exception as e:
                     error_str = str(e)
+                    _record_provider_usage(
+                        provider_name, getattr(provider, "default_model", ""), False,
+                        (time.perf_counter() - _t0) * 1000.0,
+                    )
                     # Only blacklist for confirmed quota/auth errors, not transient network issues
                     if quota_manager.detect_quota_error(error_str) or "402" in error_str:
                         quota_manager.blacklist_for_session(provider_name, error_str)

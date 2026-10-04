@@ -134,6 +134,93 @@ class TestChallengePersistentChat(unittest.TestCase):
         self.assertEqual(msgs[0]["role"], "user")
         self.assertEqual(msgs[1]["role"], "assistant")
 
+        # A normal answer is recorded as "ok" — no regression from the default.
+        self.db.expire_all()
+        assistant = (
+            self.db.query(ChatMessageModel)
+            .filter(
+                ChatMessageModel.challenge_id == "ch-chat-test-2",
+                ChatMessageModel.role == "assistant",
+            )
+            .one()
+        )
+        self.assertEqual(assistant.status, "ok")
+
+    @patch("backend.providers.router.model_router.route_request", new_callable=AsyncMock)
+    def test_post_message_router_exception_persists_error_status(self, mock_route_request):
+        """A raised router error must be recorded as status="error", not lost."""
+        mock_route_request.side_effect = RuntimeError("all providers down")
+
+        ch = ChallengeModel(
+            id="ch-chat-test-exc",
+            name="Router Failure Challenge",
+            category="WEB",
+            difficulty="EASY",
+            status="RUNNING",
+        )
+        self.db.add(ch)
+        self.db.commit()
+
+        resp = self.client.post(
+            "/api/challenges/ch-chat-test-exc/messages",
+            json={"content": "What is happening?"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        self.db.expire_all()
+        assistant = (
+            self.db.query(ChatMessageModel)
+            .filter(
+                ChatMessageModel.challenge_id == "ch-chat-test-exc",
+                ChatMessageModel.role == "assistant",
+            )
+            .one()
+        )
+        self.assertEqual(assistant.status, "error")
+        self.assertEqual(
+            assistant.content,
+            "Unable to generate response from live model providers.",
+        )
+
+    @patch("backend.providers.router.model_router.route_request", new_callable=AsyncMock)
+    def test_post_message_refusal_persists_error_status(self, mock_route_request):
+        """A non-exception refusal must also be recorded as status="error"."""
+        mock_route_request.return_value = ProviderResponse(
+            provider_name="test_provider",
+            model_name="test_model",
+            content="",
+            is_refusal=True,
+            refusal_reason="I cannot help with that request.",
+        )
+
+        ch = ChallengeModel(
+            id="ch-chat-test-refusal",
+            name="Refusal Challenge",
+            category="WEB",
+            difficulty="EASY",
+            status="RUNNING",
+        )
+        self.db.add(ch)
+        self.db.commit()
+
+        resp = self.client.post(
+            "/api/challenges/ch-chat-test-refusal/messages",
+            json={"content": "Help me."},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        self.db.expire_all()
+        assistant = (
+            self.db.query(ChatMessageModel)
+            .filter(
+                ChatMessageModel.challenge_id == "ch-chat-test-refusal",
+                ChatMessageModel.role == "assistant",
+            )
+            .one()
+        )
+        self.assertEqual(assistant.status, "error")
+        self.assertEqual(assistant.content, "I cannot help with that request.")
+
     def test_post_message_validation_errors(self):
         # Empty message
         ch = ChallengeModel(id="ch-chat-test-3", name="Validation Test", category="REV")

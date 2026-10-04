@@ -38,6 +38,7 @@ def parse_target_type(target: str) -> str:
     return 'host'
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
@@ -969,22 +970,39 @@ async def post_challenge_message(
         f"Please provide your response to the operator's latest message."
     )
 
-    # 4. Route request via existing model router
-    response = await model_router.route_request(
-        prompt=prompt,
-        capability="general_reasoning",
-        system_instruction=system_instruction,
-    )
+    # 4. Route request via existing model router. An exception here is caught so
+    # the operator still receives a durable turn (persisted with status="error")
+    # instead of a 500 that leaves no record of the failed attempt.
+    message_status = "ok"
+    try:
+        response = await model_router.route_request(
+            prompt=prompt,
+            capability="general_reasoning",
+            system_instruction=system_instruction,
+        )
+    except Exception as route_err:
+        logger.error(
+            "Challenge chat model routing failed for %s: %s", challenge_id, route_err
+        )
+        response = None
 
-    assistant_content = response.content if response and not response.is_refusal else (
-        response.refusal_reason or response.content or "Unable to generate response from live model providers."
-    )
+    if response is None:
+        assistant_content = "Unable to generate response from live model providers."
+        message_status = "error"
+    elif response.is_refusal:
+        assistant_content = (
+            response.refusal_reason or response.content or "Unable to generate response from live model providers."
+        )
+        message_status = "error"
+    else:
+        assistant_content = response.content
 
     # 5. Persist assistant message
     assistant_msg = ChatMessageModel(
         challenge_id=challenge_id,
         role="assistant",
         content=assistant_content,
+        status=message_status,
     )
     db.add(assistant_msg)
     db.commit()
@@ -1012,16 +1030,65 @@ async def post_challenge_message(
 # CHALLENGES CRUD & CONTROL
 # ----------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# CHALLENGE READ-PATH OVERLAY (SwarmCoordinator mission state)
+# ---------------------------------------------------------------------------
+# The dashboard's default engine (SwarmCoordinator) persists live progress and
+# lifecycle status to ``swarm_missions`` via SharedMissionState.save(); it never
+# writes ChallengeModel.progress/status. Reading the challenge columns directly
+# therefore shows stale values (0% / QUEUED) until the frontend's 10s reconcile
+# poll runs. These helpers overlay the latest mission row on the canonical read
+# path so first page load is already correct, while falling back to the challenge
+# columns for freshly created / legacy challenges with no mission row.
+
+def _map_swarm_status(swarm_status: Optional[str]) -> str:
+    """Map a SwarmMissionModel lifecycle status onto the dashboard vocabulary.
+
+    Mirrors App.tsx ``fetchSwarmReconcile`` (isComplete/isFailed):
+    COMPLETED -> COMPLETED, FAILED/CANCELLED -> FAILED, everything else -> RUNNING.
+    """
+    if swarm_status == "COMPLETED":
+        return "COMPLETED"
+    if swarm_status in ("FAILED", "CANCELLED"):
+        return "FAILED"
+    return "RUNNING"
+
+
+def _latest_swarm_mission(challenge_id: str, db: Session) -> Optional[SwarmMissionModel]:
+    return (
+        db.query(SwarmMissionModel)
+        .filter(SwarmMissionModel.challenge_id == challenge_id)
+        .order_by(SwarmMissionModel.created_at.desc())
+        .first()
+    )
+
+
+def _serialize_challenge(challenge: ChallengeModel, db: Session) -> dict:
+    """Serialize a ChallengeModel, preferring the live swarm mission's progress/status.
+
+    Falls back to the challenge's own columns when no SwarmMissionModel row exists
+    (challenge not yet started, or created via a path that never ran a mission).
+    """
+    data = jsonable_encoder(challenge)
+    mission = _latest_swarm_mission(challenge.id, db)
+    if mission is not None:
+        if mission.progress is not None:
+            data["progress"] = mission.progress
+        if mission.status:
+            data["status"] = _map_swarm_status(mission.status)
+    return data
+
+
 @router.get("/challenges")
 def list_challenges(db: Session = Depends(get_db)):
-    return db.query(ChallengeModel).all()
+    return [_serialize_challenge(c, db) for c in db.query(ChallengeModel).all()]
 
 @router.get("/challenges/{challenge_id}")
 def get_challenge(challenge_id: str, db: Session = Depends(get_db)):
     challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
-    return challenge
+    return _serialize_challenge(challenge, db)
 
 @router.patch("/challenges/{challenge_id}/mode")
 @router.put("/challenges/{challenge_id}/mode")

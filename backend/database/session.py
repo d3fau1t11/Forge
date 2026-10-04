@@ -107,6 +107,9 @@ MIGRATIONS = [
     (25, "CREATE TABLE IF NOT EXISTS terminal_commands (id VARCHAR PRIMARY KEY, challenge_id VARCHAR, session_id VARCHAR, command TEXT NOT NULL, stdout TEXT DEFAULT '', stderr TEXT DEFAULT '', exit_code INTEGER, duration_ms FLOAT DEFAULT 0.0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"),
     (26, "CREATE INDEX IF NOT EXISTS ix_terminal_commands_challenge_id ON terminal_commands(challenge_id)"),
     (27, "CREATE INDEX IF NOT EXISTS ix_terminal_commands_created_at ON terminal_commands(created_at)"),
+    # Chat turn outcome — distinguishes a real assistant answer from a model
+    # router failure/refusal at the persistence layer.
+    (28, "ALTER TABLE chat_messages ADD COLUMN status VARCHAR DEFAULT 'ok'"),
 ]
 
 # SQLite's exact wording for ADD COLUMN on a column that already exists

@@ -221,6 +221,10 @@ class ChatMessageModel(Base):
     challenge_id = Column(String, ForeignKey("challenges.id"), nullable=False, index=True)
     role = Column(String, nullable=False)  # user, assistant, system
     content = Column(Text, nullable=False, default="")
+    # Durable turn outcome: "ok" for a normal answer, "error" when the model
+    # router raised or returned a refusal. Persisted so a failed/refused turn is
+    # distinguishable from a real answer without string-matching content.
+    status = Column(String, nullable=False, default="ok", server_default="ok")
     created_at = Column(DateTime, default=utcnow, index=True)
 
     challenge = relationship("ChallengeModel", back_populates="messages")
