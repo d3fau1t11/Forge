@@ -251,7 +251,8 @@ class RealToolExecutor:
     _SHELL_CAPABILITIES = frozenset({"interactive_open", "interactive_start"})
 
     def __init__(self, tool_manager=None, approval_gate=None,
-                 challenge_id: Optional[str] = None, run_id: Optional[str] = None):
+                 challenge_id: Optional[str] = None, run_id: Optional[str] = None,
+                 workspace_root: Optional[str] = None):
         if tool_manager is None:
             from backend.tools.manager import tool_manager as tm
             tool_manager = tm
@@ -262,6 +263,10 @@ class RealToolExecutor:
         # console can attribute the request to the right challenge/run.
         self._challenge_id = challenge_id
         self._run_id = run_id
+        # Workspace root for the mission, if known. Used ONLY to prove that routine
+        # creation/copy commands are confined; None keeps the fail-closed PRIVILEGED
+        # default for mkdir/touch/cp/mv.
+        self._workspace_root = workspace_root
 
     async def _gate(self, cmd: str) -> Optional[ExecResult]:
         """Gate *cmd*. Returns None when approved, else a blocked ExecResult."""
@@ -273,6 +278,7 @@ class RealToolExecutor:
             broadcast_fn=ws_manager.broadcast,
             challenge_id=self._challenge_id,
             run_id=self._run_id,
+            workspace_root=self._workspace_root,
         )
         if approved:
             return None

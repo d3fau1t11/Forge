@@ -791,7 +791,7 @@ class SwarmOrchestrator:
                 # lower-cased pre-check above) because the failure-blocking code below
                 # keys board.blocked_capabilities on this exact value.
                 bin_name = os.path.basename(cmd.strip().split()[0]) if cmd.strip() else ""
-                priv_level = classify_command_privilege(cmd, bin_name)
+                priv_level = classify_command_privilege(cmd, bin_name, workspace_root=workdir)
 
                 # ── Capability-gap retry tagging ──────────────────────────────────────
                 # A denied command is recorded as a capability gap and later re-issued by
@@ -813,6 +813,7 @@ class SwarmOrchestrator:
                     challenge_id=board.challenge_id,
                     run_id=board.run_id,
                     context=_retry_context,
+                    workspace_root=workdir,
                 )
                 # req_sudo is only consulted inside the sudo-stdin block below, which
                 # additionally requires a password the gate returns only on approval —

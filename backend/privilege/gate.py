@@ -157,6 +157,7 @@ async def require_approval(
     challenge_id: Optional[str],
     run_id: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
+    workspace_root: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """Classify ``cmd`` and gate its execution behind operator authorization.
 
@@ -192,7 +193,7 @@ async def require_approval(
       * broadcasts an ``APPROVAL_REQUIRED`` event through ``broadcast_fn``.
     """
     bin_name = os.path.basename(cmd.strip().split()[0]) if cmd.strip() else ""
-    priv_level = classify_command_privilege(cmd, bin_name)
+    priv_level = classify_command_privilege(cmd, bin_name, workspace_root=workspace_root)
 
     approved = False
     # audit_log_id lets us reconcile the AuditLogModel row (written now, showing

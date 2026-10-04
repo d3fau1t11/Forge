@@ -173,6 +173,25 @@ async def interpret_operator_message(transcript: list[dict], fields: dict) -> Op
         {"reply": str, "fields": dict, "ready_to_create": bool} on success,
         None on any parsing/validation error or model refusal.
     """
+    # Deterministic, non-LLM fallback: extract a target from the operator's
+    # latest message BEFORE the model is consulted. The call site
+    # (backend/api/routes/challenges.py) builds the transcript in ascending
+    # created_at order with the just-persisted user turn appended last, so the
+    # last "user" entry is the operator's latest turn. This guarantees a
+    # volunteered target is captured even when the model leaves
+    # target_address null. Imported lazily to keep this module's top-level
+    # import graph free of FastAPI/SQLAlchemy (see module docstring); there is
+    # no circular import because challenges.py only imports this module inside
+    # its route functions.
+    from backend.api.routes.challenges import extract_target_from_text
+
+    latest_user_text = ""
+    for msg in reversed(transcript or []):
+        if msg.get("role") == "user":
+            latest_user_text = msg.get("content") or ""
+            break
+    deterministic_target = extract_target_from_text(latest_user_text)
+
     # Build the prompt
     prompt = build_intake_prompt(transcript, fields)
 
@@ -193,7 +212,18 @@ async def interpret_operator_message(transcript: list[dict], fields: dict) -> Op
     if response.is_refusal:
         return None
 
-    return _parse_model_json(response.content)
+    parsed = _parse_model_json(response.content)
+    if parsed is None:
+        return None
+
+    # Prefer the model's target_address when it provided one (it may have
+    # cleaned or combined it better). Only fall back to the deterministic
+    # extraction when the model returned null, so a volunteered target is
+    # never silently dropped.
+    if deterministic_target and not parsed["fields"].get("target_address"):
+        parsed["fields"]["target_address"] = normalize_targets(deterministic_target)
+
+    return parsed
 
 
 async def generate_opening_message() -> Optional[str]:
@@ -209,8 +239,8 @@ async def generate_opening_message() -> Optional[str]:
         "conversation history yet and no fields collected. Produce the opening JSON "
         "response now: greet the operator and ask for the three required fields — the "
         "challenge name, the category, and the difficulty. You may mention that the "
-        "platform is optional. Do not ask for targets or a description yet. Ask for "
-        "the opening information in a natural, conversational way."
+        "platform is optional. Ask for the opening information in a natural, "
+        "conversational way."
     )
 
     try:

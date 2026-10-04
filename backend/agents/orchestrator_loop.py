@@ -99,18 +99,21 @@ class AutonomousOrchestrator:
     # ------------------------------------------------------------------ #
 
     def _ensure_runtime(self, challenge_id: Optional[str] = None,
-                        run_id: Optional[str] = None):
+                        run_id: Optional[str] = None,
+                        workspace_root: Optional[str] = None):
         # The executor binds the PER-MISSION approval context (challenge_id/run_id)
         # to the operator gate. This orchestrator is a process-wide singleton, so
         # the runtime is cached per (challenge_id, run_id) rather than once — reusing
         # a runtime built for mission A on mission B would make B's approval requests
         # carry A's challenge id and resolve A's approval_mode.
-        key = (challenge_id, run_id)
+        key = (challenge_id, run_id, workspace_root)
         if self._runtime is None or self._runtime_key != key:
             from backend.agent_runtime import AgentRuntime, RealToolExecutor, session_manager
             self._session_manager = session_manager
             self._runtime = AgentRuntime(
-                tool_executor=RealToolExecutor(challenge_id=challenge_id, run_id=run_id))
+                tool_executor=RealToolExecutor(
+                    challenge_id=challenge_id, run_id=run_id,
+                    workspace_root=workspace_root))
             self._runtime_key = key
         return self._runtime
 
@@ -130,9 +133,6 @@ class AutonomousOrchestrator:
         Challenge metadata is read from the DB so the runtime prompt matches the swarm's.
         Non-fatal to the legacy path — callers may still use run_autonomous_loop.
         """
-        runtime = self._ensure_runtime(challenge_id=challenge_id, run_id=run_id)
-        sm = self._session_manager
-
         db = SessionLocal()
         try:
             ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
@@ -146,6 +146,14 @@ class AutonomousOrchestrator:
             }
         finally:
             db.close()
+
+        # Bind the mission's workspace root to the approval gate so routine
+        # creation/copy commands confined to it can auto-approve. Rebuilt (rather
+        # than reused) when the working directory changes.
+        runtime = self._ensure_runtime(
+            challenge_id=challenge_id, run_id=run_id,
+            workspace_root=(meta.get("working_directory") or None))
+        sm = self._session_manager
 
         if resume_session_id:
             session = sm.restore(resume_session_id) or sm.create(
@@ -619,6 +627,7 @@ class AutonomousOrchestrator:
                     broadcast_fn=ws_manager.broadcast,
                     challenge_id=challenge_id,
                     run_id=run_id,
+                    workspace_root=challenge.working_directory,
                 )
 
                 if not _approved:
@@ -684,6 +693,7 @@ class AutonomousOrchestrator:
                                     broadcast_fn=ws_manager.broadcast,
                                     challenge_id=challenge_id,
                                     run_id=run_id,
+                                    workspace_root=challenge.working_directory,
                                 )
                                 cmd_retry_start = time.time()
                                 if not _r_approved:
@@ -730,6 +740,7 @@ class AutonomousOrchestrator:
                             broadcast_fn=ws_manager.broadcast,
                             challenge_id=challenge_id,
                             run_id=run_id,
+                            workspace_root=challenge.working_directory,
                         )
                         cmd_elev_start = time.time()
                         if not _s_approved:
@@ -785,6 +796,7 @@ class AutonomousOrchestrator:
                                         broadcast_fn=ws_manager.broadcast,
                                         challenge_id=challenge_id,
                                         run_id=run_id,
+                                        workspace_root=challenge.working_directory,
                                     )
                                     cmd_elev_start = time.time()
                                     if not _e_approved:

@@ -97,7 +97,9 @@ class SpecialistAgent:
         # Bind the mission's challenge/run so the operator-approval gate can resolve
         # the challenge's own approval_mode and attribute the request correctly.
         return AgentRuntime(
-            tool_executor=RealToolExecutor(challenge_id=challenge_id, run_id=run_id))
+            tool_executor=RealToolExecutor(
+                challenge_id=challenge_id, run_id=run_id,
+                workspace_root=self.workspace_root))
 
     def _agent_cwd(self, task: Task) -> Optional[str]:
         if not self.workspace_root:
