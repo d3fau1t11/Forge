@@ -29,6 +29,11 @@ class TestLocalExecutionFailures(unittest.TestCase):
         self.assertTrue(r["execution_failure"])
         self.assertEqual(r["failure_category"], "SYNTAX_ERROR")
 
+    def test_python_syntax_error_unterminated_string(self):
+        r = classify_tool_execution("python", 1, "", "  File \"solve.py\", line 3\n    SyntaxError: unterminated string")
+        self.assertTrue(r["execution_failure"])
+        self.assertEqual(r["failure_category"], "SYNTAX_ERROR")
+
     def test_permission_denied(self):
         r = classify_tool_execution("bash", 126, "", "bash: ./run.sh: Permission denied")
         self.assertTrue(r["execution_failure"])

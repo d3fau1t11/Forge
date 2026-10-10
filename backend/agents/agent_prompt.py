@@ -104,7 +104,11 @@ HARD RULES — violation of any of these is a critical failure:
    - A complete Python script inside triple-backtick python blocks (FORGE will save it as solve.py and run it).
    - FLAG: <value>  (only when verified from real observed output — include the source command).
    - BUDGET_EXHAUSTED: <findings summary>
-6. Do not output narrative prose, commentary, or explanations alongside a command.  A command is the action; context belongs in the next turn's history."""
+6. Python scripts must contain valid, executable Python syntax.  In particular:
+   - F-strings with literal curly braces must double them (`{{` and `}}`); unescaped braces inside f-strings cause SyntaxError.
+   - Assignments and dict/literal syntax must be valid Python — avoid trailing commas, mismatched brackets, or unfinished statements inside code blocks.
+   - If a variable's value may contain braces, format it outside the f-string or explicitly escape.
+7. Do not output narrative prose, commentary, or explanations alongside a command.  A command is the action; context belongs in the next turn's history."""
 
 # ---------------------------------------------------------------------------
 # User prompt (full context + history injected here each turn)
