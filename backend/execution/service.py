@@ -125,6 +125,41 @@ class ExecutionService:
         )
         return await self.execute(request)
 
+    async def run_argv(
+        self,
+        argv,
+        *,
+        cwd: Optional[str] = None,
+        timeout_seconds: int = 120,
+        capability: str = "custom_command",
+        tool_name: str = "",
+        session_id: str = "",
+        agent_id: str = "",
+        canonical_target: Optional[str] = None,
+        stdin: Optional[str] = None,
+        command: str = "",
+    ) -> ExecutionResult:
+        """Run a pre-split argument vector WITHOUT a shell (``shell=False``).
+
+        Every element is passed to the OS as one literal argument, so values
+        composed from untrusted inputs (targets, extra args) can never be
+        reinterpreted as shell syntax.  *command* is an optional human-readable
+        display string (defaults to a shell-quoted join of *argv*).
+        """
+        request = ExecutionRequest(
+            command=command or " ".join(str(a) for a in argv),
+            argv=[str(a) for a in argv],
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            capability=capability,
+            tool_name=tool_name,
+            session_id=session_id,
+            agent_id=agent_id,
+            canonical_target=canonical_target,
+            stdin=stdin,
+        )
+        return await self.execute(request)
+
     # ------------------------------------------------------------------ #
     # Persistent interactive execution (Phase 4.x §5).  A persistent process
     # is NOT an ordinary one-shot command, so it is served by a dedicated

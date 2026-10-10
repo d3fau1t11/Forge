@@ -52,6 +52,11 @@ class ExecutionRequest:
     # the process's stdin after spawn (e.g. ``printf 'RETURN 0\n' | python challenge.py``
     # expressed structurally). None keeps the ordinary one-shot behaviour unchanged.
     stdin: Optional[str] = None
+    # Shell-free execution (security hardening): when set, the backend executes this
+    # pre-split argument vector via ``shell=False`` instead of interpreting *command*.
+    # Used by callers that compose commands from untrusted values (targets, extra
+    # args); *command* then only carries a human-readable display string.
+    argv: Optional[List[str]] = None
 
 
 @dataclass

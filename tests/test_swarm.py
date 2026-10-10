@@ -3,6 +3,8 @@
 import unittest
 import asyncio
 import os
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
 
@@ -143,6 +145,122 @@ class TestSwarmEngine(unittest.TestCase):
             self.assertEqual(board.extracted_headers.get("X-Forwarded-For"), "127.0.0.1")
 
         asyncio.run(flow())
+
+
+class TestSwarmCancellation(unittest.TestCase):
+    """Regression: cancelling the swarm supervisor must not leak the worker
+    gather, flag-wait, or checkpoint-coordinator tasks (nor their subprocesses)."""
+
+    def test_cancelling_supervisor_cleans_up_all_child_tasks(self):
+        from backend.agents import swarm_orchestrator as so
+        from backend.agents.swarm_orchestrator import SwarmOrchestrator
+
+        async def scenario():
+            orch = SwarmOrchestrator()
+
+            worker_started = asyncio.Event()
+            coordinator_started = asyncio.Event()
+            workers_cancelled: set = set()
+            coordinator_cancelled = asyncio.Event()
+
+            async def fake_agent_worker(agent_id, board, workdir, capability):
+                worker_started.set()
+                try:
+                    await asyncio.sleep(3600)
+                finally:
+                    workers_cancelled.add(agent_id)
+
+            async def fake_coordinator(board, workdir):
+                coordinator_started.set()
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    coordinator_cancelled.set()
+                    raise
+
+            # Replace only the long-running supervision bodies; every external
+            # dependency is mocked so no provider, network, or DB is touched.
+            orch._agent_worker = fake_agent_worker
+            orch._checkpoint_coordinator = fake_coordinator
+
+            fake_db = MagicMock()
+            fake_db.query.return_value.filter.return_value.first.return_value = None
+
+            before = {t for t in asyncio.all_tasks() if not t.done()}
+
+            with patch.object(so, "SessionLocal", return_value=fake_db), \
+                 patch.object(so.turbo_recon, "start_turbo_recon", new=AsyncMock(return_value={})), \
+                 patch.object(so.environment_detector, "detect_environment",
+                              return_value={"cpu_cores": 2}), \
+                 patch.object(so, "acquire_artifacts", new=AsyncMock(
+                     return_value=SimpleNamespace(notes=[], saved_paths=[], primary=None))), \
+                 patch.object(so.memory_retriever, "retrieve_and_format",
+                              return_value=("", [])):
+                run_task = asyncio.ensure_future(orch.run_swarm(
+                    run_id="run-cancel", challenge_id="chal-cancel",
+                    target_scope="http://127.0.0.1:9/", working_directory=".",
+                ))
+                await asyncio.wait_for(worker_started.wait(), timeout=5)
+                await asyncio.wait_for(coordinator_started.wait(), timeout=5)
+                board = orch.active_swarms["run-cancel"]
+
+                run_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await run_task
+
+            # Cancellation must NOT be swallowed, and the stopped state + checkpoint
+            # signal must be set for any waiters before cleanup.
+            self.assertTrue(board.is_stopped)
+            self.assertTrue(board.checkpoint_response_event.is_set())
+            self.assertNotIn("run-cancel", orch.active_swarms)
+            # Every worker and the coordinator observed cancellation.
+            self.assertTrue(workers_cancelled)
+            self.assertTrue(coordinator_cancelled.is_set())
+            # No supervising task (worker gather / flag wait / coordinator) survives.
+            await asyncio.sleep(0)
+            after = {t for t in asyncio.all_tasks() if not t.done()}
+            self.assertEqual(after - before, set(),
+                             f"leaked supervisor tasks: {after - before}")
+
+        asyncio.run(scenario())
+
+    def test_shutdown_helper_cancels_outstanding_and_tolerates_finished(self):
+        """The cleanup helper must cancel pending tasks, await them, and treat an
+        already-finished (or already-failed) task as a benign result."""
+        from backend.agents.swarm_orchestrator import SwarmOrchestrator
+
+        async def scenario():
+            orch = SwarmOrchestrator()
+            started = asyncio.Event()
+            cancelled = asyncio.Event()
+
+            async def sleeper():
+                started.set()
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+            async def boom():
+                raise RuntimeError("worker failed")
+
+            pending = asyncio.create_task(sleeper())
+            failed = asyncio.ensure_future(boom())
+            await started.wait()
+            await asyncio.sleep(0)  # let `failed` settle into a failed state
+
+            before = {t for t in asyncio.all_tasks() if not t.done()} - {pending}
+            # Must not raise despite the failed task, and must cancel the pending one.
+            await orch._shutdown_supervisor_tasks(pending, failed)
+            self.assertTrue(cancelled.is_set())
+            self.assertTrue(pending.done())
+            after = {t for t in asyncio.all_tasks() if not t.done()}
+            self.assertEqual(after - before, set(),
+                             f"leaked tasks after shutdown: {after - before}")
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

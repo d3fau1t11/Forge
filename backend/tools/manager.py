@@ -4,6 +4,7 @@ import difflib
 from urllib.parse import urlparse
 import asyncio
 import time
+import shlex
 import shutil
 import logging
 from typing import Dict, Any, Optional
@@ -11,6 +12,13 @@ from pydantic import BaseModel
 from backend.tools.registry import tool_registry, ToolMetadata
 from backend.environment.detector import environment_detector
 from backend.execution.service import execution_service
+from backend.execution.command_safety import (
+    UnsupportedShellSyntax,
+    build_argv,
+    find_shell_syntax,
+    is_plain_host,
+    parse_extra_args,
+)
 
 logger = logging.getLogger("forge.tools")
 
@@ -40,6 +48,14 @@ def sanitize_and_correct_command_target(command: str, canonical_target_url: Opti
         parsed_canonical = urlparse(canonical_target_url if "://" in canonical_target_url else f"http://{canonical_target_url}")
         canonical_host = (parsed_canonical.hostname or canonical_target_url.split(":")[0]).replace("http://", "").replace("https://", "").strip("/")
         if not canonical_host or len(canonical_host) < 4:
+            return command
+
+        # Never splice a non-host token into the command.  A canonical target that
+        # carries shell metacharacters or whitespace (e.g. "evil.com; rm -rf /")
+        # would otherwise inject syntax into the command line during correction.
+        # Only a syntactically plain host/IP/domain is eligible to be substituted.
+        if not is_plain_host(canonical_host):
+            logger.warning("[AUTO-CORRECT HOST] skipped: canonical host %r is not a plain host token", canonical_host[:40])
             return command
 
         corrected_cmd = command
@@ -167,8 +183,17 @@ class ToolManager:
                 stderr=f"Tool '{first_candidate.tool_name}' required for capability '{capability}' is not installed. Trusted install recipe: `{first_candidate.installation_recipe}`"
             )
 
-        # 3. Construct safe execution command string & sanitize target format for specific tools
+        # 3. Compose an executable + LITERAL argument vector (no shell).  The target
+        #    and extra args are untrusted values, so they must never be spliced into
+        #    a shell string: each becomes exactly ONE argv element and is executed
+        #    with shell=False (ProcessManager.run_argv).  A value such as
+        #    "127.0.0.1; rm -rf /" therefore stays a single literal argument.
         parsed_target = target.replace("+", ",").split(",")[0].strip()
+        # Preserve the existing host typo-correction behaviour (e.g. 'evi1.com' ->
+        # 'evil.com') on the TARGET VALUE ONLY, before it becomes an argv element.
+        # sanitize_and_correct_command_target refuses any non-plain canonical host,
+        # so correction can never splice shell metacharacters into the value.
+        parsed_target = sanitize_and_correct_command_target(parsed_target, target)
         target_port = None
 
         if parsed_target.startswith("http://") or parsed_target.startswith("https://"):
@@ -180,33 +205,53 @@ class ToolManager:
             host_only = parsed_target.split(":")[0]
             base_url = parsed_target
 
+        # Reject shell syntax in caller-supplied args EXPLICITLY.  A capability never
+        # needs shell operators, and accepting them would re-open the very injection
+        # path the argv route closes.  We do not claim a filter makes shell execution
+        # safe — we refuse to use a shell here at all.
+        try:
+            extra_argv = parse_extra_args(extra_args)
+        except UnsupportedShellSyntax as exc:
+            logger.warning("[ToolManager] rejected extra args for '%s': %s", selected_tool.tool_name, exc)
+            return ToolExecutionResult(
+                tool_name=selected_tool.tool_name,
+                capability=capability,
+                command="",
+                status="FAILED",
+                stderr=(f"Rejected extra arguments for '{selected_tool.tool_name}': unsupported "
+                        f"shell syntax ({exc.feature}). Capabilities execute without a shell."),
+                exit_code=-1,
+                execution_failure=True,
+                failure_category="UNSUPPORTED_SHELL_SYNTAX",
+            )
+
         if selected_tool.tool_name == "nmap":
-            target_for_cmd = host_only
-            extra_port = f" -p {target_port}" if target_port else ""
-            raw_args = selected_tool.args_template.format(target=target_for_cmd) + extra_port
+            argv = build_argv(selected_tool.binary, selected_tool.args_template, target=host_only)
+            if target_port:
+                argv += ["-p", str(target_port)]
         elif selected_tool.tool_name == "ffuf":
             from backend.execution.wordlist import wordlist_resolver  # lazy — avoids circular import
             clean_url = base_url.rstrip("/")
             wl_path = wordlist_resolver.resolve("web_common")
-            raw_args = f"-u {clean_url}/FUZZ -w {wl_path} -mc 200,301,302,401,403 -s"
+            argv = [selected_tool.binary, "-u", f"{clean_url}/FUZZ", "-w", wl_path,
+                    "-mc", "200,301,302,401,403", "-s"]
         else:
-            raw_args = selected_tool.args_template.format(target=parsed_target)
+            argv = build_argv(selected_tool.binary, selected_tool.args_template, target=parsed_target)
 
-        if extra_args:
-            raw_args += f" {extra_args}"
+        argv += extra_argv
 
-        full_command = f"{selected_tool.binary} {raw_args}"
-        full_command = sanitize_and_correct_command_target(full_command, target)
+        full_command = shlex.join(argv)  # display/log only — never parsed by a shell
         logger.info(f"Executing tool '{selected_tool.tool_name}' (cwd={cwd}): {full_command}")
 
-        # 4. Delegate subprocess execution to ExecutionService (Phase 3)
+        # 4. Delegate shell-free execution to ExecutionService (Phase 3, hardening)
         exec_cwd = cwd if (cwd and os.path.exists(cwd)) else None
-        _exec = await execution_service.run_command(
-            full_command,
+        _exec = await execution_service.run_argv(
+            argv,
             cwd=exec_cwd,
             timeout_seconds=selected_tool.timeout_seconds,
             capability=capability,
             tool_name=selected_tool.tool_name,
+            command=full_command,
         )
         stdout = _exec.stdout
         stderr = _exec.stderr
@@ -239,6 +284,13 @@ class ToolManager:
     ) -> ToolExecutionResult:
         start_time = time.time()
         raw_cmd = sanitize_and_correct_command_target(command.strip(), canonical_target)
+        # Agent-authored commands may legitimately need shell syntax (pipes,
+        # redirection, chaining).  We route them through the shell mechanism and
+        # make that decision explicit/observable rather than pretending a filter
+        # makes arbitrary shell execution safe.
+        shell_feature = find_shell_syntax(raw_cmd)
+        if shell_feature:
+            logger.info("[ToolManager] raw command requires shell (%s); executing via shell mechanism", shell_feature)
         logger.info(f"Executing raw CLI command (cwd={cwd}): {raw_cmd}")
 
         # Delegate subprocess execution to ExecutionService (Phase 3). When *stdin* is

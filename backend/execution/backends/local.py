@@ -20,6 +20,7 @@ python / python3:
 from __future__ import annotations
 
 import logging
+import shlex
 import shutil
 import sys
 from typing import Optional
@@ -86,30 +87,57 @@ class LocalBackend:
         """
         Execute *req* on the local host and return a structured ExecutionResult.
 
-        The command string is taken as-is from req.command.  The backend
-        resolves the python binary if the command starts with 'python3' or
-        'python' and normalises it for the current OS.
+        Two mutually exclusive modes:
+
+        * If ``req.argv`` is set, it is executed as a **literal argument vector**
+          with ``shell=False`` (no shell interpretation).  This is the safe route
+          for commands composed from untrusted values.  ``req.command`` is only a
+          human-readable display string in that case.
+        * Otherwise the command string is taken as-is from ``req.command`` and run
+          through the shell (the agent-authored route).  The backend resolves the
+          python binary if the command starts with 'python3' or 'python' and
+          normalises it for the current OS.
         """
-        command = self._normalise_command(req.command)
-        first = command.split()[0] if command.strip() else ""
+        if req.argv:
+            command = self._normalise_argv([str(a) for a in req.argv])
+            first = command[0] if command else ""
+            display = req.command or shlex.join(command)
+            logger.info(f"[LocalBackend] execute_argv cwd={req.cwd!r}: {display[:200]}")
 
-        # Do not pre-check shutil.which here — shell built-ins (echo, cd, dir on
-        # Windows) are valid commands that have no filesystem binary.  If a tool
-        # genuinely does not exist, the subprocess exit code plus stderr text will
-        # trigger COMMAND_NOT_FOUND via classify_tool_execution, and we then map
-        # that to STATUS_MISSING_TOOL below.
-        logger.info(f"[LocalBackend] execute cwd={req.cwd!r}: {command[:200]}")
+            stdout, stderr, exit_code = await process_manager.run_argv(
+                command,
+                cwd=req.cwd,
+                timeout_seconds=req.timeout_seconds,
+                env=req.env,
+                session_id=req.session_id,
+                agent_id=req.agent_id,
+                backend=self.kind,
+                input_data=req.stdin,
+                display_command=display,
+            )
+            command_display = display
+        else:
+            command = self._normalise_command(req.command)
+            first = command.split()[0] if command.strip() else ""
 
-        stdout, stderr, exit_code = await process_manager.run(
-            command,
-            cwd=req.cwd,
-            timeout_seconds=req.timeout_seconds,
-            env=req.env,
-            session_id=req.session_id,
-            agent_id=req.agent_id,
-            backend=self.kind,
-            input_data=req.stdin,
-        )
+            # Do not pre-check shutil.which here — shell built-ins (echo, cd, dir on
+            # Windows) are valid commands that have no filesystem binary.  If a tool
+            # genuinely does not exist, the subprocess exit code plus stderr text will
+            # trigger COMMAND_NOT_FOUND via classify_tool_execution, and we then map
+            # that to STATUS_MISSING_TOOL below.
+            logger.info(f"[LocalBackend] execute cwd={req.cwd!r}: {command[:200]}")
+
+            stdout, stderr, exit_code = await process_manager.run(
+                command,
+                cwd=req.cwd,
+                timeout_seconds=req.timeout_seconds,
+                env=req.env,
+                session_id=req.session_id,
+                agent_id=req.agent_id,
+                backend=self.kind,
+                input_data=req.stdin,
+            )
+            command_display = command
 
         timed_out = (
             exit_code == -1
@@ -139,7 +167,7 @@ class LocalBackend:
             stdout=stdout,
             stderr=stderr,
             exit_code=exit_code,
-            command=command,
+            command=command_display,
             tool_name=req.tool_name or first,
             capability=req.capability,
             backend=self.kind,
@@ -151,6 +179,18 @@ class LocalBackend:
         )
 
     # ------------------------------------------------------------------ #
+
+    def _normalise_argv(self, argv: list) -> list:
+        """Rewrite a leading 'python3'/'python' argv[0] for the current OS.
+
+        Mirrors :meth:`_normalise_command` so shell-free execution resolves the
+        same python binary as the shell path.
+        """
+        if argv and argv[0] in ("python3", "python"):
+            resolved = _resolve_python()
+            if resolved and resolved != argv[0]:
+                return [resolved] + list(argv[1:])
+        return list(argv)
 
     def _normalise_command(self, command: str) -> str:
         """

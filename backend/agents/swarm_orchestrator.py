@@ -1020,20 +1020,29 @@ class SwarmOrchestrator:
             worker_task = asyncio.ensure_future(asyncio.gather(*agents, return_exceptions=True))
             flag_task = asyncio.create_task(board.flag_event.wait())
             checkpoint_task = asyncio.create_task(self._checkpoint_coordinator(board, working_directory))
+            supervisor_tasks = (worker_task, flag_task, checkpoint_task)
 
             _append_to_challenge_log(challenge_id, "orchestrator", f"{pool_size} flexible-agent workers + checkpoint coordinator dispatched")
 
-            # Wait for flag event, all agents finishing, or coordinator exit.
-            done, pending = await asyncio.wait(
-                [flag_task, worker_task, checkpoint_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-
-            # Stop everything and release any coordinator hard-wait so it can exit.
-            board.is_stopped = True
-            board.checkpoint_response_event.set()
-            for p in pending:
-                p.cancel()
+            # Wait for flag event, all agents finishing, or coordinator exit. The
+            # finally guarantees that on ANY exit from the supervising wait —
+            # normal completion, an unexpected error, OR cancellation of this
+            # supervisor — the worker gather, flag-wait, and checkpoint tasks are
+            # stopped and awaited before we leave, so none (nor any subprocess they
+            # own) can outlive the run.
+            try:
+                done, _pending = await asyncio.wait(
+                    list(supervisor_tasks),
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                # Signal intent to stop and release any coordinator hard-wait BEFORE
+                # cancelling, so agents/coordinator observing these flags can exit.
+                board.is_stopped = True
+                board.checkpoint_response_event.set()
+                # Cancel outstanding tasks and await them; return_exceptions means an
+                # already-failed/cancelled task never masks the caller's outcome.
+                await self._shutdown_supervisor_tasks(*supervisor_tasks)
 
             # Check if workers raised exceptions
             if worker_task in done:
@@ -1138,6 +1147,23 @@ class SwarmOrchestrator:
             # Release OS Keep-Awake lock
             keep_awake_manager.release(reason=f"Swarm Challenge {challenge_id} Ended")
             _append_to_challenge_log(challenge_id, "orchestrator", "Swarm shutdown complete")
+
+    async def _shutdown_supervisor_tasks(self, *tasks: "asyncio.Future") -> None:
+        """Cancel every outstanding supervisor task and await it to completion.
+
+        Called from run_swarm on initial completion, on error, and on cancellation
+        of the supervisor itself, so that no worker-agent gather, flag-wait, or
+        checkpoint-coordinator task is left running (and no subprocess they own is
+        left behind). ``return_exceptions=True`` ensures an already-failed or
+        already-cancelled task never masks the caller's outcome, and awaiting the
+        gather guarantees cancellation has fully unwound before we return.
+        """
+        outstanding = [t for t in tasks if t is not None]
+        for t in outstanding:
+            if not t.done():
+                t.cancel()
+        if outstanding:
+            await asyncio.gather(*outstanding, return_exceptions=True)
 
     async def request_pause(self, challenge_id: str) -> bool:
         """Gracefully pause every active swarm for a challenge.

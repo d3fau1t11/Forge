@@ -242,6 +242,91 @@ class TestProcessManager(unittest.TestCase):
         _run(pm.run("echo done", timeout_seconds=5))
         self.assertEqual(pm.active_count(), 0)
 
+    # ── Cancellation lifecycle regression ────────────────────────────────────
+    # Cancelling the awaiting task must terminate + reap the real child process
+    # and release its registry entry — never orphan it.
+
+    def _pid_is_alive(self, pid: int) -> bool:
+        """Read-only cross-platform liveness probe (never signals anything)."""
+        if sys.platform == "win32":
+            import subprocess
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True,
+            ).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == str(pid):
+                    return True
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+    async def _wait_for_registered_pid(self, pm, timeout: float = 10.0):
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            pids = pm.active_pids()
+            if pids:
+                return pids[0]
+            await asyncio.sleep(0.05)
+        raise AssertionError("subprocess was never registered by ProcessManager")
+
+    async def _wait_pid_gone(self, pid: int, timeout: float = 10.0) -> bool:
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._pid_is_alive(pid):
+                return True
+            await asyncio.sleep(0.1)
+        return False
+
+    def test_cancellation_kills_sleeping_child_and_clears_registry(self):
+        """Cancelling run() must kill the real local child and leave no managed PID."""
+        from backend.execution.process_manager import ProcessManager
+        pm = ProcessManager()
+        # A genuinely long-running LOCAL child, cancelled mid-flight.
+        cmd = "ping -n 100 127.0.0.1" if sys.platform == "win32" else "sleep 100"
+
+        async def scenario():
+            task = asyncio.ensure_future(pm.run(cmd, timeout_seconds=120))
+            pid = await self._wait_for_registered_pid(pm)
+            self.assertIn(pid, pm.active_pids())
+            await asyncio.sleep(0.2)  # let it reach communicate()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            # Registry entry released and the OS process is actually gone.
+            self.assertNotIn(pid, pm.active_pids(),
+                             "cancelled process left a managed PID behind")
+            self.assertEqual(pm.active_count(), 0)
+            self.assertTrue(await self._wait_pid_gone(pid),
+                            f"cancelled child pid {pid} is still alive")
+
+        _run(scenario())
+
+    def test_kill_tree_and_wait_is_safe_on_already_exited_process(self):
+        """Cleanup must not raise when the process already exited."""
+        from backend.execution.process_manager import ProcessManager
+        pm = ProcessManager()
+
+        async def scenario():
+            proc = await asyncio.create_subprocess_shell(
+                "echo done",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            self.assertIsNotNone(proc.returncode)
+            # No-op, no raise, and the return code stays available.
+            await pm._kill_tree_and_wait(proc)
+            self.assertIsNotNone(proc.returncode)
+
+        _run(scenario())
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. LocalBackend — tool availability

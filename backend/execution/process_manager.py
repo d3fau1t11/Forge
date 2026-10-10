@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import platform
+import shlex
 import sys
 import time
 from dataclasses import dataclass, field
@@ -70,32 +71,120 @@ class ProcessManager:
         equivalent of ``printf '...' | command``.  On timeout the process tree is
         killed and exit_code -1 is returned with a descriptive stderr message.
         The caller decides what status to assign.
+
+        This is the **shell** entry point (``create_subprocess_shell``).  It exists
+        for agent-authored commands that genuinely need shell syntax (pipes,
+        redirection, chaining).  It is NOT a sandbox: callers composing a command
+        from untrusted values must use :meth:`run_argv` instead.
         """
-        merged_env = None
-        if env:
-            merged_env = {**os.environ, **env}
+        kwargs = self._spawn_kwargs(cwd, env, input_data)
+        # On POSIX start in its own process group so we can kill the tree.
+        if not _IS_WINDOWS:
+            kwargs["preexec_fn"] = os.setsid  # type: ignore[attr-defined]
 
         try:
-            kwargs: dict = dict(
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            if input_data is not None:
-                kwargs["stdin"] = asyncio.subprocess.PIPE
-            if cwd and os.path.isdir(cwd):
-                kwargs["cwd"] = cwd
-            if merged_env:
-                kwargs["env"] = merged_env
-
-            # On POSIX start in its own process group so we can kill the tree.
-            if not _IS_WINDOWS:
-                kwargs["preexec_fn"] = os.setsid  # type: ignore[attr-defined]
-
             process = await asyncio.create_subprocess_shell(command, **kwargs)
-
         except Exception as exc:
             return "", f"Subprocess creation error: {exc}", -1
 
+        return await self._monitor(
+            process,
+            command=command,
+            timeout_seconds=timeout_seconds,
+            session_id=session_id,
+            agent_id=agent_id,
+            backend=backend,
+            input_data=input_data,
+        )
+
+    # ------------------------------------------------------------------ #
+
+    async def run_argv(
+        self,
+        argv: "list[str]",
+        *,
+        cwd: Optional[str] = None,
+        timeout_seconds: int = 120,
+        env: Optional[Dict[str, str]] = None,
+        session_id: str = "",
+        agent_id: str = "",
+        backend: str = "local",
+        input_data: Optional[str] = None,
+        display_command: str = "",
+    ) -> tuple[str, str, int]:
+        """Execute a pre-split argument vector WITHOUT a shell (``shell=False``).
+
+        Every element of *argv* is passed to the OS as *one* argument; no element
+        is ever parsed by a shell.  This is the execution primitive for commands
+        composed from untrusted values (challenge targets, extra tool args), so a
+        value like ``127.0.0.1; rm -rf /`` stays a single literal argument instead
+        of becoming a second command.
+
+        Lifecycle, timeout, cancellation, and process-tree cleanup are identical
+        to :meth:`run` (they share :meth:`_monitor`).
+        """
+        argv = [str(a) for a in argv]
+        if not argv:
+            return "", "Empty argv: nothing to execute.", -1
+
+        kwargs = self._spawn_kwargs(cwd, env, input_data)
+        if not _IS_WINDOWS:
+            kwargs["preexec_fn"] = os.setsid  # type: ignore[attr-defined]
+
+        try:
+            # create_subprocess_exec never invokes a shell (no shell=True path).
+            process = await asyncio.create_subprocess_exec(*argv, **kwargs)
+        except Exception as exc:
+            return "", f"Subprocess creation error: {exc}", -1
+
+        return await self._monitor(
+            process,
+            command=display_command or shlex.join(argv),
+            timeout_seconds=timeout_seconds,
+            session_id=session_id,
+            agent_id=agent_id,
+            backend=backend,
+            input_data=input_data,
+        )
+
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _spawn_kwargs(
+        cwd: Optional[str], env: Optional[Dict[str, str]], input_data: Optional[str]
+    ) -> dict:
+        """Build the shared subprocess kwargs (pipes, cwd, env, optional stdin)."""
+        merged_env = {**os.environ, **env} if env else None
+        kwargs: dict = dict(
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        if input_data is not None:
+            kwargs["stdin"] = asyncio.subprocess.PIPE
+        if cwd and os.path.isdir(cwd):
+            kwargs["cwd"] = cwd
+        if merged_env:
+            kwargs["env"] = merged_env
+        return kwargs
+
+    async def _monitor(
+        self,
+        process: asyncio.subprocess.Process,
+        *,
+        command: str,
+        timeout_seconds: int,
+        session_id: str,
+        agent_id: str,
+        backend: str,
+        input_data: Optional[str],
+    ) -> tuple[str, str, int]:
+        """Register, await, timeout, and reap a spawned process.
+
+        Shared by the shell (:meth:`run`) and shell-free (:meth:`run_argv`) entry
+        points.  The timeout and cancellation branches kill and reap the process
+        tree via :meth:`_kill_tree_and_wait` before returning/propagating, so a
+        cancelled or timed-out run never orphans a subprocess.
+        """
         managed = ManagedProcess(
             pid=process.pid,
             command=command,
@@ -120,12 +209,21 @@ class ProcessManager:
 
         except asyncio.TimeoutError:
             managed.state = "timeout"
-            await self._kill_tree(process)
+            await self._kill_tree_and_wait(process)
             return (
                 "",
                 f"Command execution timed out after {timeout_seconds} seconds.",
                 -1,
             )
+
+        except asyncio.CancelledError:
+            # Cancellation (task teardown, event-loop shutdown, kill switch) must
+            # not orphan the subprocess: terminate the whole tree and reap it
+            # BEFORE propagating the cancellation. Cleanup is safe when the
+            # process has already exited.
+            managed.state = "killed"
+            await self._kill_tree_and_wait(process)
+            raise
 
         finally:
             self._active.pop(managed.pid, None)
@@ -155,6 +253,21 @@ class ProcessManager:
         try:
             process.kill()
         except ProcessLookupError:
+            pass
+
+    async def _kill_tree_and_wait(self, process: asyncio.subprocess.Process) -> None:
+        """Kill the process tree, then await its exit so the OS reaps it.
+
+        Used by the timeout and cancellation paths. Safe when the process has
+        already exited: the kill calls no-op and ``process.wait()`` returns the
+        cached return code immediately. The bounded timeout guarantees cleanup
+        can never hang the cancelling caller indefinitely.
+        """
+        await self._kill_tree(process)
+        try:
+            if process.returncode is None:
+                await asyncio.wait_for(process.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
             pass
 
     async def kill(self, process: asyncio.subprocess.Process) -> None:
