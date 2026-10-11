@@ -1,6 +1,8 @@
+import base64
+import binascii
 import httpx
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from backend.providers.base import BaseProvider, ProviderResponse
 from backend.providers.rate_limits import parse_ratelimit_headers
 from backend.providers.quota_manager import quota_manager
@@ -53,6 +55,17 @@ class GeminiProvider(HTTPBaseProvider):
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"}
     ]
 
+    # MIME types Gemini accepts as inline image data. Kept provider-local so callers
+    # only ever hand over explicit (data, mime_type) pairs, never a payload shape.
+    SUPPORTED_IMAGE_MIME_TYPES = frozenset({
+        "image/jpeg", "image/jpg", "image/png", "image/webp",
+        "image/gif", "image/bmp", "image/heic", "image/heif",
+    })
+
+    # Gemini's inline_data request ceiling (~20 MB encoded). Overridable per-instance
+    # so tests can exercise the boundary without allocating a real 20 MB buffer.
+    MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
     def __init__(self, api_key: str = "", api_keys: Optional[list] = None):
         super().__init__(
             name="gemini",
@@ -85,15 +98,75 @@ class GeminiProvider(HTTPBaseProvider):
     async def is_available(self) -> bool:
         return bool(self.api_keys or self.api_key)
 
+    def _build_image_part(
+        self, image_data: Optional[Union[bytes, str]], image_mime_type: Optional[str]
+    ):
+        """Normalize explicit (image bytes/base64, MIME type) into a Gemini inline_data part.
+
+        Returns ``(part, None)`` on success or ``(None, reason)`` when the input is not a
+        valid, supported, in-budget image. The Gemini-specific ``inline_data`` shape is
+        built here and nowhere else so callers stay provider-neutral.
+        """
+        if image_data is None or image_mime_type is None:
+            return None, "image_data and image_mime_type must be provided together"
+        if not isinstance(image_mime_type, str) or image_mime_type.strip().lower() not in self.SUPPORTED_IMAGE_MIME_TYPES:
+            return None, f"Unsupported image MIME type: {image_mime_type!r}"
+        mime_type = image_mime_type.strip().lower()
+
+        if isinstance(image_data, (bytes, bytearray)):
+            raw = bytes(image_data)
+            encoded = base64.b64encode(raw).decode("ascii")
+        elif isinstance(image_data, str):
+            try:
+                raw = base64.b64decode(image_data, validate=True)
+            except (binascii.Error, ValueError):
+                return None, "image_data string is not valid base64"
+            encoded = image_data
+        else:
+            return None, f"image_data must be bytes or a base64 string, got {type(image_data).__name__}"
+
+        if not raw:
+            return None, "image_data is empty"
+        # MAX_IMAGE_BYTES is documented as Gemini's ceiling on the *encoded* inline_data
+        # payload. Validate the base64 string actually sent, not the decoded byte count:
+        # base64 inflates size by ~33%, so a decoded-length check can let an over-limit
+        # encoded payload reach the request body. (An encoded check subsumes the old
+        # decoded check, since encoded length >= raw length for any non-empty input.)
+        if len(encoded) > self.MAX_IMAGE_BYTES:
+            return None, f"image_data exceeds the {self.MAX_IMAGE_BYTES} byte inline limit"
+
+        return {"inline_data": {"mime_type": mime_type, "data": encoded}}, None
+
     async def generate_response(
-        self, prompt: str, system_instruction: Optional[str] = None, capability: str = "general_reasoning", model: Optional[str] = None, **kwargs
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        capability: str = "general_reasoning",
+        model: Optional[str] = None,
+        *,
+        image_data: Optional[Union[bytes, str]] = None,
+        image_mime_type: Optional[str] = None,
+        **kwargs
     ) -> ProviderResponse:
         model_to_use = model or self.default_model
         if not await self.is_available():
             return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason="API Key unconfigured")
 
+        # Text-only requests keep the exact original payload shape. Image input is an
+        # additive part; the caller supplies explicit data + MIME type, never a payload.
+        if image_data is None and image_mime_type is None:
+            parts = [{"text": prompt}]
+        else:
+            image_part, image_error = self._build_image_part(image_data, image_mime_type)
+            if image_error:
+                return ProviderResponse(provider_name=self.name, model_name=model_to_use, content="", is_refusal=True, refusal_reason=image_error)
+            parts = []
+            if prompt and prompt.strip():
+                parts.append({"text": prompt})
+            parts.append(image_part)
+
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
+            "contents": [{"parts": parts}],
             "safetySettings": self.SAFETY_SETTINGS
         }
         if system_instruction:
