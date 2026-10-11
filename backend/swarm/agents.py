@@ -20,12 +20,18 @@ doubles, so no API key / network / subprocess is required.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
+from urllib.parse import urlsplit
 
-from backend.agent_runtime import AgentRuntime, RealToolExecutor, session_manager
+from backend.agent_runtime import (
+    AgentRuntime, ExecResult, FlagStatus, FlagVerifier, ObservationEngine,
+    RealToolExecutor, session_manager,
+)
+from backend.agent_runtime.observation import scoped_endpoint
 from backend.swarm.evidence import Evidence, EvidenceType
 from backend.swarm.roles import AgentRole
 from backend.swarm.tasks import Task
@@ -39,6 +45,18 @@ _CAP_SERVICES = 15
 _CAP_DEADENDS = 10
 _CAP_FAILED = 10
 
+# ── Deterministic upload-confirmation retrieval bounds ──────────────────────────
+# A discovered upload path is followed up with ONE bounded GET, without the model
+# choosing it. These caps keep that follow-through cheap and scoped.
+_UPLOAD_FETCH_TIMEOUT_SECONDS = 15
+_UPLOAD_FETCH_MAX_PATHS = 5
+# Advisory response-size cap handed to the fetcher tool (curl --max-filesize).
+# NOTE: the execution layer itself (execution_service.run_argv → ProcessManager
+# ._monitor) has NO hard output-size limit — it reads the whole stdout into memory
+# before returning. This value is therefore a best-effort request to the tool, not
+# an enforced limit; the ObservationEngine truncates only what it KEEPS.
+_UPLOAD_FETCH_MAX_BYTES = 262144
+
 _FAIL_TOKENS = {
     "COMMAND_NOT_FOUND": "missing_dependency",
     "MISSING_TOOL": "missing_dependency",
@@ -47,6 +65,27 @@ _FAIL_TOKENS = {
     "PERMISSION": "permission",
     "TIMEOUT": "timeout",
 }
+
+
+def _on_challenge_origin(url: str, origin: str) -> bool:
+    """Re-validate that *url* is an http(s) URL on EXACTLY the configured *origin*.
+
+    Used immediately before an upload-path request is executed. Refuses a missing
+    origin, a non-http(s) scheme (``javascript:``/``data:``), a protocol-relative
+    or absolute off-origin URL, and any host that is not the challenge origin —
+    case-insensitively on scheme+host+port.
+    """
+    if not url or not origin:
+        return False
+    try:
+        base = origin if "://" in origin else "http://" + origin
+        u = urlsplit(url)
+        o = urlsplit(base)
+    except Exception:
+        return False
+    if u.scheme not in ("http", "https") or not u.netloc:
+        return False
+    return f"{u.scheme}://{u.netloc}".lower() == f"{o.scheme}://{o.netloc}".lower()
 
 
 @dataclass
@@ -79,11 +118,16 @@ class AgentResult:
 class SpecialistAgent:
     def __init__(self, role: AgentRole, *, runtime: Optional[AgentRuntime] = None,
                  runtime_factory: Optional[Callable[[AgentRole], AgentRuntime]] = None,
-                 workspace_root: Optional[str] = None):
+                 workspace_root: Optional[str] = None,
+                 fetcher: Optional[Callable[..., Any]] = None):
         self.role = role if isinstance(role, AgentRole) else AgentRole.from_value(role)
         self._runtime = runtime
         self._runtime_factory = runtime_factory
         self.workspace_root = workspace_root
+        # Fake-fetcher seam: ``fetcher(url, timeout_seconds) -> ExecResult`` (sync or
+        # async). Tests inject one so deterministic upload-path retrieval needs no
+        # network/subprocess; production leaves it None and uses run_argv (curl).
+        self._fetcher = fetcher
 
     # ------------------------------------------------------------------ #
 
@@ -153,8 +197,28 @@ class SpecialistAgent:
             logger.warning(f"[SpecialistAgent:{self.role.value}] runtime error: {e}")
             status, reason, verified_flag, flag_candidates = "FAILED", f"agent runtime error: {e}", None, []
 
-        # 4) Harvest newly-discovered knowledge as structured evidence.
+        # 3.5) Deterministically follow up any upload-confirmation path the agent
+        #      observed — WITHOUT relying on the model to choose the GET. Runs after
+        #      the model loop and before the harvest, so the fetched response flows
+        #      through the SAME observation + flag-verification pipeline and its new
+        #      discoveries are harvested this run. A failed fetch never crashes the
+        #      agent, and a flag already verified by the runtime is never overwritten.
         final = session_manager.get(sess.id) or sess
+        if not verified_flag:
+            try:
+                retrieved_flag = await self._retrieve_upload_paths(final)
+            except Exception as e:  # retrieval is best-effort, never load-bearing
+                logger.warning(f"[SpecialistAgent:{self.role.value}] upload retrieval error: {e}")
+                retrieved_flag = None
+            if retrieved_flag:
+                verified_flag = retrieved_flag
+                status = "COMPLETED"
+                reason = "Flag verified from a discovered upload path."
+                if retrieved_flag not in flag_candidates:
+                    flag_candidates.append(retrieved_flag)
+                final = session_manager.get(sess.id) or final
+
+        # 4) Harvest newly-discovered knowledge as structured evidence.
         evidence = self._harvest_evidence(final, task, seeded)
         failure_category = self._derive_failure_category(final) if status != "COMPLETED" else ""
 
@@ -240,6 +304,15 @@ class SpecialistAgent:
 
         for ep in _new(st.known_endpoints, "endpoints"):
             out.append(_ev(EvidenceType.ENDPOINT.value, ep, related_endpoint=ep, confidence=0.8))
+        # Upload-confirmation paths are the ONLY new_files entries promoted to endpoints:
+        # a response reported where an uploaded file landed on the target, so it is a
+        # follow-up request target. Ordinary local files a tool saved/downloaded stay
+        # files. The path is scoped to the challenge origin so it cannot point off-target.
+        for path in _new(getattr(st, "upload_paths", []) or [], "upload_paths"):
+            ep = scoped_endpoint(path, getattr(st, "target", "") or "")
+            if ep:
+                out.append(_ev(EvidenceType.ENDPOINT.value, ep, related_endpoint=ep,
+                               confidence=0.8, tags=["upload_confirmation"]))
         for tech in _new(st.technologies, "technologies"):
             out.append(_ev(EvidenceType.TECHNOLOGY.value, tech, related_technology=tech, confidence=0.85))
         for svc in _new(st.known_services, "services"):
@@ -254,6 +327,113 @@ class SpecialistAgent:
             out.append(_ev(EvidenceType.FLAG.value, cand, confidence=0.6,
                            tags=["candidate"]))
         return out
+
+    # ------------------------------------------------------------------ #
+    # Deterministic upload-confirmation retrieval
+    # ------------------------------------------------------------------ #
+
+    async def _retrieve_upload_paths(self, sess: Any) -> Optional[str]:
+        """Follow up server-side upload paths with a bounded, scoped GET.
+
+        Every path a successful response confirmed an upload landed at (tracked in
+        ``MissionState.upload_paths``, NOT the ordinary ``known_files``) is turned
+        into an http(s) URL on the configured challenge origin and fetched ONCE.
+        The response is pushed through the SAME :class:`ObservationEngine` and
+        :class:`FlagVerifier` the runtime uses, so a flag in it reaches the normal
+        verified-flag result path — and a path itself is never treated as a flag.
+
+        Returns a newly VERIFIED flag or ``None``. Each scoped URL is fetched at
+        most once, an existing verification is never overwritten, and any off-origin
+        / protocol-relative / invalid-scheme / missing-origin target is refused
+        before the fetcher is ever called. Redirects are not followed.
+        """
+        st = getattr(sess, "state", None)
+        if st is None:
+            return None
+        # A stronger, already-existing verification always wins.
+        if getattr(st, "verified_flag", None) or getattr(sess, "verified_flag", None):
+            return None
+        origin = (getattr(st, "target", "") or "").strip()
+        paths = list(getattr(st, "upload_paths", []) or [])
+        if not origin or not paths:
+            return None
+
+        engine = ObservationEngine()
+        verifier = FlagVerifier()
+        fetched: set = set()
+        newly_verified: Optional[str] = None
+
+        for path in paths[:_UPLOAD_FETCH_MAX_PATHS]:
+            url = scoped_endpoint(str(path), origin)
+            # Re-validate immediately before execution: only a plain http(s) URL on
+            # exactly the challenge origin is allowed. This refuses off-origin and
+            # protocol-relative targets, javascript:/data: schemes, and — because we
+            # never pass a follow-redirects flag — a redirect can never move us off
+            # the origin.
+            if not url or not _on_challenge_origin(url, origin):
+                continue
+            if url in fetched:
+                continue
+            fetched.add(url)
+
+            try:
+                result = await self._fetch_url(url, timeout_seconds=_UPLOAD_FETCH_TIMEOUT_SECONDS)
+            except Exception as e:  # a transport failure must not crash the agent
+                logger.warning(f"[SpecialistAgent:{self.role.value}] upload fetch failed for {url}: {e}")
+                continue
+            if not isinstance(result, ExecResult):
+                result = ExecResult.from_tool_result(result)
+
+            obs = engine.observe(result, st)
+            # Verification from REAL fetched output — the only path to VERIFIED.
+            if obs.flag_candidates:
+                verdict = verifier.assess_observation(
+                    obs, command=result.command, action_succeeded=result.succeeded,
+                    target_scope=getattr(st, "target", ""),
+                    expected_format=getattr(st, "flag_format", ""))
+                if verdict and verdict.status == FlagStatus.VERIFIED:
+                    newly_verified = verdict.candidate
+                    st.set_verified_flag(verdict.candidate)
+                    sess.verified_flag = verdict.candidate
+
+            # Apply the observation exactly once (state mutation dedups).
+            st.apply_observation(obs)
+            session_manager.save(sess)
+            if newly_verified:
+                break
+
+        return newly_verified
+
+    async def _fetch_url(self, url: str, *, timeout_seconds: int) -> ExecResult:
+        """Fetch *url* via the injected fake fetcher, or a bounded GET otherwise."""
+        if self._fetcher is not None:
+            result = self._fetcher(url, timeout_seconds)
+            if inspect.isawaitable(result):
+                result = await result
+            return result if isinstance(result, ExecResult) else ExecResult.from_tool_result(result)
+        return await self._default_http_get(url, timeout_seconds=timeout_seconds)
+
+    async def _default_http_get(self, url: str, *, timeout_seconds: int) -> ExecResult:
+        """Production GET: shell-free ``curl`` via ``ExecutionService.run_argv``.
+
+        ``-i`` captures response headers (so Location/Set-Cookie are observable),
+        ``--max-time`` bounds the request, ``--max-filesize`` asks curl to cap the
+        body, and ``--proto =http,https`` pins the scheme. Redirects are never
+        followed (no ``-L``). See ``_UPLOAD_FETCH_MAX_BYTES`` for the size-limit
+        limitation note.
+        """
+        from backend.execution.service import execution_service  # lazy — avoid import cycles
+        argv = [
+            "curl", "-sS", "-i",
+            "--max-time", str(int(timeout_seconds)),
+            "--max-filesize", str(_UPLOAD_FETCH_MAX_BYTES),
+            "--proto", "=http,https",
+            url,
+        ]
+        res = await execution_service.run_argv(
+            argv, timeout_seconds=int(timeout_seconds) + 5,
+            capability="http_get", tool_name="curl")
+        return ExecResult.from_tool_result(res)
 
     @staticmethod
     def _derive_failure_category(sess: Any) -> str:

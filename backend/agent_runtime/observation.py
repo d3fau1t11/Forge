@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin, urlsplit
 
 # Canonical flag patterns live in the verifier (single source of truth for the runtime).
 from backend.agent_runtime.verifier import FLAG_REGEX, FALSE_FLAG_PATTERNS
@@ -32,6 +33,15 @@ _NMAP_RE = re.compile(r"^(\d{1,5})/(tcp|udp)\s+open\s+(\S+)", re.IGNORECASE | re
 # explicit file-creation phrasing only (avoids hallucinating files from arbitrary text).
 _FILE_SAVED_RE = re.compile(
     r"(?:saved to|written to|downloaded to|output written to|saving to|-o)\s+['\"]?([A-Za-z0-9._/\\\-]+)",
+    re.IGNORECASE,
+)
+# Upload-confirmation responses only: a server reporting where an uploaded file landed,
+# e.g. "The file avatar.png has been uploaded Path: uploads/avatar.png". This is a
+# SERVER-side path on the target (a follow-up request target), NOT a local file the
+# tool saved/downloaded. The pattern is intentionally exact so ordinary "saved to …"
+# output is never mistaken for it.
+_UPLOAD_CONFIRMATION_RE = re.compile(
+    r"\bthe file\s+\S+\s+has been uploaded\s+path:\s*(?P<path>\S+)",
     re.IGNORECASE,
 )
 _CRED_RE = re.compile(r"(?:password|passwd|pwd|secret|api[_-]?key)\s*[:=]\s*['\"]?([^\s'\"]{3,80})", re.IGNORECASE)
@@ -71,6 +81,40 @@ _ERROR_HINTS = re.compile(
 _MAX_IMPORTANT = 1500
 
 
+def _clean_path(value: str) -> str:
+    """Strip surrounding quotes and trailing sentence punctuation from a captured path."""
+    return (value or "").strip().strip("\"'").rstrip(".,;:)]}\"'")
+
+
+def scoped_endpoint(path: str, origin: str) -> str:
+    """Resolve an upload-confirmation *path* against the configured challenge *origin*.
+
+    The confirmation tells us where an uploaded file landed on the target. Turning that
+    into a follow-up request must NOT let the target escape the challenge scope, so this
+    returns an absolute URL anchored to *origin* — or ``""`` when the path would leave it
+    (an absolute/off-origin URL, a protocol-relative ``//host``, or a ``javascript:`` /
+    ``data:`` scheme). With no configured origin only a relative path is returned; an
+    absolute URL is refused because its scope cannot be verified.
+    """
+    p = (path or "").strip()
+    if not p:
+        return ""
+    base = (origin or "").strip()
+    if not base:
+        # No configured origin: a relative path cannot escape anything on its own, but an
+        # absolute URL would point at a host we cannot vouch for.
+        return "" if re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:", p) else p
+    if "://" not in base:
+        base = "http://" + base
+    b = urlsplit(base)
+    base_origin = f"{b.scheme}://{b.netloc}"
+    resolved = urljoin(base_origin + "/", p)
+    r = urlsplit(resolved)
+    if f"{r.scheme}://{r.netloc}".lower() != base_origin.lower():
+        return ""
+    return resolved
+
+
 def _detect_technologies(text: str) -> List[str]:
     """Reuse the experience extractor's tech detector when present; else fall back."""
     try:
@@ -95,6 +139,10 @@ class Observation:
     new_services: List[str] = field(default_factory=list)
     new_technologies: List[str] = field(default_factory=list)
     new_files: List[str] = field(default_factory=list)
+    # Server-side paths a response confirmed an upload landed at ("... has been uploaded
+    # Path: ..."). These are endpoint candidates, unlike new_files which may just be local
+    # files a tool saved. Kept as a separate bucket so nothing has to guess.
+    upload_paths: List[str] = field(default_factory=list)
     new_credentials: List[str] = field(default_factory=list)
     new_vulnerabilities: List[str] = field(default_factory=list)
     new_headers: Dict[str, str] = field(default_factory=dict)
@@ -136,6 +184,15 @@ class ObservationEngine:
         for m in _FILE_SAVED_RE.findall(combined):
             obs.new_files.append(m)
 
+        # ── Upload confirmations (server-side path, NOT a local file) ──
+        # The path is stored in new_files (it IS a discovered file) but ALSO tagged in
+        # upload_paths so the swarm can treat only these as endpoint evidence.
+        for m in _UPLOAD_CONFIRMATION_RE.finditer(combined):
+            path = _clean_path(m.group("path"))
+            if path:
+                obs.upload_paths.append(path)
+                obs.new_files.append(path)
+
         # ── Credentials ──
         for m in _CRED_RE.findall(combined):
             obs.new_credentials.append(m)
@@ -169,7 +226,8 @@ class ObservationEngine:
 
         # De-dupe while preserving order.
         for name in ("new_endpoints", "new_services", "new_technologies", "new_files",
-                     "new_credentials", "new_vulnerabilities", "flag_candidates", "errors"):
+                     "upload_paths", "new_credentials", "new_vulnerabilities", "flag_candidates",
+                     "errors"):
             setattr(obs, name, list(dict.fromkeys(getattr(obs, name))))
 
         obs.important_output = self._important(stdout, stderr)

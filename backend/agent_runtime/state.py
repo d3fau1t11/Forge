@@ -45,6 +45,7 @@ class StateDelta:
     new_services: List[str] = field(default_factory=list)
     new_technologies: List[str] = field(default_factory=list)
     new_files: List[str] = field(default_factory=list)
+    new_upload_paths: List[str] = field(default_factory=list)
     new_credentials: List[str] = field(default_factory=list)
     new_vulnerabilities: List[str] = field(default_factory=list)
     new_flag_candidates: List[str] = field(default_factory=list)
@@ -57,7 +58,7 @@ class StateDelta:
         """True when nothing materially new was learned this turn (no-progress signal)."""
         return not any([
             self.new_endpoints, self.new_services, self.new_technologies,
-            self.new_files, self.new_credentials, self.new_vulnerabilities,
+            self.new_files, self.new_upload_paths, self.new_credentials, self.new_vulnerabilities,
             self.new_flag_candidates, self.phase_changed_to,
             self.objective_changed_to, self.verified_flag, self.notes,
         ])
@@ -90,6 +91,10 @@ class MissionState:
     # ── Discovered knowledge ────────────────────────────────────────────────
     known_endpoints: List[str] = field(default_factory=list)
     known_files: List[str] = field(default_factory=list)
+    # Server-side paths confirmed by an upload response ("... has been uploaded Path: ...").
+    # Distinct from known_files (which may be local tool output files) so only these become
+    # endpoint evidence for the swarm.
+    upload_paths: List[str] = field(default_factory=list)
     known_services: List[str] = field(default_factory=list)
     technologies: List[str] = field(default_factory=list)
     credentials: List[str] = field(default_factory=list)
@@ -138,6 +143,9 @@ class MissionState:
         for f in getattr(obs, "new_files", []) or []:
             if _add_unique(self.known_files, f):
                 delta.new_files.append(f)
+        for p in getattr(obs, "upload_paths", []) or []:
+            if _add_unique(self.upload_paths, p):
+                delta.new_upload_paths.append(p)
         for cred in getattr(obs, "new_credentials", []) or []:
             if _add_unique(self.credentials, cred):
                 delta.new_credentials.append(cred)
