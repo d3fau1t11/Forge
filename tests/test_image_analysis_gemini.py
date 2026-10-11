@@ -13,6 +13,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_forge.db"
@@ -394,6 +395,202 @@ class TestOrchestratorImageIntegration(unittest.TestCase):
             self.assertTrue(res.ok)
             self.assertIn(fp, board.analyzed_image_artifacts)
             self.assertGreaterEqual(len(board.image_analysis_evidence), 1)
+
+
+class TestWorkerCreatedImageRegistration(unittest.TestCase):
+    """A swarm worker that decodes/creates a local image during execution must have
+    it classified and sent through the EXISTING Gemini vision path.
+
+    The startup pass only ever sees the artifact acquired before the agents run; this
+    covers the mid-run files reported by a worker. All provider calls are mocked and
+    every file lives under a temporary challenge workspace — no live API, no subprocess.
+    """
+
+    def _board(self):
+        board = SwarmBlackboard("chal_worker_img", "run_worker_img", "http://challenge.ctf")
+        board.challenge_name = "Binary Digits"
+        board.category = "forensics"
+        board.description = "read the hidden digits"
+        return board
+
+    @staticmethod
+    def _tool_result(stdout=""):
+        # Shape of a ToolResult as seen by the deterministic observation engine.
+        return SimpleNamespace(stdout=stdout, stderr="", exit_code=0,
+                               failure_category=None, status="SUCCESS")
+
+    def _register(self, orch, board, workdir, stdout):
+        return _run(orch._register_worker_image_artifacts(
+            board, workdir, self._tool_result(stdout)))
+
+    @staticmethod
+    def _write(path, data):
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def test_newly_created_jpeg_is_classified_and_analyzed(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = self._write(os.path.join(workdir, "binary_digits.jpg"), _JPEG_BYTES)
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok(
+                "DESCRIPTION: the image shows binary digits 0110.\nLEAD: decode as binary"))
+            with patch("backend.agents.image_analysis.model_router.route_request", route):
+                self._register(SwarmOrchestrator(), board, workdir,
+                               f"Decoded the binary string, saved to {path}")
+
+            route.assert_awaited_once()
+            kwargs = route.call_args.kwargs
+            self.assertEqual(kwargs["image_mime_type"], "image/jpeg")   # real MIME, not "jpeg"
+            self.assertEqual(kwargs["image_data"], _JPEG_BYTES)         # bytes actually on disk
+            self.assertEqual(kwargs["target_model"], GEMINI_VISION_MODEL)
+            self.assertEqual(len(board.image_analysis_evidence), 1)
+            ev = board.image_analysis_evidence[0]
+            self.assertEqual(ev["mime_type"], "image/jpeg")
+            self.assertEqual(ev["leads"], ["decode as binary"])
+            self.assertIsNone(board.flag_captured)
+
+    def test_png_relative_path_uses_png_mime(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            self._write(os.path.join(workdir, "digits.png"),
+                        b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok("DESCRIPTION: digits."))
+            with patch("backend.agents.image_analysis.model_router.route_request", route):
+                self._register(SwarmOrchestrator(), board, workdir, "output written to digits.png")
+
+            route.assert_awaited_once()
+            self.assertEqual(route.call_args.kwargs["image_mime_type"], "image/png")
+            self.assertEqual(board.image_analysis_evidence[0]["mime_type"], "image/png")
+
+    def test_non_image_file_is_ignored(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = self._write(os.path.join(workdir, "prog"), b"\x7fELF" + b"\x00" * 64)
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok())
+            with patch("backend.agents.image_analysis.model_router.route_request", route):
+                self._register(SwarmOrchestrator(), board, workdir, f"built, saved to {path}")
+
+            route.assert_not_awaited()
+            self.assertEqual(board.image_analysis_evidence, [])
+
+    def test_file_outside_workspace_is_rejected(self):
+        with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as other:
+            outside = self._write(os.path.join(other, "outside_image.jpg"), _JPEG_BYTES)
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok())
+            with patch("backend.agents.image_analysis.model_router.route_request", route):
+                orch = SwarmOrchestrator()
+                self._register(orch, board, workdir, f"saved to {outside}")   # absolute, off-workspace
+                self._register(orch, board, workdir, "saved to ../escaped.png")  # relative escape
+
+            route.assert_not_awaited()
+            self.assertEqual(board.image_analysis_evidence, [])
+
+    def test_remote_url_is_rejected_as_a_local_path(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok())
+            with patch("backend.agents.image_analysis.model_router.route_request", route):
+                self._register(SwarmOrchestrator(), board, workdir,
+                               "downloaded to http://evil.example/x.jpg")
+
+            route.assert_not_awaited()
+            self.assertEqual(board.image_analysis_evidence, [])
+
+    def test_missing_image_is_skipped_safely(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok())
+            with patch("backend.agents.image_analysis.model_router.route_request", route):
+                self._register(SwarmOrchestrator(), board, workdir, "saved to missing_image.jpg")
+
+            route.assert_not_awaited()
+            self.assertEqual(board.image_analysis_evidence, [])
+
+    def test_inaccessible_image_fails_safely(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = self._write(os.path.join(workdir, "locked.jpg"), _JPEG_BYTES)
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok())
+            with patch("backend.agents.swarm_orchestrator.classify_local_file",
+                       side_effect=OSError("permission denied")), \
+                 patch("backend.agents.image_analysis.model_router.route_request", route):
+                self._register(SwarmOrchestrator(), board, workdir, f"saved to {path}")  # must not raise
+
+            route.assert_not_awaited()
+            self.assertEqual(board.image_analysis_evidence, [])
+
+    def test_oversized_image_is_skipped_without_provider_call(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = self._write(os.path.join(workdir, "huge.jpg"), _JPEG_BYTES)
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok())
+            with patch("backend.agents.image_analysis.MAX_IMAGE_FILE_BYTES", 8), \
+                 patch("backend.agents.image_analysis.model_router.route_request", route):
+                self._register(SwarmOrchestrator(), board, workdir, f"saved to {path}")
+
+            route.assert_not_awaited()
+            self.assertEqual(board.image_analysis_evidence, [])
+
+    def test_duplicate_observations_do_not_repeat_analysis(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = self._write(os.path.join(workdir, "digits.jpg"), _JPEG_BYTES)
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok())
+            with patch("backend.agents.image_analysis.model_router.route_request", route):
+                orch = SwarmOrchestrator()
+                for _ in range(3):                       # the same file reported each turn
+                    self._register(orch, board, workdir, f"saved to {path}")
+
+            self.assertEqual(route.await_count, 1)       # provider hit exactly once
+            self.assertEqual(len(board.image_analysis_evidence), 1)
+            self.assertEqual(len(board.analyzed_image_artifacts), 1)
+
+    def test_failed_analysis_remains_retryable(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = self._write(os.path.join(workdir, "digits.jpg"), _JPEG_BYTES)
+            board = self._board()
+            refusal = ProviderResponse(
+                provider_name="gemini", model_name=GEMINI_VISION_MODEL,
+                content="", is_refusal=True, refusal_reason="transient provider error")
+            route = AsyncMock(side_effect=[refusal, _gemini_ok("DESCRIPTION: digits 0110.")])
+            with patch("backend.agents.image_analysis.model_router.route_request", route):
+                orch = SwarmOrchestrator()
+                self._register(orch, board, workdir, f"saved to {path}")
+                # A failed attempt must NOT suppress the retry.
+                self.assertNotIn(image_fingerprint(path), board.analyzed_image_artifacts)
+                self._register(orch, board, workdir, f"saved to {path}")
+
+            self.assertEqual(route.await_count, 2)
+            self.assertEqual(len(board.image_analysis_evidence), 1)
+
+    def test_gemini_output_remains_unverified_evidence_not_a_solve(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            path = self._write(os.path.join(workdir, "digits.jpg"), _JPEG_BYTES)
+            board = self._board()
+            route = AsyncMock(return_value=_gemini_ok(
+                "DESCRIPTION: the image reads picoCTF{w0rker_flag}."))
+            with patch("backend.agents.image_analysis.model_router.route_request", route):
+                self._register(SwarmOrchestrator(), board, workdir, f"saved to {path}")
+
+            # Gemini's prose is an UNVERIFIED candidate — never a captured flag.
+            self.assertIn("picoCTF{w0rker_flag}", [c["flag"] for c in board.flag_candidates])
+            self.assertIsNone(board.flag_captured)
+            self.assertFalse(board.flag_event.is_set())
+
+    def test_resolve_workspace_path_rejects_urls_and_escapes(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            ok = self._write(os.path.join(workdir, "a.png"),
+                             b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+            self.assertEqual(SwarmOrchestrator._resolve_workspace_path("a.png", workdir),
+                             os.path.realpath(ok))
+            # Trailing sentence punctuation in tool output does not lose a real file.
+            self.assertEqual(SwarmOrchestrator._resolve_workspace_path("a.png.", workdir),
+                             os.path.realpath(ok))
+            self.assertIsNone(SwarmOrchestrator._resolve_workspace_path("http://evil/x.png", workdir))
+            self.assertIsNone(SwarmOrchestrator._resolve_workspace_path("file:///etc/passwd", workdir))
+            self.assertIsNone(SwarmOrchestrator._resolve_workspace_path("../escape.png", workdir))
 
 
 if __name__ == "__main__":

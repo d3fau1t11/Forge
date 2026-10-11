@@ -39,6 +39,7 @@ from backend.config import settings
 from backend.environment.detector import environment_detector
 from backend.agents.agent_prompt import AgentContext, build_agent_prompt, make_context_from_env
 from backend.agents.artifact_acquisition import acquire_artifacts
+from backend.agents.artifact_classifier import classify_local_file
 from backend.agents.image_analysis import analyze_image_artifact, image_fingerprint, is_image_artifact
 from backend.agents import checkpoint_pipeline
 from backend.agents.checkpoint_pipeline import AgentCheckpointRecord
@@ -169,6 +170,19 @@ def _decode_artifacts(text: str) -> List[Dict[str, str]]:
 _HEADER_HINT_RE = re.compile(
     r"header[\"'\s:]*[\"']?([A-Za-z0-9][A-Za-z0-9-]{0,63})\s*:\s*([^\"'\n\r]{1,120})",
     re.IGNORECASE
+)
+
+
+# The agent-runtime observation regex that identifies files a command created
+# deliberately excludes ':' (POSIX-only), so a Windows drive-absolute path like
+# "C:\...\out.png" is truncated to "C" and lost. Swarm workers also run on Windows,
+# so this complementary pattern recovers a drive-absolute path reported with the SAME
+# explicit creation phrasing. Every recovered path is still validated against the
+# challenge workspace before it is ever opened (see _resolve_workspace_path).
+_WORKER_SAVED_WINDOWS_PATH_RE = re.compile(
+    r"(?:saved to|written to|downloaded to|output written to|saving to|-o)\s+['\"]?"
+    r"([A-Za-z]:[\\/][^\s\"'<>|]+)",
+    re.IGNORECASE,
 )
 
 
@@ -1268,6 +1282,112 @@ class SwarmOrchestrator:
             memory_context=board.memory_context,
         )
 
+    async def _register_worker_image_artifacts(self, board: "SwarmBlackboard", workdir: str, result: Any) -> None:
+        """Classify local files a swarm worker just reported and hand supported
+        images to the EXISTING Gemini vision path.
+
+        This closes the gap where a worker decodes/creates an image mid-run: the
+        startup pass only ever sees the artifact acquired before the agents start
+        (``board.artifact_classification``). It reuses the deterministic observation
+        mechanism for new-file extraction, the existing classifier, and the existing
+        ``_analyze_image_artifact`` path — no new decoding, no provider/routing change.
+
+        Non-fatal by construction: a missing, inaccessible, unsupported or oversized
+        file is simply skipped. Fingerprint deduplication and retry-after-failure
+        behaviour are inherited unchanged from ``_analyze_image_artifact``.
+        """
+        for reported in self._extract_created_file_paths(result):
+            candidate = self._resolve_workspace_path(reported, workdir)
+            if not candidate:
+                continue
+            try:
+                clf = classify_local_file(candidate)
+            except Exception as classify_err:
+                logger.debug(f"[SwarmOrchestrator] Image classification skip for {candidate!r}: {classify_err}")
+                continue
+            if not getattr(clf, "is_binary", False):
+                continue
+            image_path = getattr(clf, "safe_file_path", None)
+            if not image_path or not is_image_artifact(getattr(clf, "artifact_type", ""), image_path):
+                continue
+            # Existing path: MIME detection, fingerprint dedup, retry-after-failure,
+            # evidence recording and the unverified-candidate flag safeguard all live there.
+            await self._analyze_image_artifact(board, classification=clf)
+
+    def _extract_created_file_paths(self, result: Any) -> List[str]:
+        """Paths a tool output explicitly reported creating, via the SAME
+        deterministic observation mechanism the agent runtime uses (no LLM).
+
+        Only explicit creation phrasing ("saved to …", "written to …", "-o …") is
+        recognised — arbitrary text is never treated as a file path."""
+        try:
+            from backend.agent_runtime.observation import ObservationEngine
+        except Exception:
+            return []
+        engine = getattr(self, "_observation_engine", None)
+        if engine is None:
+            try:
+                engine = ObservationEngine()
+            except Exception:
+                return []
+            self._observation_engine = engine
+        try:
+            observation = engine.observe(result)
+        except Exception:
+            return []
+        paths = list(getattr(observation, "new_files", []) or [])
+        # Recover Windows drive-absolute paths the shared regex truncates at ':'.
+        combined = f"{getattr(result, 'stdout', '') or ''}\n{getattr(result, 'stderr', '') or ''}"
+        for found in _WORKER_SAVED_WINDOWS_PATH_RE.findall(combined):
+            candidate = found.strip().strip("'\"")
+            if candidate and candidate not in paths:
+                paths.append(candidate)
+        return paths
+
+    @staticmethod
+    def _resolve_workspace_path(reported: str, workdir: str) -> Optional[str]:
+        """Resolve a tool-reported path to a real file STRICTLY inside *workdir*.
+
+        Refuses remote URLs / any non-file scheme, path escapes (``..``), symlink
+        escapes and anything outside the permitted challenge workspace, so a worker
+        report can never make FORGE read an arbitrary system file. Returns ``None``
+        when the path is unsafe, missing, or not a regular file.
+        """
+        raw = (reported or "").strip().strip("'\"")
+        if not raw or not workdir:
+            return None
+        # A remote URL (or any scheme, e.g. file:/data:/javascript:) is never a local
+        # path. A single-letter Windows drive ("C:\...") is deliberately NOT a scheme:
+        # the scheme branch requires at least two name characters before the colon.
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]+:", raw):
+            return None
+        try:
+            base = os.path.realpath(workdir)
+        except (OSError, ValueError):
+            return None
+        base_norm = os.path.normcase(base)
+
+        def _candidate(value: str) -> Optional[str]:
+            try:
+                path = value if os.path.isabs(value) else os.path.join(base, value)
+                path = os.path.realpath(path)
+            except (OSError, ValueError):
+                return None
+            path_norm = os.path.normcase(path)
+            if path_norm != base_norm and not path_norm.startswith(base_norm + os.sep):
+                return None
+            return path if os.path.isfile(path) else None
+
+        resolved = _candidate(raw)
+        if resolved:
+            return resolved
+        # Tool output often trails a path with sentence punctuation ("...saved to out.png."),
+        # so retry once with trailing punctuation trimmed before giving up.
+        trimmed = raw.rstrip(".,;:)]}")
+        if trimmed and trimmed != raw:
+            return _candidate(trimmed)
+        return None
+
     async def _analyze_image_artifact(self, board: "SwarmBlackboard", classification=None):
         """One-shot Gemini vision pass over a recovered image artifact.
 
@@ -1581,6 +1701,14 @@ class SwarmOrchestrator:
                             await self._apply_decoded_directives(c_clean, board, agent_id)
                 for ep in re.findall(r'href=["\'](/[^"\']+)["\']', output):
                     board.discovered_endpoints.add(ep)
+
+                # Register any image this command created/decoded with the existing
+                # Gemini vision workflow (evidence-only). Non-fatal: a missing,
+                # inaccessible, unsupported or oversized file is simply skipped.
+                try:
+                    await self._register_worker_image_artifacts(board, workdir, res)
+                except Exception as img_err:
+                    logger.debug(f"[{agent_id}] Image artifact registration skip: {img_err}")
 
                 consecutive_errors = 0
                 await board._broadcast_blackboard()

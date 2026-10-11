@@ -68,6 +68,13 @@ _EXTENSION_TO_MIME: Dict[str, str] = {
 # it (and so an unsupported type is refused before any HTTP request).
 _SUPPORTED_MIME = frozenset(GeminiProvider.SUPPORTED_IMAGE_MIME_TYPES)
 
+# Hard ceiling on the RAW image bytes read from disk. The provider enforces its
+# limit on the *encoded* inline_data payload (base64 = 4 chars per 3 raw bytes), so
+# capping the raw file at 3/4 of the provider budget guarantees the encoded payload
+# can never exceed it — and an oversized file is refused BEFORE its bytes are read
+# into memory. Derived from the provider constant so the two can never drift apart.
+MAX_IMAGE_FILE_BYTES = (GeminiProvider.MAX_IMAGE_BYTES * 3) // 4
+
 # Explicit Gemini selection via the router's existing MODEL_PROVIDER_MAP entry.
 # Kept as a named constant so the integration point is obvious and testable.
 GEMINI_VISION_MODEL = "gemini-3.6-flash"
@@ -211,6 +218,20 @@ async def analyze_image_artifact(
         return ImageAnalysisResult(
             status="FAILED", image_path=image_path, mime_type=mime_type,
             reason=f"Image file not found: {image_path}")
+
+    # Size gate BEFORE reading: never pull an unbounded file into memory when the
+    # provider (or our own payload budget) would reject it anyway.
+    try:
+        size_bytes = os.path.getsize(image_path)
+    except OSError as exc:
+        return ImageAnalysisResult(
+            status="FAILED", image_path=image_path, mime_type=mime_type,
+            reason=f"Could not stat image file: {exc}")
+    if size_bytes > MAX_IMAGE_FILE_BYTES:
+        return ImageAnalysisResult(
+            status="SKIPPED", image_path=image_path, mime_type=mime_type,
+            reason=(f"Image is too large to analyse ({size_bytes:,} bytes > "
+                    f"{MAX_IMAGE_FILE_BYTES:,} byte limit)"))
 
     try:
         with open(image_path, "rb") as fh:
