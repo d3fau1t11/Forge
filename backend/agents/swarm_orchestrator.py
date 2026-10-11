@@ -39,6 +39,7 @@ from backend.config import settings
 from backend.environment.detector import environment_detector
 from backend.agents.agent_prompt import AgentContext, build_agent_prompt, make_context_from_env
 from backend.agents.artifact_acquisition import acquire_artifacts
+from backend.agents.image_analysis import analyze_image_artifact, image_fingerprint, is_image_artifact
 from backend.agents import checkpoint_pipeline
 from backend.agents.checkpoint_pipeline import AgentCheckpointRecord
 
@@ -272,6 +273,17 @@ class SwarmBlackboard:
         self.artifact_classification = None            # ClassificationResult | None
         self.env_info: Dict[str, Any] = {}
 
+        # ── Gemini visual analysis of image artifacts (focused integration) ─────
+        # Ordinary analysis evidence (never a flag). `analyzed_image_artifacts` holds
+        # fingerprints of SUCCESSFULLY analyzed images — only a confirmed OK result is
+        # added, and the set survives a resume via the mission_plan snapshot.
+        # `image_analysis_inflight` holds fingerprints currently being analyzed so a
+        # concurrent caller cannot duplicate the same provider request; it is transient
+        # and deliberately never persisted (a failure stays retryable).
+        self.image_analysis_evidence: List[Dict[str, Any]] = []
+        self.analyzed_image_artifacts: Set[str] = set()
+        self.image_analysis_inflight: Set[str] = set()
+
         # ── Per-agent live state (arbitrary N agents, not fixed roles) ──────────
         self.agent_ids: List[str] = []
         self.agent_transcripts: Dict[str, List[str]] = {}   # agent_id -> transcript lines
@@ -488,6 +500,7 @@ class SwarmBlackboard:
                 "executed_commands": list(self.executed_commands_dedup),
                 "flag_candidates": list(self.flag_candidates),
                 "candidate_usernames": list(self.candidate_usernames),
+                "image_analysis_evidence": list(self.image_analysis_evidence[-5:]),
                 "agent_directives": dict(self.agent_directives),
                 # Full per-agent reasoning history so a resumed run continues each agent's
                 # thread instead of restarting recon from scratch (#4). Capped to keep the
@@ -546,6 +559,14 @@ class SwarmBlackboard:
         for u in (snapshot.get("candidate_usernames") or []):
             if u:
                 self.candidate_usernames.add(u)
+        # Restore prior Gemini visual analysis so a resumed run does not re-send the
+        # same image (fingerprint set is rebuilt from the persisted evidence).
+        for ev in (snapshot.get("image_analysis_evidence") or []):
+            if ev and ev not in self.image_analysis_evidence:
+                self.image_analysis_evidence.append(ev)
+                fp = ev.get("fingerprint")
+                if fp:
+                    self.analyzed_image_artifacts.add(fp)
         for aid, directive in (snapshot.get("agent_directives") or {}).items():
             if directive:
                 self.agent_directives[aid] = directive
@@ -712,6 +733,18 @@ class SwarmBlackboard:
             lines.append("Candidate usernames discovered (try these before generic 'admin'): " + ", ".join(sorted(self.candidate_usernames)))
         if self.candidate_tokens:
             lines.append("Candidate tokens: " + ", ".join(list(self.candidate_tokens)[:6]))
+        if self.image_analysis_evidence:
+            # Visual analysis is EVIDENCE, not a flag. It is surfaced to agents so they
+            # can act on the description/leads, but any flag-like text in it still has to
+            # be reproduced from real tool output before it can be accepted.
+            lines.append("Gemini visual analysis of recovered image artifact(s) "
+                         "(EVIDENCE ONLY — not a verified flag):")
+            for ev in self.image_analysis_evidence[-2:]:
+                desc = (ev.get("description") or "").strip().replace("\n", " ")
+                lines.append(f"  [{ev.get('artifact_type', 'image')}] {desc[:600]}")
+                leads = ev.get("leads") or []
+                if leads:
+                    lines.append("  suggested leads: " + "; ".join(str(l)[:120] for l in leads[:5]))
         if self.last_target_rejection:
             lines.append(f"Last target rejection signal: {self.last_target_rejection} — reconcile this with the evidence above (e.g. a 'user not found' means try a discovered username).")
         if self.flag_candidates:
@@ -962,6 +995,16 @@ class SwarmOrchestrator:
                         f"@ {manifest.primary.safe_file_path or '(header-only)'}")
             except Exception as art_err:
                 logger.warning(f"[SwarmOrchestrator] Artifact acquisition failed (non-fatal): {art_err}")
+
+            # ── Focused image-artifact visual analysis (Gemini) — one-shot, non-fatal ──
+            # If the acquired artifact is an image, hand it to the configured Gemini
+            # provider through the existing router BEFORE agents start, so the shared
+            # context carries its description/leads. Any failure is recorded and the
+            # local OCR / deterministic paths continue untouched.
+            try:
+                await self._analyze_image_artifact(board)
+            except Exception as vis_err:
+                logger.warning(f"[SwarmOrchestrator] Gemini image analysis failed (non-fatal): {vis_err}")
 
             # ── Memory retrieval phase (§6) — ONE shared retrieval before agents ──
             # OBSERVE → RETRIEVE MEMORY: use the seeded recon + challenge context to
@@ -1224,6 +1267,105 @@ class SwarmOrchestrator:
             injected_directive=board.agent_directives.get(agent_id, ""),
             memory_context=board.memory_context,
         )
+
+    async def _analyze_image_artifact(self, board: "SwarmBlackboard", classification=None):
+        """One-shot Gemini vision pass over a recovered image artifact.
+
+        Runs through the EXISTING router with an explicit Gemini target (never the
+        generic capability chain). The description + leads are recorded as ordinary
+        analysis evidence — NOT a flag. Any flag-like string in Gemini's prose becomes
+        an *unverified* candidate (source ``llm_reported``), never auto-captured and
+        never a reason to mark the challenge solved. A Gemini failure is recorded and
+        the existing local OCR / deterministic artifact paths are left untouched.
+
+        De-duplicated by image fingerprint so the same artifact is never re-sent on
+        every agent iteration. Returns the result (or ``None`` when nothing applies).
+        """
+        clf = classification or board.artifact_classification
+        if clf is None:
+            return None
+        artifact_type = getattr(clf, "artifact_type", "") or ""
+        image_path = getattr(clf, "safe_file_path", None)
+        if not is_image_artifact(artifact_type, image_path):
+            return None
+
+        fingerprint = image_fingerprint(image_path)
+        if (not fingerprint
+                or fingerprint in board.analyzed_image_artifacts
+                or fingerprint in board.image_analysis_inflight):
+            return None
+        # Claim the fingerprint BEFORE awaiting so concurrent callers cannot duplicate it.
+        # The claim is released in `finally`: a failed or raised analysis therefore stays
+        # retryable, and only a confirmed OK is added to the successful-analysis set below.
+        board.image_analysis_inflight.add(fingerprint)
+        try:
+            result = await analyze_image_artifact(
+                image_path=image_path,
+                artifact_type=artifact_type,
+                challenge_name=board.challenge_name,
+                category=board.category,
+                description=board.description,
+                target=board.target_scope,
+            )
+        finally:
+            board.image_analysis_inflight.discard(fingerprint)
+
+        if not result.ok:
+            board.record_agent_step("gemini_vision", note=(
+                f"Gemini image analysis {result.status} for {artifact_type} artifact: {result.reason}"))
+            _append_to_challenge_log(board.challenge_id, "gemini_vision",
+                                     f"Image analysis {result.status}: {result.reason}")
+            logger.info(f"[SwarmOrchestrator] Gemini image analysis {result.status}: {result.reason}")
+            return result
+
+        evidence = {
+            "image_path": result.image_path,
+            "artifact_type": artifact_type,
+            "mime_type": result.mime_type,
+            "fingerprint": fingerprint,
+            "description": result.description,
+            "leads": list(result.leads),
+            "provider": result.provider,
+            "model": result.model,
+        }
+        board.image_analysis_evidence.append(evidence)
+        board.record_agent_step("gemini_vision", note=(
+            f"Gemini visual analysis ({artifact_type}): {result.description[:400]}"))
+        _append_to_challenge_log(board.challenge_id, "gemini_vision", (
+            f"🧠 Gemini vision ({artifact_type}, {result.mime_type}) via {result.model}: "
+            f"{result.description[:300]}"))
+        logger.info(f"[SwarmOrchestrator] Gemini image analysis recorded as evidence for "
+                    f"'{board.challenge_id}' ({artifact_type})")
+
+        # Confirmed OK — the only path that suppresses future analysis of this image.
+        # Deliberately AFTER the evidence recording above: a failure while recording must
+        # never leave a fingerprint marked successful with no corresponding evidence. All
+        # recording is synchronous, so the post-`finally` window stays atomic here and a
+        # concurrent caller cannot slip in before this mark.
+        board.analyzed_image_artifacts.add(fingerprint)
+
+        try:
+            await ws_manager.broadcast({
+                "event": "EVIDENCE_CAPTURED",
+                "challenge_id": board.challenge_id,
+                "run_id": board.run_id,
+                "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
+                "type": "image_analysis",
+                "source": "gemini_vision",
+                "description": result.description[:1000],
+            })
+        except Exception:
+            pass
+
+        # Flag-like text in Gemini's description is LLM prose, not tool output — record
+        # it as an UNVERIFIED candidate. record_flag_candidate only auto-promotes source
+        # "tool_output", so this can never mark the challenge solved on its own.
+        for candidate in FLAG_REGEX.findall(result.description):
+            candidate = candidate.strip()
+            if candidate and not FALSE_FLAG_PATTERNS.search(candidate):
+                await board.record_flag_candidate(candidate, "gemini_vision", "llm_reported")
+
+        return result
 
     async def _agent_worker(self, agent_id: str, board: "SwarmBlackboard", workdir: str, capability: str):
         """One general-purpose, full-context agent running a budget-bounded ReAct
