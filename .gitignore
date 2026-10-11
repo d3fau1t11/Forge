@@ -50,6 +50,15 @@ hacktricks/
 .env
 .env.local
 
+# Report / audit markdown: one-off analysis artifacts, never committed.
+# Rule: any *report*.md or *audit*.md is ignored (both letter cases). This covers
+# e.g. ROOT_CAUSE_REPORT.md, SUMMARY_REPORT.md and GEMINI_VISION_AUDIT.md while
+# leaving README.md and forge_documentation.md tracked.
+*AUDIT*.md
+*audit*.md
+*REPORT*.md
+*report*.md
+
 # Design Reference Assets
 Design/
 
