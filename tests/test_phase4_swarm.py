@@ -424,9 +424,10 @@ class TestCoordinator(SwarmTestBase):
         coord = self._coord(category="web")
         makers = {
             "recon": lambda: scripted_runtime(
-                ["cat flag.txt"],
-                by_substring={"cat": ExecResult(command="cat flag.txt", status="SUCCESS", exit_code=0,
-                                                stdout="picoCTF{sw4rm_v3rified}")}),
+                ["curl -s http://target.ctf:8080/flag"],
+                by_substring={"curl": ExecResult(command="curl -s http://target.ctf:8080/flag",
+                                                 status="SUCCESS", exit_code=0,
+                                                 stdout="picoCTF{sw4rm_v3rified}")}),
             "*": lambda: scripted_runtime(["BUDGET_EXHAUSTED: noop"]),
         }
         coord.agent_factory = factory_from(makers)
@@ -448,8 +449,11 @@ class TestCoordinator(SwarmTestBase):
 
     async def test_23_central_verification_from_tool_output(self):
         coord = self._coord()
+        # Provenance matters: the candidate must come from a command that genuinely
+        # reaches the target, not merely a flag-shaped value in local output.
         ok = coord.submit_flag_candidate("picoCTF{from_tool}", source="tool_output",
-                                         command="cat flag", action_succeeded=True, agent_id="web")
+                                         command="curl -s http://target.ctf:8080/flag",
+                                         action_succeeded=True, agent_id="web")
         self.assertTrue(ok)
         self.assertEqual(coord.mission.verified_flag, "picoCTF{from_tool}")
 
@@ -522,9 +526,10 @@ class TestCoordinatorRecovery(SwarmTestBase):
                                                      exit_code=7, stderr="Connection refused",
                                                      execution_failure=True, failure_category="NETWORK")})
             return scripted_runtime(
-                ["cat /flag"],
-                by_substring={"cat": ExecResult(command="cat /flag", status="SUCCESS", exit_code=0,
-                                                stdout="picoCTF{retry_worked}")})
+                ["curl -s http://target.ctf:8080/flag"],
+                by_substring={"curl": ExecResult(command="curl -s http://target.ctf:8080/flag",
+                                                 status="SUCCESS", exit_code=0,
+                                                 stdout="picoCTF{retry_worked}")})
         coord.agent_factory = factory_from({"recon": recon_maker, "*": recon_maker})
         res = await coord.run()
         self.assertEqual(res.verified_flag, "picoCTF{retry_worked}")
@@ -573,9 +578,10 @@ class TestObservabilityAndResume(SwarmTestBase):
         b = self._coord(mission_id=mid, category="web")
         b.agent_factory = factory_from({
             "web": lambda: scripted_runtime(
-                ["cat /flag"],
-                by_substring={"cat": ExecResult(command="cat /flag", status="SUCCESS", exit_code=0,
-                                                stdout="picoCTF{resumed_ok}")}),
+                ["curl -s http://target.ctf:8080/flag"],
+                by_substring={"curl": ExecResult(command="curl -s http://target.ctf:8080/flag",
+                                                 status="SUCCESS", exit_code=0,
+                                                 stdout="picoCTF{resumed_ok}")}),
             "*": lambda: scripted_runtime(["BUDGET_EXHAUSTED: x"]),
         })
         res = await b.run(resume=True)
@@ -588,9 +594,10 @@ class TestObservabilityAndResume(SwarmTestBase):
             coord = self._coord(category="web")
             coord.agent_factory = factory_from({
                 "recon": lambda: scripted_runtime(
-                    ["cat flag.txt"],
-                    by_substring={"cat": ExecResult(command="cat flag.txt", status="SUCCESS", exit_code=0,
-                                                    stdout="picoCTF{ws_events}")}),
+                    ["curl -s http://target.ctf:8080/flag"],
+                    by_substring={"curl": ExecResult(command="curl -s http://target.ctf:8080/flag",
+                                                     status="SUCCESS", exit_code=0,
+                                                     stdout="picoCTF{ws_events}")}),
                 "*": lambda: scripted_runtime(["BUDGET_EXHAUSTED: x"]),
             })
             await coord.run()
@@ -604,9 +611,10 @@ class TestObservabilityAndResume(SwarmTestBase):
         coord = self._coord(category="web")
         coord.agent_factory = factory_from({
             "recon": lambda: scripted_runtime(
-                ["cat flag.txt"],
-                by_substring={"cat": ExecResult(command="cat flag.txt", status="SUCCESS", exit_code=0,
-                                                stdout="picoCTF{traj}")}),
+                ["curl -s http://target.ctf:8080/flag"],
+                by_substring={"curl": ExecResult(command="curl -s http://target.ctf:8080/flag",
+                                                 status="SUCCESS", exit_code=0,
+                                                 stdout="picoCTF{traj}")}),
             "*": lambda: scripted_runtime(["BUDGET_EXHAUSTED: x"]),
         })
         await coord.run()
@@ -621,9 +629,10 @@ class TestObservabilityAndResume(SwarmTestBase):
         coord = self._coord(category="web")
         coord.agent_factory = factory_from({
             "recon": lambda: scripted_runtime(
-                ["cat flag.txt"],
-                by_substring={"cat": ExecResult(command="cat flag.txt", status="SUCCESS", exit_code=0,
-                                                stdout="picoCTF{persisted}")}),
+                ["curl -s http://target.ctf:8080/flag"],
+                by_substring={"curl": ExecResult(command="curl -s http://target.ctf:8080/flag",
+                                                 status="SUCCESS", exit_code=0,
+                                                 stdout="picoCTF{persisted}")}),
             "*": lambda: scripted_runtime(["BUDGET_EXHAUSTED: x"]),
         })
         await coord.run()

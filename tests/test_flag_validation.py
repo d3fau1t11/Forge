@@ -32,6 +32,16 @@ class TestFlagBraceGuard(unittest.TestCase):
             self.assertEqual(m.group(0), real)
             self.assertFalse(FALSE_FLAG_PATTERNS.search(real), real)
 
+    def test_strict_regex_known_prefixes_only_no_catch_all(self):
+        """The strict regex matches known CTF prefixes only — no generic {..}
+        catch-all — so CSS/JSON/LaTeX/Jinja shapes and short bodies never match."""
+        self.assertIsNone(FLAG_REGEX.search("color: #FFF{1;}"))
+        self.assertIsNone(FLAG_REGEX.search("{\"flag\": \"anything\"}"))
+        self.assertIsNone(FLAG_REGEX.search("{{ template }}"))
+        self.assertIsNone(FLAG_REGEX.search("FLAG{ab}"))  # body shorter than 4 chars
+        for real in ("FLAG{abcd}", "HTB{xyz_99}", "CTF{d4t4_3xtr4ct3d}"):
+            self.assertIsNotNone(FLAG_REGEX.search(real), real)
+
 
 if __name__ == "__main__":
     unittest.main()

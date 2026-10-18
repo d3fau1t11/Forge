@@ -277,10 +277,10 @@ class TestProviderIndependence(RuntimeTestBase):
 
     async def test_10_provider_failure_recovery(self):
         # First call fails (provider refusal), second succeeds — session must survive.
-        provider = ScriptedProvider([None, "cat flag.txt", "BUDGET_EXHAUSTED: x"])
+        provider = ScriptedProvider([None, "curl -s http://target.ctf:8080/flag", "BUDGET_EXHAUSTED: x"])
         executor = ScriptedToolExecutor(by_substring={
-            "cat": ExecResult(command="cat flag.txt", status="SUCCESS", exit_code=0,
-                              stdout="here it is: picoCTF{prov1der_f4ilover_ok}"),
+            "curl": ExecResult(command="curl -s http://target.ctf:8080/flag", status="SUCCESS", exit_code=0,
+                               stdout="here it is: picoCTF{prov1der_f4ilover_ok}"),
         })
         sess = self._make_session()
         result = await self._runtime(provider, executor).run(sess, max_turns=6)
@@ -307,10 +307,10 @@ class TestProviderIndependence(RuntimeTestBase):
 
         # Fresh process + a DIFFERENT provider continues the same mission.
         resumed = SessionManager().resume(sess.id)
-        provider_b = ScriptedProvider(["cat /flag", "BUDGET_EXHAUSTED: x"], provider_name="prov-B")
+        provider_b = ScriptedProvider(["curl -s http://target.ctf:8080/flag", "BUDGET_EXHAUSTED: x"], provider_name="prov-B")
         exec_b = ScriptedToolExecutor(by_substring={
-            "cat": ExecResult(command="cat /flag", status="SUCCESS", exit_code=0,
-                              stdout="FLAG{cross_provider_continuity}".replace("FLAG", "flag")),
+            "curl": ExecResult(command="curl -s http://target.ctf:8080/flag", status="SUCCESS", exit_code=0,
+                               stdout="FLAG{cross_provider_continuity}".replace("FLAG", "flag")),
         })
         result = await self._runtime(provider_b, exec_b).run(resumed, max_turns=6)
 
@@ -349,10 +349,10 @@ class TestFlagLifecycle(RuntimeTestBase):
         self.assertFalse(any(e.event_type == "FLAG_VERIFIED" for e in events))
 
     async def test_12_flag_verified_from_tool_output(self):
-        provider = ScriptedProvider(["cat flag.txt"])
+        provider = ScriptedProvider(["curl -s http://target.ctf:8080/flag"])
         executor = ScriptedToolExecutor(by_substring={
-            "cat": ExecResult(command="cat flag.txt", status="SUCCESS", exit_code=0,
-                              stdout="picoCTF{v3rified_from_0utput}"),
+            "curl": ExecResult(command="curl -s http://target.ctf:8080/flag", status="SUCCESS", exit_code=0,
+                               stdout="picoCTF{v3rified_from_0utput}"),
         })
         sess = self._make_session()
         result = await self._runtime(provider, executor).run(sess, max_turns=4)
@@ -473,10 +473,10 @@ class TestCrashResumeAcceptance(RuntimeTestBase):
         for ep in endpoints_at_crash:
             self.assertIn(ep, resumed.state.known_endpoints)
 
-        provider_2 = ScriptedProvider(["cat /flag.txt"])
+        provider_2 = ScriptedProvider(["curl -s http://target.ctf:8080/flag"])
         exec2 = ScriptedToolExecutor(by_substring={
-            "cat": ExecResult(command="cat /flag.txt", status="SUCCESS", exit_code=0,
-                              stdout="picoCTF{resumed_from_turn_8}"),
+            "curl": ExecResult(command="curl -s http://target.ctf:8080/flag", status="SUCCESS", exit_code=0,
+                               stdout="picoCTF{resumed_from_turn_8}"),
         })
         result = await self._runtime(provider_2, exec2).run(resumed, max_turns=6)
 
@@ -486,7 +486,7 @@ class TestCrashResumeAcceptance(RuntimeTestBase):
         max_seq = max(e.sequence for e in events)
         self.assertGreater(max_seq, seq_at_crash)
         # The post-resume events are strictly after the crash sequence.
-        post = [e for e in events if e.command and "cat /flag.txt" in e.command]
+        post = [e for e in events if e.command and "http://target.ctf:8080/flag" in e.command]
         self.assertTrue(post and all(e.sequence > seq_at_crash for e in post))
 
 

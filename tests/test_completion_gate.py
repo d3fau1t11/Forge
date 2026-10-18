@@ -75,7 +75,6 @@ class TestDualGatedCompletion(unittest.TestCase):
 
     def test_exit_code_0_no_flag_should_not_complete(self):
         """Exit code 0 without a flag match should NOT result in COMPLETED status."""
-        # Simulate the logic from cli_agent_runner.py
         captured_flag = None
         returncode = 0
 
@@ -90,6 +89,7 @@ class TestDualGatedCompletion(unittest.TestCase):
             progress = 30
 
         self.assertEqual(status, "AWAITING_FLAG", "Exit 0 without flag must be AWAITING_FLAG, never COMPLETED")
+
         self.assertEqual(progress, 80)
 
     def test_exit_code_0_with_flag_should_complete(self):
