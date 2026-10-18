@@ -483,29 +483,6 @@ def get_checkpoint(challenge_id: str, db: Session = Depends(get_db)):
     }
 
 
-class CheckpointRespondRequest(BaseModel):
-    text: str = ""
-
-
-@router.post("/challenges/{challenge_id}/checkpoint/respond")
-async def respond_checkpoint(challenge_id: str, req: CheckpointRespondRequest, db: Session = Depends(get_db)):
-    """Deliver the operator's pasted external-model response to a waiting swarm. The
-    orchestrator parses '--- suggestion: {agent} ---' blocks, routes each directive by
-    its own label, and resumes. Any flag still passes the normal validation gate."""
-    from backend.agents.swarm_orchestrator import swarm_orchestrator
-    result = await swarm_orchestrator.submit_checkpoint_response(challenge_id, req.text or "")
-    if not result.get("accepted"):
-        raise HTTPException(status_code=409, detail=result.get("reason", "No active checkpoint is awaiting a response."))
-    await ws_manager.broadcast({
-        "event": "CHECKPOINT_RESPONSE_ACCEPTED",
-        "challenge_id": challenge_id,
-        "parsed": result.get("parsed"),
-        "routed": result.get("routed", []),
-        "fallback": result.get("fallback"),
-    })
-    return result
-
-
 # NOTE: The guarded DELETE /challenges and DELETE /challenges/{challenge_id}
 # endpoints are defined earlier in this file (see delete_challenge /
 # delete_all_challenges near the top). Duplicate unguarded definitions that
@@ -538,6 +515,53 @@ async def resume_challenge(challenge_id: str, db: Session = Depends(get_db)):
     db.commit()
     await ws_manager.broadcast({"event": "CHALLENGE_RESUMED", "challenge_id": challenge_id})
     return {"status": "RUNNING", "id": challenge_id}
+
+
+@router.post("/challenges/{challenge_id}/continue")
+async def continue_challenge(challenge_id: str, db: Session = Depends(get_db)):
+    """Continue a paused run from its persisted snapshot.
+
+    Re-dispatches the flexible-agent swarm with resume=True so run_swarm rehydrates
+    the mission_plan blackboard_state (endpoints, headers, cookies, secrets, executed
+    commands, flag candidates, agent transcripts/directives, ...) and the agents pick
+    back up with full context of what they already tried — not a fresh start.
+    Only valid when the challenge is in PAUSED state (e.g. after the 45-minute
+    ceiling or instance expiry paused it)."""
+    challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    if challenge.status != "PAUSED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Challenge is not paused (status={challenge.status}); nothing to continue",
+        )
+
+    target = db.query(TargetProfileModel).filter(TargetProfileModel.challenge_id == challenge_id).first()
+    target_addr = target.current_address if target else "127.0.0.1"
+
+    run = RunModel(
+        challenge_id=challenge_id,
+        status="RUNNING",
+        current_phase="recon",
+        current_agent="orchestrator",
+    )
+    db.add(run)
+    challenge.status = "RUNNING"
+    db.commit()
+    db.refresh(run)
+
+    # resume=True → run_swarm rehydrates the persisted blackboard snapshot.
+    workflow_runner.start_run(run.id, challenge_id, target_addr, engine_type="swarm", resume=True)
+
+    await ws_manager.broadcast({
+        "event": "RUN_STARTED",
+        "run_id": run.id,
+        "challenge_id": challenge_id,
+        "target": target_addr,
+        "engine": "swarm",
+        "resume": True,
+    })
+    return {"status": "RUNNING", "id": run.id, "challenge_id": challenge_id, "resumed": True}
 
 @router.post("/challenges/{challenge_id}/report")
 async def generate_report(challenge_id: str, db: Session = Depends(get_db)):

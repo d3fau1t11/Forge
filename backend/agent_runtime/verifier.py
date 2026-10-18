@@ -70,14 +70,13 @@ FALSE_FLAG_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# Semantic-path (judge_relevance) matches return a fixed 0.75 confidence. They are
-# only auto-completed to VERIFIED when that confidence clears this threshold;
-# otherwise they surface as CANDIDATE held for operator review. With the default
-# of 0.85, a 0.75 semantic-path match does NOT auto-complete — a correct
-# semantic-path answer waits for the next checkpoint cycle instead of ending the
-# mission immediately. (CHECKPOINT_INTERVAL_SECONDS and checkpoint logic are
-# intentionally not adjusted to compensate.)
-SEMANTIC_VERIFY_AUTO_COMPLETE_THRESHOLD = 0.85
+# Semantic-path (judge_relevance / extract_candidate_blind) matches return a fixed
+# 0.75 confidence. The verbatim-substring double-check inside judge_relevance (and the
+# echo / agent-source / provenance / action-success gates in assess()) already IS the
+# authenticity test, so a semantic-path confirmation promotes directly to VERIFIED —
+# there is no confidence-tier auto-complete threshold and no operator-review hold.
+# (Checkpoint logic and CHECKPOINT_INTERVAL_SECONDS are gone; this comment only
+# documents why no threshold constant remains.)
 
 
 class FlagStatus(str, Enum):
@@ -623,18 +622,13 @@ class FlagVerifier:
             # and an LLM callable alongside a trusted origin.
             verdict = judge_relevance(candidate, raw_trusted_output, answer_spec, llm_call)
             if verdict.is_answer:
-                # Confidence-gated auto-complete: a semantic-path match clears the
-                # threshold only when 0.75 >= SEMANTIC_VERIFY_AUTO_COMPLETE_THRESHOLD.
-                # With the default 0.85 it does not, so the match is held as a
-                # CANDIDATE for operator review instead of silently ending the mission.
-                if 0.75 >= SEMANTIC_VERIFY_AUTO_COMPLETE_THRESHOLD:
-                    return FlagVerdict(FlagStatus.VERIFIED, 0.75, verdict.extracted_value,
-                                       [verdict.justification])
-                return FlagVerdict(
-                    FlagStatus.CANDIDATE, 0.75, verdict.extracted_value,
-                    [verdict.justification,
-                     "semantic match below auto-complete threshold — held for operator review"],
-                )
+                # The verbatim-substring double-check already IS the authenticity gate:
+                # judge_relevance only returns is_answer=True when the candidate is a
+                # verbatim substring of trusted output and the LLM re-confirmed it
+                # verbatim. So a semantic-path confirmation is proof — promote directly
+                # to VERIFIED, same as the regex fast path. No confidence tier, no gating.
+                return FlagVerdict(FlagStatus.VERIFIED, 0.75, verdict.extracted_value,
+                                   [verdict.justification])
             return FlagVerdict(FlagStatus.REJECTED, 0.0, candidate, [verdict.justification])
         else:
             return FlagVerdict(FlagStatus.REJECTED, 0.0, candidate,

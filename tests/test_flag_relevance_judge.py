@@ -101,12 +101,12 @@ class TestAssessSemanticFallback(unittest.TestCase):
         kwargs.update(overrides)
         return kwargs
 
-    def test_nonstandard_integer_answer_candidate_at_075_held_for_review(self):
-        """Non-regex candidate judged relevant → CANDIDATE at 0.75, not VERIFIED.
+    def test_nonstandard_integer_answer_verified_directly(self):
+        """Non-regex candidate judged relevant → VERIFIED directly at 0.75.
 
-        With the default SEMANTIC_VERIFY_AUTO_COMPLETE_THRESHOLD of 0.85, the
-        fixed 0.75 semantic-path confidence does not auto-complete, so the match
-        is held for operator review instead of ending the mission immediately.
+        The verbatim-substring double-check already IS the authenticity gate, so a
+        semantic-path confirmation promotes straight to VERIFIED — there is no
+        confidence-tier auto-complete threshold and no operator-review hold any more.
         """
         llm = _llm("47")
         spec = AnswerSpec(
@@ -117,30 +117,10 @@ class TestAssessSemanticFallback(unittest.TestCase):
         verdict = FlagVerifier().assess(
             "47", raw_trusted_output="There are 47 users registered.",
             answer_spec=spec, llm_call=llm, **self.base_kwargs())
-        self.assertEqual(verdict.status, FlagStatus.CANDIDATE)
-        self.assertEqual(verdict.confidence, 0.75)
-        self.assertEqual(verdict.candidate, "47")
-        self.assertIn("semantic match below auto-complete threshold", verdict.reasons[-1])
-
-    def test_nonstandard_integer_answer_verified_when_threshold_low(self):
-        """Lowering SEMANTIC_VERIFY_AUTO_COMPLETE_THRESHOLD below 0.75 makes the
-        same semantic-path inputs produce VERIFIED, proving the constant is
-        load-bearing (not dead code)."""
-        llm = _llm("47")
-        spec = AnswerSpec(
-            expected_shape="integer",
-            description_summary="How many users are registered.",
-            known_prefix=None,
-        )
-        with unittest.mock.patch(
-            "backend.agent_runtime.verifier.SEMANTIC_VERIFY_AUTO_COMPLETE_THRESHOLD", 0.5
-        ):
-            verdict = FlagVerifier().assess(
-                "47", raw_trusted_output="There are 47 users registered.",
-                answer_spec=spec, llm_call=llm, **self.base_kwargs())
         self.assertEqual(verdict.status, FlagStatus.VERIFIED)
         self.assertEqual(verdict.confidence, 0.75)
         self.assertEqual(verdict.candidate, "47")
+        self.assertNotIn("held for review", "|".join(verdict.reasons))
 
     def test_nonstandard_answer_rejected_when_llm_hallucinates(self):
         """Judge hallucination → clean REJECTED at 0.0, never CANDIDATE."""

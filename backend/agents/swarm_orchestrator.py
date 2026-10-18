@@ -51,10 +51,13 @@ from backend.agents.agent_prompt import AgentContext, build_agent_prompt, make_c
 from backend.agents.artifact_acquisition import acquire_artifacts
 from backend.agents.artifact_classifier import classify_local_file
 from backend.agents.image_analysis import analyze_image_artifact, image_fingerprint, is_image_artifact
-from backend.agents import checkpoint_pipeline
-from backend.agents.checkpoint_pipeline import AgentCheckpointRecord
-
 logger = logging.getLogger("forge.swarm")
+
+# Single mission wall-clock ceiling: 45 minutes of total mission time (not per-agent).
+# The mission pauses (resumable) when this is reached, or when the platform-reported
+# instance expiry time is sooner — whichever comes first. No config knob; a fixed
+# value so there is nothing to tune or misconfigure.
+MISSION_CEILING_SECONDS = 45 * 60
 
 # Strict flag regex — only known CTF platform prefixes, minimum 4 chars inside braces.
 # Does NOT include a generic catch-all to avoid false positives from CSS, LaTeX, JSON, etc.
@@ -836,30 +839,6 @@ class SwarmBlackboard:
             lines.extend(others[:6])
         return "\n".join(lines) if lines else "No shared findings yet."
 
-    def snapshot_agent_records(self) -> List[AgentCheckpointRecord]:
-        """Build the deterministic per-agent records for a consolidated checkpoint
-        report — verbatim evidence/commands + this agent's flag candidate (if any)."""
-        records: List[AgentCheckpointRecord] = []
-        for agent_id in self.agent_ids:
-            hist = [h for h in self.execution_history if h.get("agent") == agent_id]
-            evidence = [h["output"] for h in hist if h.get("output")][-5:]
-            tried = [f"{h.get('command', '')} -> {(h.get('output') or '')[:120]}"
-                     for h in hist if h.get("command")][-6:]
-            fc = fs = None
-            for c in reversed(self.flag_candidates):
-                if c.get("worker") == agent_id:
-                    fc, fs = c.get("flag"), c.get("source")
-                    break
-            records.append(AgentCheckpointRecord(
-                agent_id=agent_id,
-                evidence=evidence,
-                tried=tried,
-                transcript="\n".join(self.agent_transcripts.get(agent_id, [])),
-                flag_candidate=fc,
-                flag_source=fs,
-            ))
-        return records
-
     async def _persist_progress_if_due(self, force: bool = False):
         """Throttled DB persist of mission plan (task statuses) + progress so the UI is reload-safe."""
         now = time.time()
@@ -1144,22 +1123,22 @@ class SwarmOrchestrator:
                 for i, aid in enumerate(board.agent_ids)
             ]
 
-            # Run agents concurrently until flag capture, all-budget-exhaustion, or
-            # cancellation. ensure_future (not create_task) wraps the gather Future so
-            # it can sit in asyncio.wait() alongside the flag + checkpoint tasks.
+            # Run agents concurrently until flag capture or cancellation. ensure_future
+            # (not create_task) wraps the gather Future so it can sit in asyncio.wait()
+            # alongside the flag-wait and the single mission-ceiling watcher.
             worker_task = asyncio.ensure_future(asyncio.gather(*agents, return_exceptions=True))
             flag_task = asyncio.create_task(board.flag_event.wait())
-            checkpoint_task = asyncio.create_task(self._checkpoint_coordinator(board, working_directory))
-            supervisor_tasks = (worker_task, flag_task, checkpoint_task)
+            ceiling_task = asyncio.create_task(self._ceiling_watcher(board))
+            supervisor_tasks = (worker_task, flag_task, ceiling_task)
 
-            _append_to_challenge_log(challenge_id, "orchestrator", f"{pool_size} flexible-agent workers + checkpoint coordinator dispatched")
+            _append_to_challenge_log(challenge_id, "orchestrator", f"{pool_size} flexible-agent workers + ceiling watcher dispatched")
 
-            # Wait for flag event, all agents finishing, or coordinator exit. The
-            # finally guarantees that on ANY exit from the supervising wait —
-            # normal completion, an unexpected error, OR cancellation of this
-            # supervisor — the worker gather, flag-wait, and checkpoint tasks are
-            # stopped and awaited before we leave, so none (nor any subprocess they
-            # own) can outlive the run.
+            # Wait for flag event, all agents finishing, or the ceiling watcher
+            # pausing the mission. The finally guarantees that on ANY exit from the
+            # supervising wait — normal completion, an unexpected error, OR
+            # cancellation of this supervisor — the worker gather, flag-wait, and
+            # ceiling-watcher tasks are stopped and awaited before we leave, so none
+            # (nor any subprocess they own) can outlive the run.
             try:
                 done, _pending = await asyncio.wait(
                     list(supervisor_tasks),
@@ -1582,50 +1561,7 @@ class SwarmOrchestrator:
         recovery = RecoveryEngine()
 
         while not board.flag_captured and not board.is_stopped:
-            # Hard-pause at a checkpoint: idle until the operator response resumes us.
-            # Time spent idle here is accumulated and subtracted from the work budget so a
-            # multi-minute operator pause never counts against the M working-minute clock.
-            if board.checkpoint_pause:
-                pause_started = time.time()
-                await board.update_worker_state(agent_id, status="IDLE", current_task="Paused at operator checkpoint")
-                while board.checkpoint_pause and not board.is_stopped and not board.flag_captured:
-                    await asyncio.sleep(1.0)
-                board.agent_paused_seconds[agent_id] = (
-                    board.agent_paused_seconds.get(agent_id, 0.0) + (time.time() - pause_started)
-                )
-                continue
-
-            # Instance-expiry hard wind-down — the CTF platform kills the target on its own
-            # timer (as short as ~15 min). Stop and report best findings a buffer before that
-            # deadline rather than being cut off mid-command.
-            if board.instance_expiry_ts:
-                buffer = int(getattr(settings, "INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
-                if time.time() >= board.instance_expiry_ts - buffer:
-                    reason = "WINDING_DOWN: platform instance expiry approaching — reporting best findings"
-                    board.record_agent_step(agent_id, note=reason)
-                    _append_to_challenge_log(board.challenge_id, agent_id, reason)
-                    await board.update_worker_state(agent_id, status="DONE", current_task=reason)
-                    if not board.stall_reason:
-                        board.stall_reason = "Platform instance expiry reached"
-                    break
-
-            # Budget gate — N iterations OR M working-minutes, whichever first. Working-minutes
-            # exclude checkpoint-pause idle time (see agent_paused_seconds / #3).
-            elapsed_min = _effective_elapsed_minutes(
-                board.agent_started_ts[agent_id], time.time(),
-                board.agent_paused_seconds.get(agent_id, 0.0),
-            )
             iters = board.agent_iterations.get(agent_id, 0)
-            if iters >= board.max_iterations or elapsed_min >= board.max_minutes:
-                reason = (f"BUDGET_EXHAUSTED (iterations={iters}/{board.max_iterations}, "
-                          f"minutes={elapsed_min:.1f}/{board.max_minutes})")
-                board.record_agent_step(agent_id, note=reason)
-                _append_to_challenge_log(board.challenge_id, agent_id, reason)
-                await board.update_worker_state(agent_id, status="DONE", current_task=reason)
-                if not board.stall_reason:
-                    board.stall_reason = "Agents exhausted their iteration/time budget without a verified flag"
-                break
-
             try:
                 ctx = self._build_agent_context(board, workdir, agent_id)
                 system_instruction, user_prompt = build_agent_prompt(ctx)
@@ -1886,191 +1822,38 @@ class SwarmOrchestrator:
             return None
         return _summarize
 
-    def _wind_down_for_expiry(self, board: "SwarmBlackboard"):
-        """Stop the run cleanly as the platform instance-expiry deadline nears. Agents
-        self-stop on the same deadline (see _agent_worker); this signals run_swarm to
-        finalize with best findings instead of the coordinator hard-waiting on a paste."""
-        board.stall_reason = board.stall_reason or "Platform instance expiry reached"
-        _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                 "Instance expiry within wind-down buffer — stopping run with best findings")
+    def _wind_down_for_expiry(self, board: "SwarmBlackboard", reason: str = "Platform instance expiry reached"):
+        """Pause (resumable) the mission as a deadline nears — the same response whether
+        it is the 45-minute ceiling or the platform instance expiry. Never terminates;
+        run_swarm finalizes the run as PAUSED so it can be continued from its snapshot."""
+        board.pause_requested = True
         board.is_stopped = True
-        board.checkpoint_response_event.set()
-
-    async def _checkpoint_coordinator(self, board: "SwarmBlackboard", workdir: str):
-        """Every CHECKPOINT_INTERVAL_SECONDS (or as the instance timer nears expiry,
-        or immediately on a verified flag), hard-pause all agents, emit ONE
-        consolidated report, and wait for the operator's pasted guidance."""
-        _append_to_challenge_log(board.challenge_id, "checkpoint", "Checkpoint coordinator started")
-        while not board.flag_captured and not board.is_stopped:
-            interval = int(getattr(settings, "CHECKPOINT_INTERVAL_SECONDS", 300))
-            buffer = int(getattr(settings, "INSTANCE_WINDDOWN_BUFFER_SECONDS", 30))
-            # Too close to instance expiry to run an interactive (operator-paste) checkpoint
-            # — wind down instead of hard-waiting for a paste that can't complete in time.
-            if board.instance_expiry_ts and (board.instance_expiry_ts - time.time()) <= buffer:
-                self._wind_down_for_expiry(board)
-                break
-            if board.instance_expiry_ts:
-                secs_left = board.instance_expiry_ts - time.time()
-                if secs_left > 0:
-                    interval = min(interval, max(10, int(secs_left - buffer)))
-            try:
-                await asyncio.wait_for(board.flag_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
-            if board.flag_captured or board.is_stopped:
-                break
-            # Crossed into the expiry buffer while waiting → wind down, don't hard-wait.
-            if board.instance_expiry_ts and (board.instance_expiry_ts - time.time()) <= buffer:
-                self._wind_down_for_expiry(board)
-                break
-            try:
-                await self._run_checkpoint_cycle(board, workdir)
-            except Exception as e:
-                logger.warning(f"[checkpoint] cycle error (non-fatal): {e}")
-                _append_to_challenge_log(board.challenge_id, "checkpoint", f"Cycle error (non-fatal): {e}")
-                board.checkpoint_pause = False
-                board.checkpoint_active = False
-        _append_to_challenge_log(board.challenge_id, "checkpoint", "Checkpoint coordinator stopped")
-
-    async def _run_checkpoint_cycle(self, board: "SwarmBlackboard", workdir: str):
-        cycle_start = board.cycle_window_start_ts
-        board.checkpoint_pause = True
-        board.checkpoint_active = True
-        board.cycle_n += 1
-        board.checkpoint_response_event.clear()
-        board.latest_pasted_response = None
-        _append_to_challenge_log(board.challenge_id, "checkpoint", f"=== Checkpoint cycle {board.cycle_n}: pausing agents ===")
-        # Passive provider-headroom summary (from real response headers; no extra calls).
-        try:
-            from backend.providers.quota_manager import quota_manager as _qm
-            _append_to_challenge_log(board.challenge_id, "checkpoint", f"Provider headroom: {_qm.ratelimit_summary()}")
-        except Exception:
-            pass
-        await asyncio.sleep(2.0)  # brief quiesce so in-flight steps land
-
-        records = board.snapshot_agent_records()
-        start_str = datetime.fromtimestamp(cycle_start, tz=timezone.utc).strftime("%H:%M:%S")
-        end_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        report = await checkpoint_pipeline.build_consolidated_report(
-            challenge_name=board.challenge_name, category=board.category, difficulty=board.difficulty,
-            target=board.target_scope, cycle_n=board.cycle_n, start_time=start_str, end_time=end_str,
-            records=records, summarizer=self._make_summarizer(),
-        )
-        board.last_checkpoint_report = report
-
-        db = SessionLocal()
-        try:
-            db.add(CheckpointModel(
-                run_id=board.run_id,
-                state_snapshot={"kind": "hitl_checkpoint", "cycle_n": board.cycle_n,
-                                "report": report, "agent_ids": list(board.agent_ids)},
-                last_successful_action=f"checkpoint_cycle_{board.cycle_n}",
-                resumable=True,
-            ))
-            run_obj = db.query(RunModel).filter(RunModel.id == board.run_id).first()
-            if run_obj:
-                run_obj.status = "WAITING_FOR_USER"
-            ch_obj = db.query(ChallengeModel).filter(ChallengeModel.id == board.challenge_id).first()
-            if ch_obj:
-                ch_obj.status = "WAITING_FOR_USER"
-            db.commit()
-        except Exception as e:
-            logger.debug(f"[checkpoint] persist skip: {e}")
-        finally:
-            db.close()
-
-        await ws_manager.broadcast({
-            "event": "CHECKPOINT_REACHED", "challenge_id": board.challenge_id, "run_id": board.run_id,
-            "cycle": board.cycle_n, "report": report,
-        })
+        board.stall_reason = board.stall_reason or reason
         _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                 f"Report emitted for cycle {board.cycle_n}; awaiting operator paste")
+                                 f"MISSION PAUSED: {reason} — state saved for resume")
 
-        # HARD WAIT for the operator's pasted external-model response.
-        await board.checkpoint_response_event.wait()
-        if board.is_stopped or board.flag_captured:
-            board.checkpoint_pause = False
-            board.checkpoint_active = False
-            return
+    async def _ceiling_watcher(self, board: "SwarmBlackboard"):
+        """Single mission ceiling: pause (never terminate) when 45 minutes of total
+        wall-clock mission time has elapsed, or when the platform-reported instance
+        expiry time (board.instance_expiry_ts) is sooner — whichever comes first.
 
-        pasted = board.latest_pasted_response or ""
-        parsed = checkpoint_pipeline.parse_suggestions(pasted, board.agent_ids)
-        if parsed.parsed:
-            async with board._lock:
-                for aid, directive in parsed.directives.items():
-                    prev = board.agent_directives.get(aid, "")
-                    board.agent_directives[aid] = (prev + "\n\n" + directive).strip() if prev else directive
-            _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                     f"Routed directives to: {', '.join(sorted(parsed.directives.keys()))}"
-                                     + (f" | {parsed.note}" if parsed.note else ""))
-            await ws_manager.broadcast({
-                "event": "CHECKPOINT_RESUMED", "challenge_id": board.challenge_id, "run_id": board.run_id,
-                "cycle": board.cycle_n, "routed": sorted(parsed.directives.keys()),
-                "unknown_labels": parsed.unknown_labels,
-            })
-        else:
-            if parsed.fallback and parsed.fallback_text:
-                async with board._lock:
-                    for aid in board.agent_ids:
-                        prev = board.agent_directives.get(aid, "")
-                        add = "[GENERAL GUIDANCE] " + parsed.fallback_text
-                        board.agent_directives[aid] = (prev + "\n\n" + add).strip() if prev else add
-            _append_to_challenge_log(board.challenge_id, "checkpoint",
-                                     f"UNPARSEABLE paste — {parsed.note} Applied as general guidance to all agents.")
-            await ws_manager.broadcast({
-                "event": "CHECKPOINT_PARSE_ERROR", "challenge_id": board.challenge_id, "run_id": board.run_id,
-                "cycle": board.cycle_n, "note": parsed.note, "applied_as_general": bool(parsed.fallback_text),
-            })
-
-        # Refresh each agent's budget for the new cycle. The operator just re-authorized
-        # continuation at the checkpoint, so directives get a fresh iteration/minute window
-        # instead of dying instantly on a budget that was already spent before the pause
-        # (the checkpoint-interval == budget trap). The dedup set is deliberately NOT reset,
-        # so agents still never re-run an identical command.
-        now_ts = time.time()
-        for aid in board.agent_ids:
-            board.agent_started_ts[aid] = now_ts
-            board.agent_paused_seconds[aid] = 0.0
-            board.agent_iterations[aid] = 0
-            board.agent_local_fail_streak[aid] = 0
-        _append_to_challenge_log(
-            board.challenge_id, "checkpoint",
-            f"Budget refreshed for {len(board.agent_ids)} agents on resume (fresh cycle window)")
-
-        board.checkpoint_pause = False
-        board.checkpoint_active = False
-        board.latest_pasted_response = None
-        db = SessionLocal()
-        try:
-            run_obj = db.query(RunModel).filter(RunModel.id == board.run_id).first()
-            if run_obj:
-                run_obj.status = "RUNNING"
-            ch_obj = db.query(ChallengeModel).filter(ChallengeModel.id == board.challenge_id).first()
-            if ch_obj:
-                ch_obj.status = "RUNNING"
-            db.commit()
-        except Exception:
-            pass
-        finally:
-            db.close()
-        board.cycle_window_start_ts = time.time()
-        _append_to_challenge_log(board.challenge_id, "checkpoint", f"=== Checkpoint cycle {board.cycle_n}: agents resumed ===")
-
-    async def submit_checkpoint_response(self, challenge_id: str, text: str) -> Dict[str, Any]:
-        """Deliver the operator's pasted external-model response to a waiting swarm.
-        Called by the API. Parsing/injection happens in the coordinator on wake."""
-        for board in list(self.active_swarms.values()):
-            if board.challenge_id == challenge_id and board.checkpoint_active:
-                board.latest_pasted_response = text or ""
-                preview = checkpoint_pipeline.parse_suggestions(text or "", board.agent_ids)
-                board.checkpoint_response_event.set()
-                return {
-                    "accepted": True, "parsed": preview.parsed,
-                    "routed": sorted(preview.directives.keys()),
-                    "fallback": preview.fallback, "unknown_labels": preview.unknown_labels,
-                    "note": preview.note,
-                }
-        return {"accepted": False, "reason": "No active checkpoint is awaiting a response for this challenge."}
+        When the ceiling is hit the mission is paused the same way an operator pause
+        does: full state is persisted via the existing mission_plan snapshot mechanism
+        and run_swarm finalizes the run as PAUSED (resumable) so a later continue
+        resumes the agents with their prior context intact."""
+        while not board.flag_captured and not board.is_stopped:
+            deadline = board.started_ts + MISSION_CEILING_SECONDS
+            if board.instance_expiry_ts:
+                deadline = min(deadline, board.instance_expiry_ts)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                if board.instance_expiry_ts and board.instance_expiry_ts <= board.started_ts + MISSION_CEILING_SECONDS:
+                    self._wind_down_for_expiry(board, "Platform instance expiry reached")
+                else:
+                    self._wind_down_for_expiry(board, "45-minute mission ceiling reached")
+                return
+            # Sleep in small increments so a flag capture or stop can interrupt the wait.
+            await asyncio.sleep(min(remaining, 5.0))
 
     def _extract_command(self, text: str) -> Optional[str]:
         if not text:

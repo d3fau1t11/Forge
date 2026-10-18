@@ -159,9 +159,9 @@ class TestSwarmCancellation(unittest.TestCase):
             orch = SwarmOrchestrator()
 
             worker_started = asyncio.Event()
-            coordinator_started = asyncio.Event()
+            ceiling_started = asyncio.Event()
             workers_cancelled: set = set()
-            coordinator_cancelled = asyncio.Event()
+            ceiling_cancelled = asyncio.Event()
 
             async def fake_agent_worker(agent_id, board, workdir, capability):
                 worker_started.set()
@@ -170,18 +170,18 @@ class TestSwarmCancellation(unittest.TestCase):
                 finally:
                     workers_cancelled.add(agent_id)
 
-            async def fake_coordinator(board, workdir):
-                coordinator_started.set()
+            async def fake_ceiling_watcher(board):
+                ceiling_started.set()
                 try:
                     await asyncio.sleep(3600)
                 except asyncio.CancelledError:
-                    coordinator_cancelled.set()
+                    ceiling_cancelled.set()
                     raise
 
             # Replace only the long-running supervision bodies; every external
             # dependency is mocked so no provider, network, or DB is touched.
             orch._agent_worker = fake_agent_worker
-            orch._checkpoint_coordinator = fake_coordinator
+            orch._ceiling_watcher = fake_ceiling_watcher
 
             fake_db = MagicMock()
             fake_db.query.return_value.filter.return_value.first.return_value = None
@@ -201,7 +201,7 @@ class TestSwarmCancellation(unittest.TestCase):
                     target_scope="http://127.0.0.1:9/", working_directory=".",
                 ))
                 await asyncio.wait_for(worker_started.wait(), timeout=5)
-                await asyncio.wait_for(coordinator_started.wait(), timeout=5)
+                await asyncio.wait_for(ceiling_started.wait(), timeout=5)
                 board = orch.active_swarms["run-cancel"]
 
                 run_task.cancel()
@@ -213,10 +213,10 @@ class TestSwarmCancellation(unittest.TestCase):
             self.assertTrue(board.is_stopped)
             self.assertTrue(board.checkpoint_response_event.is_set())
             self.assertNotIn("run-cancel", orch.active_swarms)
-            # Every worker and the coordinator observed cancellation.
+            # Every worker and the ceiling watcher observed cancellation.
             self.assertTrue(workers_cancelled)
-            self.assertTrue(coordinator_cancelled.is_set())
-            # No supervising task (worker gather / flag wait / coordinator) survives.
+            self.assertTrue(ceiling_cancelled.is_set())
+            # No supervising task (worker gather / flag wait / ceiling watcher) survives.
             await asyncio.sleep(0)
             after = {t for t in asyncio.all_tasks() if not t.done()}
             self.assertEqual(after - before, set(),

@@ -142,14 +142,15 @@ class TestBlindExtractionFallbackE2E(unittest.TestCase):
         )
         return board
 
-    def test_c_ssti_flag_recorded_as_candidate(self):
+    def test_c_ssti_flag_verified_and_captured(self):
         """(c) Regression test for the actual bug: SSTI output, generic default
-        flag_pattern, trusted origin, action succeeded → the flag IS recorded as
-        a candidate via board.record_flag_candidate by the end of the call.
+        flag_pattern, trusted origin, action succeeded → the flag now verifies
+        DIRECTLY (not held as a candidate at 0.75) and is captured end to end:
+        record_flag → flag_event set → mission would complete.
 
-        A test that would have caught this before the live run did, because the
-        hardcoded regex finds nothing and the fallback must route the value to
-        assess() (and thus record_flag_candidate) instead of silently returning.
+        This is the direct evidence that the original bug (academy{...} flag seen
+        in real tool output but never captured because the semantic path was held
+        below the auto-complete threshold) is fully closed.
         """
         board = self.base_board()
         orch = SwarmOrchestrator()
@@ -176,11 +177,9 @@ class TestBlindExtractionFallbackE2E(unittest.TestCase):
             f"SSTI flag not routed to record_flag_candidate; calls={calls}",
         )
         self.assertIn(SSTI_FLAG, [c["flag"] for c in board.flag_candidates])
-        # Semantic-path confidence (0.75) is below the 0.85 auto-complete threshold,
-        # so it is held as a candidate, not captured — the important regression
-        # signal is that it is offered/recorded at all, which it wasn't before.
-        self.assertIsNone(board.flag_captured)
-        self.assertFalse(board.flag_event.is_set())
+        # Semantic-path confirmation now promotes directly to VERIFIED → captured.
+        self.assertEqual(board.flag_captured, SSTI_FLAG)
+        self.assertTrue(board.flag_event.is_set())
 
     def test_d_agent_source_reject_catches_traceback_derived_value(self):
         """(d) Crack the Gate 1 false-positive: the agent's own traceback line as
