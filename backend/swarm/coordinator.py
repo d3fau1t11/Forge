@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from backend.agent_runtime import (
     FlagVerifier, FlagSource, FlagStatus, session_manager, trajectory_store,
+    EvidenceOrigin, classify_origin,
 )
 from backend.swarm import events
 from backend.swarm.agents import AgentResult, SpecialistAgent
@@ -261,13 +262,21 @@ class SwarmCoordinator:
                               command: str = "", action_succeeded: bool = True,
                               agent_id: str = "external") -> bool:
         """Central, authoritative flag verification (§11) for a candidate surfaced
-        outside the runtime's own tool-output path. Returns True iff VERIFIED."""
+        outside the runtime's own tool-output path. Returns True iff VERIFIED.
+
+        A caller that supplies no command (or a command that does not genuinely
+        reach the target) provides no provenance, so the candidate fails closed and
+        is only recorded for review."""
         src = FlagSource.TOOL_OUTPUT if source == "tool_output" else (
             FlagSource.LLM_PROSE if source == "llm" else FlagSource.UNKNOWN)
+        origin = classify_origin(command, self.mission.target)
+        if source != "tool_output":
+            origin = EvidenceOrigin.UNKNOWN
         verdict = self.verifier.assess(candidate, source=src, command=command,
                                        action_succeeded=action_succeeded,
                                        target_scope=self.mission.target,
-                                       expected_format=self.mission.flag_format)
+                                       expected_format=self.mission.flag_format,
+                                       origin=origin)
         if verdict.status == FlagStatus.VERIFIED:
             self._accept_verified_flag(verdict.candidate, agent_id=agent_id, task=None)
             return True

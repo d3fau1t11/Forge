@@ -20,7 +20,8 @@ Public surface
     Action, ActionType, ActionValidator, ExecResult   — actions (validation ≠ execution)
     RepetitionDetector, RepetitionKind                — repetition detection
     RecoveryEngine, RecoveryStrategy                  — failure recovery
-    FlagVerifier, FlagStatus, FlagSource, FlagVerdict — flag candidate vs verified
+    FlagVerifier, FlagStatus, FlagSource, FlagVerdict,    — flag candidate vs verified
+    EvidenceOrigin, expected_flag_prefixes                — recovery provenance / expected format
 """
 
 from backend.agent_runtime.state import MissionState, StateDelta
@@ -38,6 +39,8 @@ from backend.agent_runtime.recovery import (
 )
 from backend.agent_runtime.verifier import (
     FlagVerifier, FlagStatus, FlagSource, FlagVerdict, FLAG_REGEX, FALSE_FLAG_PATTERNS,
+    EvidenceOrigin, expected_flag_prefixes, classify_origin, command_reaches_target,
+    is_agent_code_command, local_script_path, target_host,
 )
 from backend.agent_runtime.context import ContextBuilder, BuiltContext
 from backend.agent_runtime.trajectory import (
@@ -59,6 +62,8 @@ __all__ = [
     "RepetitionDetector", "RepetitionKind", "RepetitionReport",
     "RecoveryEngine", "RecoveryPlan", "RecoveryStrategy", "FailureCategory",
     "FlagVerifier", "FlagStatus", "FlagSource", "FlagVerdict", "FLAG_REGEX", "FALSE_FLAG_PATTERNS",
+    "EvidenceOrigin", "expected_flag_prefixes", "classify_origin", "command_reaches_target",
+    "is_agent_code_command", "local_script_path", "target_host",
     "ContextBuilder", "BuiltContext",
     "TrajectoryStore", "TrajectorySearch", "trajectory_store", "trajectory_search",
     "AgentSession", "SessionManager", "session_manager",

@@ -36,7 +36,9 @@ from backend.agent_runtime.recovery import RecoveryEngine, RecoveryStrategy
 from backend.agent_runtime.repetition import RepetitionDetector, RepetitionKind
 from backend.agent_runtime.session import AgentSession, SessionManager, session_manager
 from backend.agent_runtime.trajectory import TrajectoryStore, trajectory_store
-from backend.agent_runtime.verifier import FlagSource, FlagStatus, FlagVerifier
+from backend.agent_runtime.verifier import (
+    FlagSource, FlagStatus, FlagVerifier, classify_origin, is_agent_code_command,
+)
 
 logger = logging.getLogger("forge.agent_runtime.runtime")
 
@@ -337,10 +339,21 @@ class AgentRuntime:
                              observation=obs.to_dict(), decision_summary=obs.summary)
 
             # ── Flag verification from REAL tool output (only path to VERIFIED) ──
+            # A regex match is a candidate; provenance decides. Agent-authored code
+            # (an inline/scripted solver) fails closed, and a plain local command
+            # that never reached the target is not target-derived. Only a command
+            # that genuinely contacts the target can verify.
             if obs.flag_candidates:
+                exec_command = exec_result.command or action.display()
+                agent_code = (action.type == ActionType.PYTHON_SCRIPT
+                              or is_agent_code_command(exec_command))
+                agent_source = action.script if action.type == ActionType.PYTHON_SCRIPT else ""
+                origin = classify_origin(exec_command, state.target,
+                                         agent_source=agent_source, agent_code=agent_code)
                 verdict = self.verifier.assess_observation(
-                    obs, command=exec_result.command, action_succeeded=exec_result.succeeded,
-                    target_scope=state.target, expected_format=state.flag_format)
+                    obs, command=exec_command, action_succeeded=exec_result.succeeded,
+                    target_scope=state.target, expected_format=state.flag_format,
+                    origin=origin, agent_source=agent_source, agent_code=agent_code)
                 if verdict and verdict.status == FlagStatus.VERIFIED:
                     state.set_verified_flag(verdict.candidate)
                     state.record_success(decision.strategy or action.display())

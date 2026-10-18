@@ -9,6 +9,7 @@ Features:
 """
 
 import asyncio
+import functools
 import base64
 import codecs
 import hashlib
@@ -26,6 +27,15 @@ from typing import Dict, Any, List, Optional, Set
 from backend.database.session import SessionLocal
 from backend.database.models import RunModel, ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel, ToolExecutionModel, CheckpointModel
 from backend.providers.router import model_router
+from backend.agent_runtime.verifier import (
+    FlagVerifier, FlagSource, FlagVerdict, EvidenceOrigin,
+    GENERIC_FLAG_REGEX, expected_flag_prefixes,
+    classify_origin, is_agent_code_command, local_script_path,
+    AnswerSpec, derive_answer_spec, judge_relevance,
+    extract_candidate_blind, _TRUSTED_ORIGINS,
+)
+from backend.agent_runtime.repetition import RepetitionDetector, RepetitionKind
+from backend.agent_runtime.recovery import RecoveryEngine, RecoveryStrategy
 from backend.tools.manager import tool_manager, LOCAL_EXEC_CATEGORIES
 from backend.websocket.manager import ws_manager
 from backend.engine.keep_awake import keep_awake_manager
@@ -68,6 +78,11 @@ FALSE_FLAG_PATTERNS = re.compile(
 # punctuation). Values must be printable single-line ASCII. Anything else is
 # LLM prose, not a real header, so we refuse to record or inject it.
 _VALID_HEADER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+
+# Provenance classification (agent-authored code vs. a genuine target response vs.
+# a local observation) lives in the shared verifier so every engine uses ONE policy:
+# ``classify_origin`` / ``is_agent_code_command`` / ``local_script_path``. A hostname
+# appearing in a command or generated source is NOT provenance — see verifier.py.
 
 # Substrings that betray an LLM placeholder rather than a concrete header value.
 # These are the exact shapes that caused the X-Forwarded-For injection loop:
@@ -262,7 +277,17 @@ class SwarmBlackboard:
         self.candidate_tokens: Set[str] = set()
         self.tested_user_combinations: Set[str] = set()
         self.processed_decode_hashes: Set[str] = set()
+        # Hashes of raw_trusted_output already screened by extract_candidate_blind
+        # this mission (found or NO_ANSWER), so repeated/near-identical trusted
+        # outputs don't burn an LLM call each occurrence. Fresh per board instance
+        # (per mission), never global/cross-mission.
+        self._blind_extraction_seen: Set[str] = set()
         self.last_target_rejection: Optional[str] = None
+        # Agent-authored source text keyed by the exact path the agent wrote and
+        # ran (generated solver scripts). Used to prove a flag-shaped value was
+        # *constructed by the agent* rather than captured from the target. Never
+        # persisted: it is only meaningful within the turn that produced it.
+        self.agent_authored_sources: Dict[str, str] = {}
         self._lock = asyncio.Lock()
 
         # ── Experience memory (retrieved ONCE per mission, shared by all agents) ──
@@ -281,6 +306,9 @@ class SwarmBlackboard:
         self.description: str = ""
         self.flag_pattern: str = getattr(settings, "DEFAULT_FLAG_PATTERNS",
                                          "picoCTF{...}|FLAG{...}|flag{...}|HTB{...}|CTF{...}")
+        # Derived once from the challenge description before agents spawn; feeds the
+        # verifier's semantic fallback (judge_relevance) for non-regex answers.
+        self.answer_spec: Optional[AnswerSpec] = None
         self.max_iterations: int = getattr(settings, "AGENT_MAX_ITERATIONS", 40)
         self.max_minutes: int = getattr(settings, "AGENT_MAX_MINUTES", 30)
         self.attached_file_paths: List[str] = []
@@ -377,6 +405,20 @@ class SwarmBlackboard:
 
             await self._broadcast_blackboard()
 
+    def register_agent_source(self, path: str, source: str) -> None:
+        """Remember the source of a script the agent authored and is about to run."""
+        if path and source:
+            self.agent_authored_sources[path] = source
+
+    def agent_source_for_command(self, command: str) -> str:
+        """Return the agent-authored source referenced by a command, or ""."""
+        if not command:
+            return ""
+        for path, src in self.agent_authored_sources.items():
+            if path and path in command:
+                return src
+        return ""
+
     async def record_flag(self, flag: str, worker_id: str):
         async with self._lock:
             if not self.flag_captured:
@@ -393,8 +435,16 @@ class SwarmBlackboard:
                     "solver_worker": worker_id
                 })
 
-    async def record_flag_candidate(self, candidate: str, worker_id: str, source: str):
-        """Record an unverified flag candidate for review. Only promotes to captured if from tool output."""
+    async def record_flag_candidate(self, candidate: str, worker_id: str, source: str,
+                                    *, verdict: Optional["FlagVerdict"] = None):
+        """Record an unverified flag candidate for review.
+
+        A regex match — or a ``source`` string alone — is NOT sufficient to mark a
+        challenge solved. Promotion to a captured flag requires an authoritative
+        :class:`FlagVerifier` ``verdict`` that reports ``VERIFIED``. Without one the
+        value is retained as an unverified candidate only (fail closed).
+        """
+        is_new = False
         async with self._lock:
             # Reject obvious placeholders / examples
             if FALSE_FLAG_PATTERNS.search(candidate):
@@ -403,26 +453,34 @@ class SwarmBlackboard:
                 return
 
             # Check if this candidate was already seen
-            for existing in self.flag_candidates:
-                if existing["flag"] == candidate:
-                    return
+            already_seen = any(existing["flag"] == candidate for existing in self.flag_candidates)
+            if not already_seen:
+                self.flag_candidates.append({"flag": candidate, "worker": worker_id, "source": source})
+                is_new = True
+                _append_to_challenge_log(self.challenge_id, worker_id, f"🏳 Flag candidate from {source}: {candidate}")
+                logger.info(f"[SwarmBlackboard] Flag candidate from {source} by {worker_id}: {candidate}")
 
-            self.flag_candidates.append({"flag": candidate, "worker": worker_id, "source": source})
-            _append_to_challenge_log(self.challenge_id, worker_id, f"🏳 Flag candidate from {source}: {candidate}")
-            logger.info(f"[SwarmBlackboard] Flag candidate from {source} by {worker_id}: {candidate}")
+                await ws_manager.broadcast({
+                    "event": "FLAG_CANDIDATE",
+                    "challenge_id": self.challenge_id,
+                    "run_id": self.run_id,
+                    "candidate": candidate,
+                    "source": source,
+                    "worker": worker_id
+                })
 
-            await ws_manager.broadcast({
-                "event": "FLAG_CANDIDATE",
-                "challenge_id": self.challenge_id,
-                "run_id": self.run_id,
-                "candidate": candidate,
-                "source": source,
-                "worker": worker_id
-            })
-
-        # Only auto-promote to captured if the source is actual tool/command output (not LLM prose)
-        if source == "tool_output":
+        # Only an authoritative, VERIFIED verdict may promote the candidate to a
+        # captured flag (and thus fire the flag event / solved termination), no
+        # matter which pipeline (tool output, decoded artifact, chain) surfaced it.
+        # A raw match without verification is kept as a candidate.
+        if verdict is not None and verdict.is_verified:
             await self.record_flag(candidate, worker_id)
+        elif source == "tool_output" and is_new:
+            reason = "; ".join(verdict.reasons) if verdict is not None and verdict.reasons \
+                else "no authoritative verification available"
+            _append_to_challenge_log(
+                self.challenge_id, worker_id,
+                f"⚠ Unverified tool-output flag (kept as candidate, not captured): {candidate} — {reason}")
 
     async def note_exploit_header(self, name: str, value: str, worker_id: str) -> bool:
         """Validate a candidate exploit header and, if genuinely new and concrete,
@@ -877,6 +935,10 @@ class SwarmOrchestrator:
 
     def __init__(self):
         self.active_swarms: Dict[str, SwarmBlackboard] = {}
+        # Authoritative flag verifier — the ONLY component that may promote a
+        # candidate to a captured flag. Reused (not duplicated) from the agent
+        # runtime so both engines share one verification policy.
+        self._flag_verifier = FlagVerifier()
 
     async def run_swarm(
         self,
@@ -1058,6 +1120,17 @@ class SwarmOrchestrator:
                                              "[MEMORY] No relevant prior experience found (cold start)")
             except Exception as mem_err:
                 logger.warning(f"[SwarmOrchestrator] Memory retrieval failed (non-fatal): {mem_err}")
+
+            # ── Answer spec (derived ONCE before agents spawn) ─────────────────────
+            # Feeds the verifier's semantic fallback so a non-regex answer (e.g. a
+            # plain integer) can still be judged against the description. Non-fatal:
+            # without it, assess() keeps bit-for-bit today's behavior.
+            try:
+                board.answer_spec = derive_answer_spec(
+                    board.description, board.flag_pattern, self._make_summarizer())
+            except Exception as spec_err:
+                logger.warning(f"[SwarmOrchestrator] Answer spec derivation failed (non-fatal): {spec_err}")
+                board.answer_spec = None
 
             # ── Spawn N general-purpose agents (config-driven; not roles) ──────────
             pool_size = self._resolve_pool_size(board.env_info)
@@ -1478,8 +1551,8 @@ class SwarmOrchestrator:
             pass
 
         # Flag-like text in Gemini's description is LLM prose, not tool output — record
-        # it as an UNVERIFIED candidate. record_flag_candidate only auto-promotes source
-        # "tool_output", so this can never mark the challenge solved on its own.
+        # it as an UNVERIFIED candidate. Promotion to a captured flag requires a
+        # VERIFIED FlagVerifier verdict, so this can never mark the challenge solved.
         for candidate in FLAG_REGEX.findall(result.description):
             candidate = candidate.strip()
             if candidate and not FALSE_FLAG_PATTERNS.search(candidate):
@@ -1501,6 +1574,12 @@ class SwarmOrchestrator:
                                         selected_model="auto (capability chain)", current_task="Booting agent")
         consecutive_errors = 0
         MAX_CONSECUTIVE_ERRORS = 5
+
+        # Per-agent repetition + recovery guards (mirrors AgentRuntime.run() in
+        # backend/agent_runtime/runtime.py:169-170). Scoped per agent per run so
+        # each worker tracks its own action history across the mission.
+        repetition = RepetitionDetector()
+        recovery = RecoveryEngine()
 
         while not board.flag_captured and not board.is_stopped:
             # Hard-pause at a checkpoint: idle until the operator response resumes us.
@@ -1605,6 +1684,9 @@ class SwarmOrchestrator:
                         board.record_agent_step(agent_id, note=f"Could not write solver: {werr}")
                         board.agent_iterations[agent_id] = iters + 1
                         continue
+                    # Record the authored source so flag verification can tell a
+                    # value the script *observed* from one it *constructed*.
+                    board.register_agent_source(solver_path, script)
                     # Quote the path — the workspace path can contain spaces (e.g.
                     # .../WEB/EASY/Old Sessions), which otherwise splits into [Errno 2].
                     cmd = f'python "{solver_path}"'
@@ -1629,6 +1711,27 @@ class SwarmOrchestrator:
 
                 board.agent_iterations[agent_id] = iters + 1
 
+                # ── Repetition guard (pre-exec): never blindly repeat an action.
+                # Mirrors AgentRuntime.run() pre-exec (runtime.py:304-314).
+                # cmd is a raw command string, which is exactly what
+                # RepetitionDetector.classify/observe expect — no adapter needed.
+                pre_kind = repetition.classify(cmd)
+                if pre_kind == RepetitionKind.EXACT_REPEAT:
+                    rep_report = repetition.observe(
+                        cmd, failed=True, failure_category="repeat", novel=False)
+                    plan = recovery.diagnose(repetition=rep_report, command=cmd)
+                    sig = RepetitionDetector.semantic_signature(cmd) or cmd[:80]
+                    note = plan.directive or f"Repeated action detected: {sig}"
+                    board.record_agent_step(agent_id, command=cmd, note=note)
+                    _append_to_challenge_log(
+                        board.challenge_id, agent_id,
+                        f"REPLAN: agent {agent_id} repeating strategy '{sig}' — {plan.directive[:160]}")
+                    repetition.reset_streaks()
+                    await board.update_worker_state(agent_id, status="RUNNING",
+                                                    current_task=f"Repeated strategy {sig}; re-planning")
+                    await asyncio.sleep(1.0)
+                    continue
+
                 if cmd in board.executed_commands_dedup:
                     board.record_agent_step(agent_id, command=cmd, note="skipped (already executed by the swarm)")
                     await asyncio.sleep(0.5)
@@ -1645,6 +1748,49 @@ class SwarmOrchestrator:
 
                 await board.record_tool_execution(agent_id, cmd, res)
                 board.record_agent_step(agent_id, command=cmd, output=output)
+
+                # ── Repetition + recovery (post-exec): detect repeated strategies
+                # and decide retry / replan / abort. Mirrors AgentRuntime.run()
+                # post-exec (runtime.py:388-395). The observation engine used for
+                # novelty is the same one already lazily imported at line ~1389
+                # (cached as self._observation_engine) — no second observation path.
+                engine = getattr(self, "_observation_engine", None)
+                if engine is None:
+                    try:
+                        from backend.agent_runtime.observation import ObservationEngine
+                        engine = ObservationEngine()
+                        self._observation_engine = engine
+                    except Exception:
+                        engine = None
+                observation = engine.observe(res) if engine is not None else None
+                failed = (res.status != "SUCCESS") or bool(getattr(res, "execution_failure", False))
+                rep_report = repetition.observe(
+                    cmd,
+                    failed=failed,
+                    failure_category=getattr(res, "failure_category", None),
+                    novel=observation.novelty if observation else False,
+                )
+                plan = recovery.diagnose(
+                    exec_result=res, observation=observation,
+                    repetition=rep_report, command=cmd)
+
+                if plan.strategy == RecoveryStrategy.REPLAN:
+                    sig = RepetitionDetector.semantic_signature(cmd) or cmd[:80]
+                    board.record_agent_step(agent_id, command=cmd, note=plan.directive)
+                    _append_to_challenge_log(
+                        board.challenge_id, agent_id,
+                        f"REPLAN: agent {agent_id} repeated strategy '{sig}' without progress — {plan.directive[:160]}")
+                    repetition.reset_streaks()
+                elif plan.strategy == RecoveryStrategy.ABORT:
+                    blocker = (f"ABORTING agent {agent_id}: recovery engine signaled abort "
+                               f"({plan.category.value}) — {plan.directive[:160]}")
+                    board.record_agent_step(agent_id, command=cmd, note=blocker)
+                    _append_to_challenge_log(board.challenge_id, agent_id, blocker)
+                    await board.update_worker_state(agent_id, status="DONE", current_task=blocker)
+                    if not board.stall_reason:
+                        board.stall_reason = (f"Agent aborted: repeated approach without progress "
+                                              f"({plan.category.value})")
+                    break
 
                 # Local execution failures (Errno 2 / SyntaxError / permission / missing dep)
                 # never reached the target — a broken invocation, not a target response. Don't
@@ -1691,9 +1837,10 @@ class SwarmOrchestrator:
                     pass
 
                 # Flags/leads come ONLY from real tool output — never from LLM prose.
-                self._check_tool_output_for_flags(output, board, agent_id)
+                # Promotion is decided by the authoritative verifier, not the regex.
+                await self._check_tool_output_for_flags(output, board, agent_id, command=cmd, result=res)
                 self._check_tool_output_for_rejections(output, board, agent_id)
-                await self._apply_decoded_directives(output, board, agent_id)
+                await self._apply_decoded_directives(output, board, agent_id, command=cmd, result=res)
                 if "<!--" in output:
                     for c in re.findall(r"<!--(.*?)-->", output, re.DOTALL):
                         c_clean = c.strip()
@@ -1945,28 +2092,152 @@ class SwarmOrchestrator:
         elif "invalid token" in text_lower or "token expired" in text_lower:
             board.last_target_rejection = "INVALID_TOKEN"
 
-    def _check_tool_output_for_flags(self, text: str, board: SwarmBlackboard, worker_id: str):
-        """Scan ONLY tool/command output for flag patterns. Never call this on LLM prose."""
+    async def _check_tool_output_for_flags(self, text: str, board: SwarmBlackboard, worker_id: str,
+                                           *, command: str = "", result: Any = None):
+        """Scan ONLY tool/command output for flag patterns. Never call this on LLM prose.
+
+        A regex/format match is a **candidate only**. Promotion to a captured flag is
+        decided by the authoritative :class:`FlagVerifier`, which now requires
+        *provenance evidence beyond a successful command*:
+
+        * a value echoed in the issued command, or present in agent-authored code
+          (a generated solver script), is constructed — not captured;
+        * output from a failed action (e.g. a traceback) is not a success;
+        * agent-authored code output ALWAYS fails closed here: a hostname in a
+          comment, string literal, or unrelated URL inside generated source is not
+          provenance, so only a genuine target response can reach VERIFIED;
+        * only a value recovered from a target response / decoded artifact can
+          reach VERIFIED (the multi-step-chain origin is reserved and untrusted).
+        """
         if not text:
             return
-        match = FLAG_REGEX.search(text)
-        if match:
-            candidate = match.group(0).strip()
-            # Reject placeholder patterns like picoCTF{...} or FLAG{example}
+        candidates = self._flag_candidates_in(text, board.flag_pattern)
+
+        # Provenance + success are needed both by the blind-extraction fallback
+        # below and by the existing per-candidate assess() loop, so compute once.
+        action_succeeded = self._action_succeeded(result)
+        local_script = local_script_path(command)
+        agent_code = is_agent_code_command(command)
+        # Only read a registered script's source when we actually detected a script
+        # run; an inline one-liner has no separate inspectable source (fails closed).
+        agent_source = board.agent_source_for_command(command) if (command and local_script) else ""
+        # Agent-authored code is ALWAYS AGENT_CODE — the shared classifier ignores the
+        # target hostname inside generated source (it can appear in a comment/string
+        # while the script prints a fabricated value).
+        origin = classify_origin(command, board.target_scope,
+                                 agent_source=agent_source, agent_code=agent_code)
+
+        if not candidates:
+            # Blind-extraction fallback: when the hardcoded regex finds nothing,
+            # a non-regex answer recovered from a trusted target response is still
+            # a candidate worth verifying through the EXISTING assess() loop below.
+            # Strictly additive: only when the origin is trusted, the action
+            # succeeded, an answer spec exists, and this exact output hasn't been
+            # screened yet (dedupe protects the Groq quota).
+            if (board.answer_spec is not None
+                    and origin in _TRUSTED_ORIGINS
+                    and action_succeeded):
+                text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                if text_hash in board._blind_extraction_seen:
+                    return
+                extracted = extract_candidate_blind(
+                    text, board.answer_spec, self._make_summarizer())
+                # Cache regardless of outcome (found or NO_ANSWER) so
+                # repeated/near-identical outputs never trigger a second LLM call.
+                board._blind_extraction_seen.add(text_hash)
+                if extracted:
+                    candidates = [extracted]
+                else:
+                    return
+            else:
+                return
+
+        # Evaluate EVERY candidate independently: a rejected/placeholder first match
+        # must never mask a later genuine value in the same output.
+        for candidate in candidates:
             if FALSE_FLAG_PATTERNS.search(candidate):
                 logger.info(f"[{worker_id}] Rejected false-positive from tool output: {candidate}")
                 _append_to_challenge_log(board.challenge_id, worker_id, f"⚠ Rejected placeholder flag: {candidate}")
-                return
-            # This is from tool output — high confidence, auto-promote to captured
-            asyncio.create_task(board.record_flag_candidate(candidate, worker_id, "tool_output"))
+                continue
 
-    async def _apply_decoded_directives(self, raw: str, board: SwarmBlackboard, worker_id: str) -> bool:
+            # Run the blocking verifier (which internally bridges the async LLM
+            # call via a worker thread + asyncio.run) on a worker thread from the
+            # running loop so it never stalls the shared event loop that the
+            # checkpoint coordinator, other agents, and the WebSocket depend on.
+            loop = asyncio.get_running_loop()
+            verdict = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._flag_verifier.assess,
+                    candidate,
+                    source=FlagSource.TOOL_OUTPUT,
+                    command=command,
+                    action_succeeded=action_succeeded,
+                    target_scope=board.target_scope,
+                    expected_format=board.flag_pattern,
+                    agent_source=agent_source,
+                    agent_code=agent_code,
+                    origin=origin,
+                    raw_trusted_output=text,
+                    answer_spec=board.answer_spec,
+                    llm_call=self._make_summarizer(),
+                ),
+            )
+            if verdict.is_verified:
+                logger.info(f"[{worker_id}] Flag VERIFIED from {origin.value}: {verdict.candidate}")
+            else:
+                logger.info(f"[{worker_id}] Flag candidate NOT verified ({verdict.status.value}, {origin.value}): "
+                            f"{verdict.candidate} — {'; '.join(verdict.reasons)}")
+            await board.record_flag_candidate(verdict.candidate, worker_id, "tool_output", verdict=verdict)
+
+    @staticmethod
+    def _flag_candidates_in(text: str, expected_format: str) -> List[str]:
+        """All flag-shaped values in text, in order, de-duplicated.
+
+        Combines the strict known-prefix regex with the challenge's own declared
+        expected format so an unfamiliar-but-legitimate prefix is still discovered.
+        Returning *all* candidates (never just the first) lets each one be verified
+        independently: a rejected or unsupported first match cannot mask a later,
+        genuinely supported value in the same output.
+        """
+        if not text:
+            return []
+        out: List[str] = [m.group(0).strip() for m in FLAG_REGEX.finditer(text)]
+        prefixes = expected_flag_prefixes(expected_format)
+        if prefixes:
+            for gm in GENERIC_FLAG_REGEX.finditer(text):
+                token = gm.group(0)
+                if token.split("{", 1)[0].lower() in prefixes:
+                    out.append(token)
+        return list(dict.fromkeys(c for c in out if c))
+
+    @staticmethod
+    def _action_succeeded(result: Any) -> bool:
+        """Did the producing action actually succeed? (exit 0 is not enough —
+        execution-level failures are excluded; a missing result is treated as
+        unknown and conservatively not a success.)"""
+        if result is None:
+            return False
+        failed = bool(getattr(result, "execution_failure", False))
+        status = getattr(result, "status", None)
+        if status is not None:
+            return status == "SUCCESS" and not failed
+        return getattr(result, "exit_code", None) == 0 and not failed
+
+
+    async def _apply_decoded_directives(self, raw: str, board: SwarmBlackboard, worker_id: str,
+                                        *, command: str = "", result: Any = None) -> bool:
         """Deterministically decode an artifact (HTML comment, task text) and act
         on concrete leads (headers, candidate usernames, flags).
 
         - Caches hash of input to prevent 15x duplicate decode loops on unchanged input.
         - Harvests candidate usernames and queues targeted exploit tasks.
         - Extracts header directives (e.g. 'use header "X-Dev-Access: yes"').
+        - Routes decoded flag candidates through the SAME authoritative verifier as
+          direct tool output. A decoded value inherits the *upstream* provenance: it
+          is ``DECODED_ARTIFACT`` only when the command that produced ``raw`` was a
+          real target response. Decoding a local blob proves only that it decoded —
+          the hostname appearing inside ``raw`` is NOT provenance.
         """
         if not raw or not raw.strip():
             return False
@@ -1978,17 +2249,43 @@ class SwarmOrchestrator:
                 return False
             board.processed_decode_hashes.add(raw_hash)
 
+        action_succeeded = self._action_succeeded(result)
+        local_script = local_script_path(command)
+        agent_code = is_agent_code_command(command)
+        agent_source = board.agent_source_for_command(command) if (command and local_script) else ""
+        # Provenance comes from how ``raw`` was OBTAINED (the command), never from
+        # its contents: a local file can contain a target URL and a base64 blob.
+        upstream_origin = classify_origin(command, board.target_scope,
+                                          agent_source=agent_source, agent_code=agent_code)
+        if upstream_origin == EvidenceOrigin.TARGET_RESPONSE and action_succeeded:
+            decode_origin = EvidenceOrigin.DECODED_ARTIFACT
+        elif upstream_origin == EvidenceOrigin.AGENT_CODE:
+            decode_origin = EvidenceOrigin.AGENT_CODE
+        else:
+            decode_origin = EvidenceOrigin.LOCAL_OBSERVATION
+
         acted = False
         try:
             for d in _decode_artifacts(raw):
                 decoded = d["decoded"]
                 _append_to_challenge_log(board.challenge_id, worker_id, f"🔓 {d['scheme']} decode: {decoded[:160]}")
                 # Flags hidden via an encoding inside a real captured artifact.
-                for fm in FLAG_REGEX.finditer(decoded):
-                    cand = fm.group(0).strip()
-                    if not FALSE_FLAG_PATTERNS.search(cand):
-                        await board.record_flag_candidate(cand, worker_id, "decoded_artifact")
-                        acted = True
+                for cand in self._flag_candidates_in(decoded, board.flag_pattern):
+                    if FALSE_FLAG_PATTERNS.search(cand):
+                        continue
+                    verdict = self._flag_verifier.assess(
+                        cand,
+                        source=FlagSource.TOOL_OUTPUT,
+                        command=command,
+                        action_succeeded=action_succeeded,
+                        target_scope=board.target_scope,
+                        expected_format=board.flag_pattern,
+                        agent_source=agent_source,
+                        agent_code=agent_code,
+                        origin=decode_origin,
+                    )
+                    await board.record_flag_candidate(cand, worker_id, "decoded_artifact", verdict=verdict)
+                    acted = True
 
                 # Harvest candidate usernames (e.g. 'NOTE: Jack', 'username: Jack', 'dev: Jack', 'account: Jack')
                 user_matches = re.findall(r"\b(?:user(?:name)?|developer|account|NOTE)\s*[:=\-]\s*['\"]?([A-Za-z0-9_\-\.]{3,24})", decoded, re.IGNORECASE)

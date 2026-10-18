@@ -29,7 +29,7 @@ from urllib.parse import urlsplit
 
 from backend.agent_runtime import (
     AgentRuntime, ExecResult, FlagStatus, FlagVerifier, ObservationEngine,
-    RealToolExecutor, session_manager,
+    RealToolExecutor, session_manager, EvidenceOrigin,
 )
 from backend.agent_runtime.observation import scoped_endpoint
 from backend.swarm.evidence import Evidence, EvidenceType
@@ -386,11 +386,19 @@ class SpecialistAgent:
 
             obs = engine.observe(result, st)
             # Verification from REAL fetched output — the only path to VERIFIED.
+            # This is a scoped HTTP GET to exactly the challenge origin (validated
+            # immediately above), so the output is a genuine target response. The
+            # producing command is passed so the verifier can SUBSTANTIATE the claimed
+            # target origin from execution evidence rather than trust the enum: we use
+            # the fetcher's own display command when present, otherwise the equivalent
+            # scoped, redirect-free curl command this path would have issued.
             if obs.flag_candidates:
+                fetch_command = result.command or f"curl {url}"
                 verdict = verifier.assess_observation(
-                    obs, command=result.command, action_succeeded=result.succeeded,
+                    obs, command=fetch_command, action_succeeded=result.succeeded,
                     target_scope=getattr(st, "target", ""),
-                    expected_format=getattr(st, "flag_format", ""))
+                    expected_format=getattr(st, "flag_format", ""),
+                    origin=EvidenceOrigin.TARGET_RESPONSE)
                 if verdict and verdict.status == FlagStatus.VERIFIED:
                     newly_verified = verdict.candidate
                     st.set_verified_flag(verdict.candidate)

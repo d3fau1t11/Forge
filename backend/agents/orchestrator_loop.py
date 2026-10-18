@@ -25,8 +25,19 @@ from backend.knowledge.playbook_vault import playbook_vault
 from backend.recon.turbo_recon import turbo_recon
 from backend.agents.stream_condenser import stream_condenser
 from backend.agents.strategic_planner import strategic_planner
+from backend.agent_runtime.verifier import (
+    FlagVerifier, FlagSource, FlagVerdict,
+    FALSE_FLAG_PATTERNS, classify_origin, is_agent_code_command,
+)
 
 logger = logging.getLogger("forge.orchestrator")
+
+# Candidate-discovery pattern (same strict prefix set the runtime uses). A match
+# here is only ever a *candidate*; provenance decides whether it is captured.
+_FLAG_DISCOVERY_RE = re.compile(
+    r"(?:picoCTF|FORGE|CTF|HTB|FLAG|THM)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}",
+    re.IGNORECASE,
+)
 
 # Common import-name to pip-package-name mappings
 IMPORT_TO_PACKAGE_MAP = {
@@ -57,6 +68,10 @@ class AutonomousOrchestrator:
         # verbatim for backward compatibility, and delegates only via run_with_runtime.
         self._runtime = None
         self._session_manager = None
+        # Authoritative flag verifier — the ONLY component that may promote a
+        # candidate to a captured flag in this (legacy) engine. Reused from the
+        # agent runtime so every engine shares one verification policy.
+        self._flag_verifier = FlagVerifier()
 
     # ------------------------------------------------------------------ #
     # Agent-runtime facade (Step 5). The orchestrator is becoming a thin
@@ -435,44 +450,52 @@ class AutonomousOrchestrator:
                 })
 
                 # Check if model emitted structured completion JSON: {"action": "complete", ...}
+                # A model JSON completion is an ASSERTION, never proof: it can name a
+                # fabricated flag or claim completion with no target evidence. Record any
+                # flag-shaped value as an unverified CANDIDATE and keep hunting. Never mark
+                # the challenge complete, write a verified finding, fire success learning,
+                # or broadcast FLAG_CAPTURED from here.
+                completion_claimed = False
                 try:
                     if "{" in raw_ai_output and "}" in raw_ai_output:
                         json_match = re.search(r"\{.*\}", raw_ai_output, re.DOTALL)
                         if json_match:
                             parsed_action = json.loads(json_match.group(0))
                             if isinstance(parsed_action, dict) and parsed_action.get("action") == "complete":
+                                completion_claimed = True
                                 cand_flag = parsed_action.get("flag", "")
                                 cand_proof = parsed_action.get("proof", "")
-                                found_in_json = re.findall(r"(?:picoCTF|FORGE|CTF|HTB|FLAG|THM)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}", f"{cand_flag} {cand_proof}", re.IGNORECASE)
-                                if found_in_json:
-                                    flag_str = found_in_json[0]
-                                    await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} Agent Structured Solve (Proof: {cand_proof[:100]})", history_summary)
-                                    break
-                                elif cand_proof and len(cand_proof) > 20:
-                                    # Verified proof of exploit completion
-                                    challenge.status = "COMPLETED"
-                                    challenge.progress = 100
-                                    if run:
-                                        run.status = "COMPLETED"
-                                    db.commit()
-                                    report_generator.generate_readme(db, challenge_id)
-                                    await ws_manager.broadcast({
-                                        "event": "RUN_COMPLETED",
-                                        "challenge_id": challenge_id,
-                                        "run_id": run_id,
-                                        "status": "COMPLETED",
-                                        "proof": cand_proof
-                                    })
-                                    break
+                                candidates = self._discover_flag_candidates(f"{cand_flag} {cand_proof}")
+                                for candidate in candidates:
+                                    await self._record_flag_candidate(
+                                        db, challenge_id, run_id, candidate,
+                                        f"Turn #{turn} model completion JSON assertion (unverified)")
+                                if not candidates:
+                                    logger.info(f"[Orchestrator] Model claimed completion on turn #{turn} "
+                                                f"without a flag candidate; assertion ignored, continuing.")
                 except Exception:
                     pass
+                if completion_claimed:
+                    # Model-authored completion is not verified evidence — do not execute a
+                    # command from it and do not terminate. Keep investigating.
+                    history_summary.append(
+                        f"Turn #{turn}: model asserted completion (UNVERIFIED, no capture). "
+                        f"Continue collecting target-derived evidence.")
+                    continue
 
-                # Check if model returned Flag directly in response
-                direct_flags = re.findall(r"(?:picoCTF|FORGE|CTF|HTB|FLAG|THM)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}", raw_ai_output, re.IGNORECASE)
-                if direct_flags or raw_ai_output.startswith("FLAG:"):
-                    flag_str = direct_flags[0] if direct_flags else raw_ai_output.replace("FLAG:", "").strip()
-                    await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} AI Reasoning", history_summary)
-                    break
+                # A flag in the model's PROSE is an assertion, not a captured value.
+                # Record every candidate and continue — only a verified tool-output path
+                # may complete the mission.
+                direct_candidates = self._discover_flag_candidates(raw_ai_output)
+                if direct_candidates or raw_ai_output.startswith("FLAG:"):
+                    for candidate in direct_candidates:
+                        await self._record_flag_candidate(
+                            db, challenge_id, run_id, candidate,
+                            f"Turn #{turn} model prose assertion (unverified)")
+                    history_summary.append(
+                        f"Turn #{turn}: model asserted flag candidate(s) {direct_candidates or '[unparseable]'} "
+                        f"(UNVERIFIED, no capture). Prove it with a target-derived command.")
+                    continue
 
                 if raw_ai_output.upper() == "DONE":
                     logger.info(f"AI declared mission completed without explicit flag on turn #{turn}.")
@@ -808,13 +831,50 @@ class AutonomousOrchestrator:
                 db.add(ev)
                 db.commit()
 
-                # Check for REAL Flag pattern in STDOUT/STDERR
+                # Candidate discovery from REAL tool output. A regex match is a
+                # candidate ONLY: provenance (shared FlagVerifier) decides capture.
+                # Every candidate is evaluated independently so a rejected/
+                # placeholder first match never masks a later genuine one.
                 combined_output = f"{stdout_text}\n{stderr_text}"
-                found_flags = re.findall(r"(?:picoCTF|FORGE|CTF|HTB|FLAG|THM)\{[A-Za-z0-9_!\-@#\$%\^&\*\.]+\}", combined_output, re.IGNORECASE)
+                found_flags = self._discover_flag_candidates(combined_output)
                 if found_flags:
-                    flag_str = found_flags[0]
-                    await self._record_flag_capture(db, challenge, run, challenge_id, run_id, flag_str, f"Turn #{turn} Tool `{cmd_line}` Output", history_summary)
-                    break
+                    agent_code = bool(is_python_script) or is_agent_code_command(cmd_line)
+                    agent_source = script_code if is_python_script else ""
+                    origin = classify_origin(cmd_line, target,
+                                             agent_source=agent_source, agent_code=agent_code)
+                    action_succeeded = (
+                        tool_res.exit_code == 0
+                        and not getattr(tool_res, "execution_failure", False)
+                    )
+                    captured = False
+                    for candidate in found_flags:
+                        verdict = self._flag_verifier.assess(
+                            candidate,
+                            source=FlagSource.TOOL_OUTPUT,
+                            command=cmd_line,
+                            action_succeeded=action_succeeded,
+                            target_scope=target,
+                            agent_source=agent_source,
+                            agent_code=agent_code,
+                            origin=origin,
+                        )
+                        if verdict.is_verified:
+                            if await self._record_flag_capture(
+                                    db, challenge, run, challenge_id, run_id,
+                                    verdict.candidate,
+                                    f"Turn #{turn} verified tool output ({origin.value})",
+                                    history_summary, verdict=verdict):
+                                captured = True
+                                break
+                        else:
+                            logger.info(f"[Orchestrator] Flag candidate not verified "
+                                        f"({verdict.status.value}/{origin.value}): {candidate} — "
+                                        f"{'; '.join(verdict.reasons)}")
+                            await self._record_flag_candidate(
+                                db, challenge_id, run_id, verdict.candidate,
+                                f"Turn #{turn} tool output ({origin.value}, unverified)")
+                    if captured:
+                        break
 
                 # State Checkpoint
                 checkpoint_manager.create_checkpoint(
@@ -898,8 +958,76 @@ class AutonomousOrchestrator:
         finally:
             db.close()
 
-    async def _record_flag_capture(self, db: Session, challenge, run, challenge_id: str, run_id: str, flag_str: str, source: str, history_summary: Optional[list] = None):
-        """Helper to record flag capture, mark challenge COMPLETED, and trigger Self-Learning Flywheel."""
+    @staticmethod
+    def _discover_flag_candidates(text: str) -> list:
+        """Deterministically discover flag-shaped candidates in arbitrary text.
+
+        Discovery is deliberately separate from verification: a value found here is
+        a CANDIDATE only and must be routed through :class:`FlagVerifier`. Placeholder
+        shapes (``picoCTF{...}`` etc.) are not even candidates.
+        """
+        if not text:
+            return []
+        found = [m.strip() for m in _FLAG_DISCOVERY_RE.findall(text)]
+        return list(dict.fromkeys(
+            c for c in found if c and not FALSE_FLAG_PATTERNS.search(c)))
+
+    async def _record_flag_candidate(self, db: Session, challenge_id: str, run_id: str,
+                                     candidate: str, source: str,
+                                     confidence: float = 0.3) -> None:
+        """Record an UNVERIFIED flag candidate for review — never captures a flag.
+
+        This writes candidate evidence only. It never marks the challenge completed,
+        writes a verified finding, triggers success learning, or broadcasts
+        ``FLAG_CAPTURED``.
+        """
+        if not candidate:
+            return
+        logger.info(f"[Orchestrator] Unverified flag candidate ({source}): {candidate}")
+        try:
+            db.add(EvidenceModel(
+                challenge_id=challenge_id,
+                agent="orchestrator",
+                evidence_type="flag_candidate",
+                source=source,
+                content=f"UNVERIFIED flag candidate: {candidate}",
+                confidence=confidence,
+            ))
+            db.commit()
+        except Exception as cand_err:
+            logger.debug(f"[Orchestrator] Failed to persist flag candidate: {cand_err}")
+        try:
+            await ws_manager.broadcast({
+                "event": "FLAG_CANDIDATE",
+                "challenge_id": challenge_id,
+                "run_id": run_id,
+                "candidate": candidate,
+                "source": source,
+                "verified": False,
+            })
+        except Exception as bcast_err:
+            logger.debug(f"[Orchestrator] Failed to broadcast flag candidate: {bcast_err}")
+
+    async def _record_flag_capture(self, db: Session, challenge, run, challenge_id: str, run_id: str, flag_str: str, source: str, history_summary: Optional[list] = None, *, verdict: Optional[FlagVerdict] = None) -> bool:
+        """Record flag capture — ONLY for an explicit, validated VERIFIED verdict.
+
+        This is the single completion gate for the orchestrator engine. It fails
+        closed unless it receives a :class:`FlagVerdict` whose status is VERIFIED
+        (a regex match, model assertion, exit code, or target hostname is not
+        proof). Without a VERIFIED verdict the value is retained as an unverified
+        candidate and no completion, finding, learning, or ``FLAG_CAPTURED`` event
+        is produced. The authoritative flag is always ``verdict.candidate``.
+        """
+        if verdict is None or not getattr(verdict, "is_verified", False):
+            reasons = "; ".join(verdict.reasons) if verdict is not None else "no verdict supplied"
+            logger.warning(f"[Orchestrator] Refusing flag capture for '{flag_str}' — not VERIFIED "
+                           f"({reasons}). Retained as candidate only.")
+            await self._record_flag_candidate(db, challenge_id, run_id, flag_str,
+                                              f"{source} (unverified: {reasons})")
+            return False
+
+        # The verified verdict is authoritative; ignore any caller-supplied string.
+        flag_str = verdict.candidate
         challenge.flag_status = "CAPTURED"
         challenge.flag = flag_str
         challenge.status = "COMPLETED"
@@ -965,6 +1093,7 @@ class AutonomousOrchestrator:
             "source": source,
             "duration_seconds": challenge.duration_seconds
         })
+        return True
 
     async def execute_run_step(self, db: Session, run_id: str) -> Dict[str, Any]:
         # Check Kill Switch
