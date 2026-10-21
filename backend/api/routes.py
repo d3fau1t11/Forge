@@ -30,6 +30,8 @@ from backend.privilege.manager import privilege_manager
 from backend.utils.workspace import (
     CTF_WORKSPACE_ROOT,
     is_deletable_working_dir,
+    is_valid_directory_name,
+    is_within_workspace,
     resolve_safe_working_dir,
 )
 
@@ -1482,25 +1484,43 @@ class CreateDirRequest(BaseModel):
 
 @router.get("/system/browse-dir")
 def browse_directory(path: Optional[str] = None):
-    if not path or not path.strip():
-        current_path = os.getcwd()
-    else:
+    if path and path.strip():
         current_path = os.path.abspath(path.strip())
-    
-    if not os.path.exists(current_path):
-        current_path = os.getcwd()
-
-    parent_path = os.path.dirname(current_path)
-    
-    drives = []
-    if os.name == 'nt':
-        import string
-        for letter in string.ascii_uppercase:
-            drive = f"{letter}:\\"
-            if os.path.exists(drive):
-                drives.append(drive)
     else:
-        drives = ["/"]
+        # Default to the permitted workspace root, never to os.getcwd() or the
+        # repository root.
+        current_path = CTF_WORKSPACE_ROOT
+
+    # Fail closed: reject anything that cannot be provably contained inside the
+    # workspace (traversal, cross-drive, UNC, outside-root, symlink escapes).
+    if not is_within_workspace(current_path):
+        raise HTTPException(
+            status_code=400,
+            detail="Requested path is outside the permitted CTF workspace.",
+        )
+
+    root_abs = os.path.abspath(CTF_WORKSPACE_ROOT)
+
+    if not os.path.isdir(current_path):
+        # The permitted root itself is browseable even when it has not been
+        # created yet; report it as empty instead of falling back to an
+        # unrestricted location.
+        if os.path.abspath(current_path) == root_abs:
+            return {
+                "current_path": current_path,
+                "parent_path": current_path,
+                "drives": [],
+                "directories": [],
+            }
+        raise HTTPException(status_code=404, detail="Directory not found.")
+
+    # Keep navigation information confined to the permitted workspace. At the
+    # workspace root there is no navigable parent inside the boundary, so report
+    # self (the UI disables "up" when parent_path == current_path).
+    if os.path.abspath(current_path) == root_abs:
+        parent_path = current_path
+    else:
+        parent_path = os.path.dirname(current_path)
 
     directories = []
     try:
@@ -1512,29 +1532,55 @@ def browse_directory(path: Optional[str] = None):
                 except OSError:
                     continue
     except OSError:
-        pass
+        directories = []
 
     directories.sort()
 
     return {
         "current_path": current_path,
         "parent_path": parent_path,
-        "drives": drives,
-        "directories": directories
+        "drives": [],
+        "directories": directories,
     }
 
 @router.post("/system/create-dir")
 def create_directory(req: CreateDirRequest):
-    target_path = os.path.abspath(os.path.join(req.parent_path, req.dir_name.strip()))
+    parent_path = (req.parent_path or "").strip()
+    dir_name = (req.dir_name or "").strip()
+
+    if not parent_path:
+        raise HTTPException(status_code=400, detail="parent_path is required.")
+    if not dir_name:
+        raise HTTPException(status_code=400, detail="dir_name is required.")
+    # dir_name is a single directory name, not a path: reject absolute paths,
+    # separators, traversal, and platform-invalid names.
+    if not is_valid_directory_name(dir_name):
+        raise HTTPException(status_code=400, detail="Invalid directory name.")
+    if not is_within_workspace(parent_path):
+        raise HTTPException(
+            status_code=400,
+            detail="parent_path is outside the permitted CTF workspace.",
+        )
+
+    target_path = os.path.normpath(os.path.join(parent_path, dir_name))
+    if not is_within_workspace(target_path):
+        raise HTTPException(
+            status_code=400,
+            detail="Target directory is outside the permitted CTF workspace.",
+        )
+
     try:
         os.makedirs(target_path, exist_ok=True)
-        return {"status": "SUCCESS", "created_path": target_path}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to create directory: {str(e)}")
+    except OSError:
+        logger.warning("Failed to create directory under CTF workspace: %s", target_path)
+        raise HTTPException(status_code=400, detail="Failed to create directory.")
+
+    return {"status": "SUCCESS", "created_path": target_path}
 
 @router.post("/system/select-folder-dialog")
 async def open_native_folder_dialog():
     selected_path = ""
+
     def _open_tkinter():
         nonlocal selected_path
         try:
@@ -1551,8 +1597,24 @@ async def open_native_folder_dialog():
             pass
 
     await asyncio.to_thread(_open_tkinter)
+
     if selected_path:
+        # The native dialog itself is not trusted to enforce the workspace
+        # boundary; validate the selection with the same containment policy.
+        if not is_within_workspace(selected_path):
+            return {
+                "status": "REJECTED",
+                "selected_path": "",
+                "reason": "Selected folder is outside the permitted CTF workspace.",
+            }
+        if not os.path.isdir(selected_path):
+            return {
+                "status": "REJECTED",
+                "selected_path": "",
+                "reason": "Selected folder is not a directory.",
+            }
         return {"status": "SUCCESS", "selected_path": selected_path}
+
     return {"status": "CANCELLED", "selected_path": ""}
 
 # ----------------------------------------------------

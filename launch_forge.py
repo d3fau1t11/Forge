@@ -3,11 +3,43 @@ import sys
 import subprocess
 import uvicorn
 
+from backend.config import settings
+
 if sys.stdout.encoding.lower() != 'utf-8':
     try:
         sys.stdout.reconfigure(encoding='utf-8')
     except Exception:
         pass
+
+DEFAULT_HOST = "127.0.0.1"
+LAN_HOST = "0.0.0.0"
+
+
+def is_lan_opt_in(argv=None):
+    """Return True only when LAN binding is explicitly opted into.
+
+    Explicit opt-in paths:
+      * ``--lan`` command-line flag
+      * ``FORGE_LAN=1`` environment variable (exact match only)
+
+    Missing, malformed, or any other value does NOT enable LAN binding.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--lan" in argv:
+        return True
+    return os.environ.get("FORGE_LAN") == "1"
+
+
+def resolve_host(lan_enabled: bool = False) -> str:
+    """Resolve the bind host for the Uvicorn server.
+
+    The default is loopback (127.0.0.1). LAN binding (0.0.0.0) requires an
+    explicit opt-in; a general HOST configuration never silently bypasses
+    the loopback default.
+    """
+    return LAN_HOST if lan_enabled else DEFAULT_HOST
+
 
 def free_port(port: int = 8000):
     """Frees specified port if occupied by a previous process."""
@@ -43,10 +75,14 @@ def main():
         subprocess.run([npm_cmd, "run", "build"], cwd=frontend_dir, check=True)
         print("[✓] Web portal bundle ready.")
 
-    free_port(8000)
+    port = settings.PORT
+    free_port(port)
 
-    print("[+] Launching unified FORGE server on http://localhost:8000 ...")
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=False)
+    lan_enabled = is_lan_opt_in()
+    host = resolve_host(lan_enabled)
+
+    print(f"[+] Launching unified FORGE server on http://{host}:{port} ...")
+    uvicorn.run("backend.main:app", host=host, port=port, reload=False)
 
 if __name__ == "__main__":
     main()
