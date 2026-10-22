@@ -1,13 +1,17 @@
 import os
 import logging
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import secrets
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, APIRouter, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from backend.config import settings
+from backend.api.auth import require_api_token
 from backend.database.session import init_db
 from backend.api.routes import router as api_router
 from backend.websocket.manager import ws_manager
+from backend.environment.detector import environment_detector
+from backend.providers.router import model_router
 
 log_dir = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(log_dir, exist_ok=True)
@@ -29,10 +33,18 @@ app = FastAPI(
     description="Autonomous CTF Intelligence & Exploitation Framework"
 )
 
-# Enable CORS for local Vite development frontend
+# CORS allowlist: explicit origins actually used by the frontend.
+#   * http://localhost:5173  — Vite development server
+#   * http://127.0.0.1:8000  — production: FastAPI serves the compiled portal
+#
+# `localhost` and `127.0.0.1` are NOT the same browser origin, so both are listed
+# explicitly when they are used. Credentials are enabled because the frontend
+# sends `Authorization: Bearer <token>` (an explicit credential) on protected
+# requests; the allowlist is explicit (never a wildcard) so arbitrary origins are
+# never reflected. CORS narrowing complements — it does not replace — auth.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,6 +81,17 @@ def on_startup():
     init_db()
     _mark_stale_runs_interrupted()
     logger.info(f"{settings.PROJECT_NAME} initialized and ready.")
+    # Display the active bearer token once in the local terminal so the operator
+    # can enter it into the frontend. Use `print()` (stdout) rather than the
+    # application logger so the token is NOT written to forge.log or any log file.
+    # It is printed once per backend process, not on every request.
+    print("")
+    print("=" * 65)
+    print(f" FORGE API bearer token: {settings.API_TOKEN}")
+    print(" Enter this token in the frontend connection dialog.")
+    print(" Valid for this backend process only (never stored permanently).")
+    print("=" * 65)
+    print("")
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -88,11 +111,49 @@ async def on_shutdown():
     except Exception as e:
         logger.warning(f"[Shutdown] Interactive session cleanup failed: {e}")
 
-app.include_router(api_router, prefix="/api")
+# Public, unauthenticated readiness probe. /health exposes no application data
+# (only OS/tool/budget summary) and is intentionally separated from the
+# authentication-protected /api router so startup/load-balancer probes work
+# before the operator has entered the backend token.
+public_router = APIRouter()
+
+
+@public_router.get("/health")
+def health_check():
+    env = environment_detector.detect_environment()
+    return {
+        "status": "healthy",
+        "system": env["os"],
+        "distro": env["distro"],
+        "installed_tools_count": sum(1 for t in env["installed_tools"].values() if t["installed"]),
+        "paid_models_allowed": model_router.paid_allowed,
+        "daily_budget_usd": model_router.daily_budget_usd,
+        "current_spent_usd": model_router.current_spent_usd
+    }
+
+
+app.include_router(public_router, prefix="/api")
+
+# All application-data and state-changing /api routes require the bearer token.
+# The dependency runs before any endpoint operation. /health (above) is the sole
+# public exception and is deliberately not part of this dependency list.
+app.include_router(
+    api_router,
+    prefix="/api",
+    dependencies=[Depends(require_api_token)],
+)
 
 @app.websocket("/ws/events")
 async def websocket_endpoint(websocket: WebSocket):
-    await ws_manager.connect(websocket)
+    # Authenticate before accept(): the client presents the bearer token as the
+    # WebSocket subprotocol (Sec-WebSocket-Protocol), keeping the secret out of
+    # the URL/query string and out of server access logs.
+    offered_protocol = websocket.headers.get("sec-websocket-protocol", "")
+    if not secrets.compare_digest(offered_protocol, settings.API_TOKEN):
+        # Reject without registering the socket: it can never receive broadcasts.
+        await websocket.close(code=1008, reason="Unauthorized: invalid or missing token")
+        return
+    await ws_manager.connect(websocket, subprotocol=offered_protocol)
     try:
         while True:
             data = await websocket.receive_text()

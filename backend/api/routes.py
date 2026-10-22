@@ -182,19 +182,6 @@ class UpdateProviderKeyRequest(BaseModel):
 # SYSTEM & ENVIRONMENT
 # ----------------------------------------------------
 
-@router.get("/health")
-def health_check():
-    env = environment_detector.detect_environment()
-    return {
-        "status": "healthy",
-        "system": env["os"],
-        "distro": env["distro"],
-        "installed_tools_count": sum(1 for t in env["installed_tools"].values() if t["installed"]),
-        "paid_models_allowed": model_router.paid_allowed,
-        "daily_budget_usd": model_router.daily_budget_usd,
-        "current_spent_usd": model_router.current_spent_usd
-    }
-
 @router.get("/environment")
 def get_environment():
     return environment_detector.detect_environment()

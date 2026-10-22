@@ -1,25 +1,111 @@
 // API Service Client connecting FORGE Frontend to FastAPI REST Endpoints & WebSockets
+//
+// Authentication: the backend prints one high-entropy bearer token to its local
+// terminal at startup. The operator pastes it into the connection dialog; the
+// token is kept in sessionStorage only (never localStorage, cookies, or the
+// compiled bundle) and sent as `Authorization: Bearer <token>` on every request.
 
-const API_BASE_URL = 'http://localhost:8000/api';
-const WS_BASE_URL = 'ws://localhost:8000/ws/events';
+const API_BASE_URL = '/api';
+const WS_BASE_URL = '/ws/events';
+const TOKEN_STORAGE_KEY = 'forge_api_token';
+
+type Listener = (eventData: any) => void;
+type AuthListener = () => void;
 
 export class ApiService {
   private ws: WebSocket | null = null;
-  private wsListeners: Array<(eventData: any) => void> = [];
+  private wsListeners: Array<Listener> = [];
+  private authRequiredListeners: Array<AuthListener> = [];
+  private reconnectTimer: number | null = null;
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // TOKEN MANAGEMENT (sessionStorage only)
+  // ---------------------------------------------------------------------------
+
+  /** Token printed by the backend at startup; held in sessionStorage only. */
+  public getStoredToken(): string | null {
+    if (typeof sessionStorage === 'undefined') return null;
+    return sessionStorage.getItem(TOKEN_STORAGE_KEY);
+  }
+
+  public setToken(token: string): void {
+    if (typeof sessionStorage === 'undefined') return;
+    sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+  }
+
+  public clearToken(): void {
+    if (typeof sessionStorage === 'undefined') return;
+    sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+  }
+
+  public isAuthenticated(): boolean {
+    return !!this.getStoredToken();
+  }
+
+  public onAuthRequired(fn: AuthListener): void {
+    this.authRequiredListeners.push(fn);
+  }
+
+  private notifyAuthRequired(): void {
+    this.clearToken();
+    this.stopReconnectTimer();
+    this.authRequiredListeners.forEach((fn) => fn());
+  }
+
+  private stopReconnectTimer(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // CENTRALIZED REQUEST HELPERS
+  // ---------------------------------------------------------------------------
+
+  private authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    const headers: Record<string, string> = { ...extra };
+    const token = this.getStoredToken();
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    return headers;
+  }
+
+  private async _request(url: string, init: RequestInit = {}): Promise<Response> {
+    const res = await fetch(url, {
+      ...init,
+      headers: this.authHeaders(init.headers as Record<string, string> || {}),
+    });
+    // 401 means the session token is missing/invalid. Clear it and ask the
+    // operator to re-authenticate. Never silently retry without credentials.
+    if (res.status === 401) {
+      this.notifyAuthRequired();
+    }
+    return res;
+  }
+
+  // ---------------------------------------------------------------------------
   // WEBSOCKET REAL-TIME EVENTS
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
-  public connectWebSocket(onEvent: (eventData: any) => void) {
+  public connectWebSocket(onEvent: Listener, token?: string): void {
     this.wsListeners.push(onEvent);
+    this.stopReconnectTimer();
 
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
+    // Present the token via the WebSocket subprotocol (Sec-WebSocket-Protocol)
+    // rather than a query parameter, keeping the secret out of the URL.
+    const protocols = token ? [token] : undefined;
     try {
-      this.ws = new WebSocket(WS_BASE_URL);
+      this.ws = new WebSocket(WS_BASE_URL, protocols);
+
+      this.ws.onopen = () => {
+        console.log('WebSocket connected.');
+      };
 
       this.ws.onmessage = (ev) => {
         try {
@@ -30,9 +116,16 @@ export class ApiService {
         }
       };
 
-      this.ws.onclose = () => {
-        console.log('WebSocket disconnected. Reconnecting in 3s...');
-        setTimeout(() => this.connectWebSocket(onEvent), 3000);
+      this.ws.onclose = (ev) => {
+        console.log('WebSocket disconnected.', { code: ev.code, reason: ev.reason });
+        this.ws = null;
+        // An authentication rejection (1008 policy violation) must not reconnect:
+        // surface the auth prompt instead of entering a reconnect loop.
+        if (ev.code === 1008 || /unauthorized/i.test(ev.reason || '')) {
+          this.notifyAuthRequired();
+          return;
+        }
+        this.reconnectTimer = window.setTimeout(() => this.connectWebSocket(onEvent, token), 3000);
       };
 
       this.ws.onerror = (err) => {
@@ -43,13 +136,21 @@ export class ApiService {
     }
   }
 
-  // ----------------------------------------------------
+  public disconnectWebSocket(): void {
+    this.stopReconnectTimer();
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // SYSTEM & ENVIRONMENT
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getHealth() {
     try {
-      const res = await fetch(`${API_BASE_URL}/health`);
+      const res = await this._request(`${API_BASE_URL}/health`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -60,7 +161,7 @@ export class ApiService {
 
   public async getEnvironment() {
     try {
-      const res = await fetch(`${API_BASE_URL}/environment`);
+      const res = await this._request(`${API_BASE_URL}/environment`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -68,13 +169,13 @@ export class ApiService {
     }
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // CHALLENGES
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getChallenges() {
     try {
-      const res = await fetch(`${API_BASE_URL}/challenges`);
+      const res = await this._request(`${API_BASE_URL}/challenges`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -84,7 +185,7 @@ export class ApiService {
 
   public async getChallengePlan(challengeId: string) {
     try {
-      const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/plan`);
+      const res = await this._request(`${API_BASE_URL}/challenges/${challengeId}/plan`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -107,7 +208,7 @@ export class ApiService {
     instance_expiry_minutes?: number;
     attached_file_paths?: string[];
   }) {
-    const res = await fetch(`${API_BASE_URL}/challenges`, {
+    const res = await this._request(`${API_BASE_URL}/challenges`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -120,19 +221,19 @@ export class ApiService {
     const form = new FormData();
     form.append('file', file);
     // No explicit Content-Type — the browser sets the multipart boundary.
-    const res = await fetch(`${API_BASE_URL}/challenges/upload`, { method: 'POST', body: form });
+    const res = await this._request(`${API_BASE_URL}/challenges/upload`, { method: 'POST', body: form });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async getCheckpoint(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint`);
+    const res = await this._request(`${API_BASE_URL}/challenges/${challengeId}/checkpoint`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async respondToCheckpoint(challengeId: string, text: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/checkpoint/respond`, {
+    const res = await this._request(`${API_BASE_URL}/challenges/${challengeId}/checkpoint/respond`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text })
@@ -142,30 +243,30 @@ export class ApiService {
   }
 
   public async deleteChallenge(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}`, { method: 'DELETE' });
+    const res = await this._request(`${API_BASE_URL}/challenges/${challengeId}`, { method: 'DELETE' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async deleteAllChallenges() {
-    const res = await fetch(`${API_BASE_URL}/challenges`, { method: 'DELETE' });
+    const res = await this._request(`${API_BASE_URL}/challenges`, { method: 'DELETE' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async generateReport(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/report`, { method: 'POST' });
+    const res = await this._request(`${API_BASE_URL}/challenges/${challengeId}/report`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // TARGETS
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getTargets() {
     try {
-      const res = await fetch(`${API_BASE_URL}/targets`);
+      const res = await this._request(`${API_BASE_URL}/targets`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -174,19 +275,19 @@ export class ApiService {
   }
 
   public async verifyTarget(targetId: string) {
-    const res = await fetch(`${API_BASE_URL}/targets/${targetId}/verify`, { method: 'POST' });
+    const res = await this._request(`${API_BASE_URL}/targets/${targetId}/verify`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async rediscoverTarget(targetId: string) {
-    const res = await fetch(`${API_BASE_URL}/targets/${targetId}/rediscover`, { method: 'POST' });
+    const res = await this._request(`${API_BASE_URL}/targets/${targetId}/rediscover`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async updateTargetAddress(targetId: string, newAddress: string) {
-    const res = await fetch(`${API_BASE_URL}/targets/${targetId}/address`, {
+    const res = await this._request(`${API_BASE_URL}/targets/${targetId}/address`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ new_address: newAddress })
@@ -195,24 +296,24 @@ export class ApiService {
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // RUNS & KILL SWITCH
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async startRun(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/runs/${challengeId}/start`, { method: 'POST' });
+    const res = await this._request(`${API_BASE_URL}/runs/${challengeId}/start`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async pauseChallenge(challengeId: string) {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/pause`, { method: 'POST' });
+    const res = await this._request(`${API_BASE_URL}/challenges/${challengeId}/pause`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async activateKillSwitch(runId?: string) {
-    const res = await fetch(`${API_BASE_URL}/killswitch`, {
+    const res = await this._request(`${API_BASE_URL}/killswitch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId })
@@ -221,13 +322,13 @@ export class ApiService {
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // TOOLS & EXECUTIONS
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getTools() {
     try {
-      const res = await fetch(`${API_BASE_URL}/tools`);
+      const res = await this._request(`${API_BASE_URL}/tools`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -239,7 +340,7 @@ export class ApiService {
     try {
       const params = new URLSearchParams({ limit: String(limit) });
       if (challengeId) params.set('challenge_id', challengeId);
-      const res = await fetch(`${API_BASE_URL}/tools/executions?${params.toString()}`);
+      const res = await this._request(`${API_BASE_URL}/tools/executions?${params.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -249,7 +350,7 @@ export class ApiService {
 
   public async getAgents() {
     try {
-      const res = await fetch(`${API_BASE_URL}/agents`);
+      const res = await this._request(`${API_BASE_URL}/agents`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -258,7 +359,7 @@ export class ApiService {
   }
 
   public async executeTerminalCommand(command: string, challengeId?: string) {
-    const res = await fetch(`${API_BASE_URL}/terminal/execute`, {
+    const res = await this._request(`${API_BASE_URL}/terminal/execute`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command, challenge_id: challengeId })
@@ -267,13 +368,13 @@ export class ApiService {
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // PRIVILEGE MANAGER
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getPendingPrivileges() {
     try {
-      const res = await fetch(`${API_BASE_URL}/privilege/pending`);
+      const res = await this._request(`${API_BASE_URL}/privilege/pending`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -282,7 +383,7 @@ export class ApiService {
   }
 
   public async sendPrivilegeDecision(auditId: string, approved: boolean) {
-    const res = await fetch(`${API_BASE_URL}/privilege/decision`, {
+    const res = await this._request(`${API_BASE_URL}/privilege/decision`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ audit_id: auditId, approved })
@@ -291,13 +392,13 @@ export class ApiService {
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // PROVIDERS & EVIDENCE
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getProviders() {
     try {
-      const res = await fetch(`${API_BASE_URL}/providers/health`);
+      const res = await this._request(`${API_BASE_URL}/providers/health`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -307,7 +408,7 @@ export class ApiService {
 
   public async getEvidence() {
     try {
-      const res = await fetch(`${API_BASE_URL}/evidence`);
+      const res = await this._request(`${API_BASE_URL}/evidence`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -317,7 +418,7 @@ export class ApiService {
 
   public async getFindings() {
     try {
-      const res = await fetch(`${API_BASE_URL}/findings`);
+      const res = await this._request(`${API_BASE_URL}/findings`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -325,13 +426,13 @@ export class ApiService {
     }
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // SYSTEM SETTINGS MANAGEMENT
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getSystemSettings() {
     try {
-      const res = await fetch(`${API_BASE_URL}/system/settings`);
+      const res = await this._request(`${API_BASE_URL}/system/settings`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -348,7 +449,7 @@ export class ApiService {
   }
 
   public async updateSystemSettings(data: any) {
-    const res = await fetch(`${API_BASE_URL}/system/settings`, {
+    const res = await this._request(`${API_BASE_URL}/system/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -357,12 +458,12 @@ export class ApiService {
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // PACKAGE INSTALLATION & PRIVILEGE APPROVALS
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async installPackage(requestId: string, packageName: string, challengeId?: string) {
-    const res = await fetch(`${API_BASE_URL}/package/install`, {
+    const res = await this._request(`${API_BASE_URL}/package/install`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -376,7 +477,7 @@ export class ApiService {
   }
 
   public async skipPackageInstall(requestId: string, challengeId?: string) {
-    const res = await fetch(`${API_BASE_URL}/package/skip`, {
+    const res = await this._request(`${API_BASE_URL}/package/skip`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -389,7 +490,7 @@ export class ApiService {
   }
 
   public async approvePrivilege(requestId: string, command: string, sudoPassword?: string, challengeId?: string, workingDirectory?: string) {
-    const res = await fetch(`${API_BASE_URL}/privilege/approve`, {
+    const res = await this._request(`${API_BASE_URL}/privilege/approve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -405,7 +506,7 @@ export class ApiService {
   }
 
   public async rejectPrivilege(requestId: string, challengeId?: string) {
-    const res = await fetch(`${API_BASE_URL}/privilege/reject`, {
+    const res = await this._request(`${API_BASE_URL}/privilege/reject`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -417,14 +518,14 @@ export class ApiService {
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // DIRECTORY BROWSER & FOLDER PICKER
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async browseDirectory(path?: string) {
     try {
       const url = path ? `${API_BASE_URL}/system/browse-dir?path=${encodeURIComponent(path)}` : `${API_BASE_URL}/system/browse-dir`;
-      const res = await fetch(url);
+      const res = await this._request(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -438,7 +539,7 @@ export class ApiService {
   }
 
   public async createDirectory(parent_path: string, dir_name: string) {
-    const res = await fetch(`${API_BASE_URL}/system/create-dir`, {
+    const res = await this._request(`${API_BASE_URL}/system/create-dir`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ parent_path, dir_name })
@@ -449,7 +550,7 @@ export class ApiService {
 
   public async selectFolderDialog() {
     try {
-      const res = await fetch(`${API_BASE_URL}/system/select-folder-dialog`, { method: 'POST' });
+      const res = await this._request(`${API_BASE_URL}/system/select-folder-dialog`, { method: 'POST' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -459,14 +560,14 @@ export class ApiService {
 
   public async getSystemRequirements() {
     const urlsToTry = [
-      '/api/system/requirements',
+      `${API_BASE_URL}/system/requirements`,
       'http://127.0.0.1:8000/api/system/requirements',
       'http://localhost:8000/api/system/requirements'
     ];
 
     for (const url of urlsToTry) {
       try {
-        const res = await fetch(url);
+        const res = await this._request(url);
         if (res.ok) {
           return await res.json();
         }
@@ -495,7 +596,7 @@ export class ApiService {
         ram_gb: ram
       },
       system_requirements: [
-        { requirement: "FastAPI Backend Server (Port 8000)", status: "FAIL", details: "Connection Refused on http://127.0.0.1:8000", impact: "Start FastAPI backend server with `py -m uvicorn backend.main:app --port 8000`" },
+        { requirement: "FastAPI Backend Server (Port 8000)", status: "FAIL", details: "Connection Refused on http://127.0.0.1:8000", impact: "Start FastAPI backend server with py -m uvicorn backend.main:app --port 8000" },
         { requirement: "Python 3.10+ Runtime Environment", status: "PASS", details: "Detected via host configuration", impact: "Core backend execution requires Python 3.10+." },
         { requirement: "Host Physical RAM Memory", status: "PASS", details: `${ram} GB Client RAM`, impact: "4.0 GB+ recommended." },
         { requirement: "CPU Processing Cores", status: "PASS", details: `${cores} Cores Detected`, impact: "2+ cores recommended." }
@@ -511,7 +612,7 @@ export class ApiService {
   }
 
   public async parseProviderSnippet(snippet: string) {
-    const res = await fetch(`${API_BASE_URL}/providers/parse-snippet`, {
+    const res = await this._request(`${API_BASE_URL}/providers/parse-snippet`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ snippet })
@@ -528,7 +629,7 @@ export class ApiService {
     base_url?: string;
     test_connection?: boolean;
   }) {
-    const res = await fetch(`${API_BASE_URL}/providers/register-snippet`, {
+    const res = await this._request(`${API_BASE_URL}/providers/register-snippet`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -543,7 +644,7 @@ export class ApiService {
     model_id?: string;
     base_url?: string;
   }) {
-    const res = await fetch(`${API_BASE_URL}/providers/update-key`, {
+    const res = await this._request(`${API_BASE_URL}/providers/update-key`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -552,13 +653,13 @@ export class ApiService {
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // PLAYBOOK VAULT
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getPlaybooks() {
     try {
-      const res = await fetch(`${API_BASE_URL}/playbooks`);
+      const res = await this._request(`${API_BASE_URL}/playbooks`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -568,7 +669,7 @@ export class ApiService {
 
   public async searchPlaybooks(query: string, category?: string) {
     try {
-      const res = await fetch(`${API_BASE_URL}/playbooks/search`, {
+      const res = await this._request(`${API_BASE_URL}/playbooks/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, category, top_k: 10, include_unpromoted: true })
@@ -586,7 +687,7 @@ export class ApiService {
     source_type?: string;
     title?: string;
   }) {
-    const res = await fetch(`${API_BASE_URL}/playbooks/ingest`, {
+    const res = await this._request(`${API_BASE_URL}/playbooks/ingest`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -598,13 +699,13 @@ export class ApiService {
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // KNOWLEDGE COVERAGE
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getKnowledgeCoverage() {
     try {
-      const res = await fetch(`${API_BASE_URL}/knowledge/coverage`);
+      const res = await this._request(`${API_BASE_URL}/knowledge/coverage`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -612,9 +713,9 @@ export class ApiService {
     }
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // EXPERIENCE MEMORY (FORGE-learned experience layer)
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   public async getMemory(category?: string, outcome?: string) {
     try {
@@ -622,7 +723,7 @@ export class ApiService {
       if (category && category !== 'ALL') params.set('category', category.toLowerCase());
       if (outcome && outcome !== 'ALL') params.set('outcome', outcome.toLowerCase());
       const qs = params.toString();
-      const res = await fetch(`${API_BASE_URL}/memory${qs ? `?${qs}` : ''}`);
+      const res = await this._request(`${API_BASE_URL}/memory${qs ? `?${qs}` : ''}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -631,14 +732,14 @@ export class ApiService {
   }
 
   public async getMemoryDetail(experienceId: string) {
-    const res = await fetch(`${API_BASE_URL}/memory/${experienceId}`);
+    const res = await this._request(`${API_BASE_URL}/memory/${experienceId}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
 
   public async searchMemory(query: string, category?: string) {
     try {
-      const res = await fetch(`${API_BASE_URL}/memory/search`, {
+      const res = await this._request(`${API_BASE_URL}/memory/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, category: category && category !== 'ALL' ? category.toLowerCase() : undefined, top_k: 10 })
@@ -651,7 +752,7 @@ export class ApiService {
   }
 
   public async sendMemoryFeedback(experienceId: string, success: boolean, note?: string) {
-    const res = await fetch(`${API_BASE_URL}/memory/${experienceId}/feedback`, {
+    const res = await this._request(`${API_BASE_URL}/memory/${experienceId}/feedback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ success, note: note || '' })
@@ -660,15 +761,13 @@ export class ApiService {
     return await res.json();
   }
 
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
   // WRITEUP / REPORT (AI-authored from real run telemetry)
-  // ----------------------------------------------------
+  // ---------------------------------------------------------------------------
 
-  // Preview: AI-crafted (Gemini-first) technical writeup. NOT saved to disk.
-  // May take several seconds while the provider chain authors it.
   public async getWriteup(challengeId: string): Promise<{ content: string; generated_by: string }> {
     try {
-      const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/writeup`);
+      const res = await this._request(`${API_BASE_URL}/challenges/${challengeId}/writeup`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -676,9 +775,8 @@ export class ApiService {
     }
   }
 
-  // Persist the operator-confirmed writeup into the challenge working folder.
   public async saveWriteup(challengeId: string, content: string): Promise<{ status: string; file_path: string }> {
-    const res = await fetch(`${API_BASE_URL}/challenges/${challengeId}/writeup/save`, {
+    const res = await this._request(`${API_BASE_URL}/challenges/${challengeId}/writeup/save`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content })

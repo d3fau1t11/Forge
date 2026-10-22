@@ -120,20 +120,36 @@ export default function App() {
   const [rootRequests, setRootRequests] = useState<RootPermissionRequest[]>([]);
   const [knowledgeRefreshTrigger, setKnowledgeRefreshTrigger] = useState(0);
 
-  useEffect(() => {
+  // ---------------------------------------------------------------------------
+  // LOCAL API AUTHENTICATION
+  // ---------------------------------------------------------------------------
+  // The backend prints one bearer token to its terminal at startup. The operator
+  // pastes it here; it is held in sessionStorage by apiService and sent on every
+  // protected request and as the WebSocket subprotocol.
+  const [authenticated, setAuthenticated] = useState<boolean>(false);
+  const [authToken, setAuthToken] = useState<string>('');
+
+  const handleAuthConnect = () => {
+    const token = authToken.trim();
+    if (!token) return;
+    apiService.setToken(token);
+    setAuthenticated(true);
     fetchBackendData();
+    connectLiveWebSocket(token);
+  };
 
-    // Setup live WebSocket listener
-    let ws: WebSocket | null = null;
+  const clearAuth = () => {
+    apiService.clearToken();
+    apiService.disconnectWebSocket();
+    setAuthenticated(false);
+  };
+
+  // WebSocket message handler (extracted so it can be reused by the centralized
+  // apiService WebSocket connection, which presents the bearer token as the
+  // subprotocol).
+  const handleWSMessage = (data: any) => {
     try {
-      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsHost = window.location.host || 'localhost:8000';
-      ws = new WebSocket(`${wsProtocol}//${wsHost}/ws/events`);
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.event === 'RUN_STARTED') {
+      if (data.event === 'RUN_STARTED') {
             setChallenges((prev) =>
               prev.map((c) => (c.id === data.challenge_id ? { ...c, status: 'RUNNING' } : c))
             );
@@ -412,13 +428,33 @@ export default function App() {
           console.error('WS Parse Error', err);
         }
       };
-    } catch (e) {
-      console.log('WS Connection notice: local fallback mode active.');
-    }
 
-    return () => {
-      if (ws) ws.close();
-    };
+    // Live WebSocket connection is managed centrally by apiService (which
+    // presents the bearer token as the subprotocol). It is started by the
+    // lifecycle effect below once the operator is authenticated.
+
+  // ---------------------------------------------------------------------------
+  // AUTHENTICATION & WEBSOCKET LIFECYCLE
+  // ---------------------------------------------------------------------------
+
+  const connectLiveWebSocket = (token: string) => {
+    apiService.connectWebSocket(handleWSMessage, token);
+  };
+
+  useEffect(() => {
+    // Surface the auth prompt whenever a protected request/WS is rejected (401).
+    apiService.onAuthRequired(() => {
+      clearAuth();
+    });
+
+    // On mount: resume an existing session from sessionStorage, otherwise show
+    // the token-entry dialog.
+    const stored = apiService.getStoredToken();
+    if (stored) {
+      setAuthenticated(true);
+      fetchBackendData();
+      connectLiveWebSocket(stored);
+    }
   }, []);
 
   const fetchBackendData = async () => {
@@ -649,7 +685,7 @@ export default function App() {
     setKillSwitchActive(true);
     setShowModalKillSwitch(true);
     try {
-      await fetch('/api/killswitch', { method: 'POST' });
+      await apiService.activateKillSwitch();
     } catch (e) {
       console.log('Kill switch triggered locally');
     }
@@ -915,6 +951,45 @@ export default function App() {
         onApprove={handleApproveRoot}
         onDismiss={handleDismissRoot}
       />
+
+      {/* 7. Local API authentication dialog (shown until the operator enters the
+          bearer token printed by the backend terminal). */}
+      {!authenticated && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+          <div className="bg-[#06090e] border-2 border-cyber-amber/50 text-slate-100 rounded-xl p-8 w-full max-w-md shadow-[0_0_40px_rgba(245,158,11,0.25)]">
+            <div className="flex items-center space-x-2 mb-2">
+              <AlertTriangle className="w-5 h-5 text-cyber-amber" />
+              <h2 className="font-bold text-cyber-amber uppercase tracking-wider text-sm">FORGE — Local Access</h2>
+            </div>
+            <p className="text-slate-300 text-sm mb-6">
+              The backend requires a bearer token. Enter the token printed in the
+              local backend terminal at startup (valid for this process only).
+            </p>
+            <div className="space-y-3">
+              <label className="block text-xs text-slate-400 uppercase tracking-wider">API bearer token</label>
+              <input
+                type="password"
+                value={authToken}
+                onChange={(e) => setAuthToken(e.target.value)}
+                placeholder="Paste the backend token here"
+                className="w-full bg-slate-900/50 border border-slate-600 rounded px-3 py-2 text-slate-100 focus:outline-none focus:border-cyber-amber"
+                onKeyDown={(e) => e.key === 'Enter' && handleAuthConnect()}
+              />
+              <button
+                onClick={handleAuthConnect}
+                disabled={!authToken.trim()}
+                className="w-full bg-cyber-amber text-[#06090e] font-bold py-2.5 rounded hover:bg-cyber-amber/90 disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                Connect to Backend
+              </button>
+            </div>
+            <p className="text-xs text-slate-500 mt-4">
+              Token is held in session memory for this tab only and is never
+              stored permanently or sent to any third party.
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

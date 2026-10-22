@@ -1,4 +1,5 @@
 import os
+import secrets
 from dotenv import load_dotenv
 
 # Load .env file explicitly
@@ -15,6 +16,12 @@ try:
         HOST: str = "127.0.0.1"
         PORT: int = 8000
         SECRET_KEY: str = "forge-secret-key-change-in-production"
+
+        # API authentication bearer token — one high-entropy token per backend
+        # process, generated at startup with `secrets` unless the operator
+        # explicitly configures FORGE_API_TOKEN. It is NEVER derived from the
+        # insecure SECRET_KEY placeholder above.
+        API_TOKEN: str = os.getenv("FORGE_API_TOKEN") or secrets.token_urlsafe(32)
         
         # Database
         DATABASE_URL: str = "sqlite:///./forge.db"
@@ -94,6 +101,10 @@ except ImportError:
             self.HOST = os.getenv("HOST", "127.0.0.1")
             self.PORT = int(os.getenv("PORT", 8000))
             self.SECRET_KEY = os.getenv("SECRET_KEY", "forge-secret-key")
+            # API authentication bearer token: explicit FORGE_API_TOKEN wins,
+            # otherwise one high-entropy token per backend process. Never derived
+            # from the insecure SECRET_KEY placeholder.
+            self.API_TOKEN = os.getenv("FORGE_API_TOKEN") or secrets.token_urlsafe(32)
             self.DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./forge.db")
             self.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
             self.NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")

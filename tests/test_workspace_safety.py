@@ -18,6 +18,11 @@ import pytest
 
 sys.path.insert(0, os.path.abspath("."))
 
+# Deterministic bearer token for the TestClient-based endpoint tests. Set before
+# importing backend.api.routes so settings.API_TOKEN is predictable.
+TEST_TOKEN = "workspace-safety-test-token"
+os.environ["FORGE_API_TOKEN"] = TEST_TOKEN
+
 from backend.utils.workspace import (
     CTF_WORKSPACE_ROOT,
     PROJECT_ROOT,
@@ -209,13 +214,18 @@ def _patch_workspace(root: str):
 
 
 def _make_client(root: str):
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Depends
     from fastapi.testclient import TestClient
     from backend.api import routes
+    from backend.api.auth import require_api_token
+    from backend.config import settings
+
+    # Keep the deterministic token for the duration of the test.
+    settings.API_TOKEN = TEST_TOKEN
 
     app = FastAPI()
-    app.include_router(routes.router)
-    return TestClient(app)
+    app.include_router(routes.router, dependencies=[Depends(require_api_token)])
+    return TestClient(app, headers={"Authorization": f"Bearer {TEST_TOKEN}"})
 
 
 def _mock_dialog(monkeypatch, path_or_none):

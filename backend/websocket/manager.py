@@ -1,4 +1,4 @@
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 from fastapi import WebSocket
 
 class ConnectionManager:
@@ -7,8 +7,10 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
+    async def connect(self, websocket: WebSocket, subprotocol: Optional[str] = None):
+        """Accept the connection (only after the caller has authenticated it) and
+        register the socket so it can receive broadcasts."""
+        await websocket.accept(subprotocol=subprotocol)
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
