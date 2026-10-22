@@ -73,3 +73,5 @@ frontend/.vite/
 .idea/
 .DS_Store
 Thumbs.db
+AGENTS.md
+/docs/forge
