@@ -1,3 +1,6 @@
+# Temporary/test files (moved to tmp/ directory)
+tmp/
+
 # Python
 __pycache__/
 *.py[cod]
