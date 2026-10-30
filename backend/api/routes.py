@@ -1392,27 +1392,81 @@ class PrivilegeRejectRequest(BaseModel):
 
 @router.post("/privilege/approve")
 async def approve_privilege_execution(req: PrivilegeApprovalRequest):
-    """Executes an approved root/superuser command on behalf of the operator."""
+    """Approves a pending root/superuser request (Fix 04B, server-authoritative).
+
+    Only the command stored server-side with the pending request is executed —
+    the client's ``command`` field is advisory and ignored. The request ID is
+    single-use and expires with the orchestrator's approval wait, so unknown,
+    expired, already-resolved or concurrently duplicated approvals fail closed
+    without executing anything. An operator sudo password (if supplied) is fed
+    to ``sudo -S`` through stdin by the execution layer; it is never
+    interpolated into the shell line and never logged.
+    """
     import logging
     from backend.agents.orchestrator_loop import orchestrator_loop
     from backend.tools.manager import tool_manager
 
     logger = logging.getLogger("forge.privilege")
-    cmd = req.command.strip()
-    logger.info(f"Operator approved root elevation for command: {cmd}")
 
+    pending = await orchestrator_loop.take_root_request(req.request_id)
+    if pending is None:
+        logger.warning(
+            "Privilege approval fail-closed for request %s: unknown, expired, "
+            "already resolved or concurrently consumed", req.request_id)
+        await ws_manager.broadcast({
+            "event": "ROOT_PERMISSION_RESULT",
+            "request_id": req.request_id,
+            "challenge_id": req.challenge_id,
+            "success": False,
+            "output": "Root permission request is unknown, expired, or already resolved."
+        })
+        return {"status": "NOT_PENDING", "request_id": req.request_id}
+
+    # The server-bound command is the only execution source. It is prefixed
+    # with `sudo ` exactly like the pre-fix flow (operator approval semantics:
+    # "run this command elevated"); no client data enters this string.
+    command = str(pending.get("command") or "").strip()
+    command = command if command.startswith("sudo ") else f"sudo {command}"
+
+    stdin_data = None
     if req.sudo_password:
-        elevated_cmd = f"echo {req.sudo_password} | sudo -S {cmd.removeprefix('sudo ').strip()}"
-    elif not cmd.startswith("sudo"):
-        elevated_cmd = f"sudo {cmd}"
-    else:
-        elevated_cmd = cmd
+        # Safe password channel: `sudo -S` reads the password from stdin via
+        # the execution layer's one-shot stdin feed (scripted-input API). The
+        # password never enters the command string, so shell metacharacters in
+        # it cannot alter the executed command. It is not logged anywhere.
+        command = "sudo -S " + command[len("sudo "):].strip()
+        stdin_data = req.sudo_password + "\n"
 
-    tool_res = await tool_manager.execute_raw_command(
-        command=elevated_cmd,
-        cwd=req.working_directory,
-        timeout_seconds=120
-    )
+    logger.info(
+        "Executing operator-approved privileged request %s (cwd=%s)",
+        req.request_id, pending.get("working_directory"))
+
+    try:
+        tool_res = await tool_manager.execute_raw_command(
+            command=command,
+            cwd=pending.get("working_directory"),
+            timeout_seconds=120,
+            stdin=stdin_data,
+        )
+    except Exception as exec_err:
+        # Transport-level failure after approval: fail closed — nothing was
+        # executed by this endpoint, and the waiting agent is released with a
+        # denial instead of hanging to its timeout. The password is never part
+        # of any message here.
+        logger.error(
+            "Approved privilege execution failed for request %s: %s",
+            req.request_id, exec_err)
+        orchestrator_loop.resolve_root_request(
+            request_id=req.request_id, success=False,
+            message="Approved privileged execution failed and was not run.")
+        await ws_manager.broadcast({
+            "event": "ROOT_PERMISSION_RESULT",
+            "request_id": req.request_id,
+            "challenge_id": req.challenge_id,
+            "success": False,
+            "output": "Approved privileged execution failed (transport error); nothing was executed."
+        })
+        return {"status": "FAILED", "request_id": req.request_id}
 
     await ws_manager.broadcast({
         "event": "ROOT_PERMISSION_RESULT",
@@ -1438,16 +1492,17 @@ async def approve_privilege_execution(req: PrivilegeApprovalRequest):
 
 @router.post("/privilege/reject")
 async def reject_privilege_execution(req: PrivilegeRejectRequest):
-    """Operator rejected root execution for a command."""
+    """Operator rejected root execution (Fix 04B: also releases the pending
+    server-authoritative record so a rejected request can never be approved
+    afterwards)."""
     import logging
     from backend.agents.orchestrator_loop import orchestrator_loop
 
     logger = logging.getLogger("forge.privilege")
     logger.info(f"Operator rejected root elevation for request: {req.request_id}")
 
-    orchestrator_loop.resolve_root_request(
+    orchestrator_loop.reject_root_request(
         request_id=req.request_id,
-        success=False,
         message="Root permission rejected by operator."
     )
 
