@@ -32,6 +32,12 @@ from backend.agent_runtime.verifier import (
 
 logger = logging.getLogger("forge.orchestrator")
 
+# Operator approval for privileged commands is server-authoritative: a pending
+# request record expires after this TTL, which matches the orchestrator's own
+# ROOT_PERMISSION_REQUEST operator-approval wait (120s below), so a stale
+# approval can never outlive the request it belongs to.
+ROOT_REQUEST_TTL_SECONDS = 120
+
 # Candidate-discovery pattern (same strict prefix set the runtime uses). A match
 # here is only ever a *candidate*; provenance decides whether it is captured.
 _FLAG_DISCOVERY_RE = re.compile(
@@ -61,6 +67,12 @@ class AutonomousOrchestrator:
         # Tracks pending root/privilege requests: request_id -> asyncio.Event
         self._root_events: dict[str, asyncio.Event] = {}
         self._root_results: dict[str, dict] = {}
+        # Server-authoritative pending privilege requests (Fix 04B): the ONLY
+        # trusted source for what an operator approval may execute. Entries are
+        # single-use, expire after ROOT_REQUEST_TTL_SECONDS and are consumed
+        # atomically relative to concurrent approval attempts.
+        self._pending_root_requests: dict[str, dict] = {}
+        self._pending_root_lock: asyncio.Lock = asyncio.Lock()
         # ── Agent-runtime facade (Step 5) ──────────────────────────────────────
         # The new HERMES-inspired runtime owns canonical session/trajectory state.
         # These are lazily bound so importing the orchestrator never forces the
@@ -147,15 +159,78 @@ class AutonomousOrchestrator:
             event.set()
 
     def resolve_root_request(self, request_id: str, success: bool, tool_res: Optional[Any] = None, message: str = ""):
-        """Called by the API route when operator approves or denies root execution."""
+        """Called by the API route when operator approves or denies root execution.
+
+        Resolution is discarded when no agent is waiting on this request ID
+        (unknown, already resolved, or already timed out) so a stale
+        resolution can never be read by a later or different request."""
+        event = self._root_events.get(request_id)
+        if event is None:
+            return
         self._root_results[request_id] = {
             "success": success,
             "tool_res": tool_res,
             "message": message
         }
-        event = self._root_events.get(request_id)
-        if event:
-            event.set()
+        event.set()
+
+    def register_root_request(
+        self,
+        command: str,
+        challenge_id: Optional[str] = None,
+        working_directory: Optional[str] = None,
+        ttl_seconds: Optional[float] = None,
+    ) -> str:
+        """Create the server-authoritative pending privilege record (Fix 04B).
+
+        The returned request_id is bound to exactly this command for
+        ``ROOT_REQUEST_TTL_SECONDS`` (the same bound as the orchestrator's
+        operator-approval wait). Operators approve THIS command; whether the
+        client echoes a different command or not changes nothing.
+
+        ``ttl_seconds`` defaults to ROOT_REQUEST_TTL_SECONDS; test code may
+        shorten it to exercise expiry deterministically.
+        """
+        request_id = str(uuid.uuid4())
+        now = time.time()
+        self._root_events[request_id] = asyncio.Event()
+        self._pending_root_requests[request_id] = {
+            "command": command,
+            "challenge_id": challenge_id,
+            "working_directory": working_directory,
+            "created_at": now,
+            "expires_at": now + (ttl_seconds if ttl_seconds is not None else ROOT_REQUEST_TTL_SECONDS),
+        }
+        return request_id
+
+    async def take_root_request(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Atomically consume a pending privilege request (Fix 04B).
+
+        Single-use and fail-closed: returns the server-stored record exactly
+        once per request_id, or None when the request is unknown, expired, or
+        already consumed. A concurrent duplicate attempt therefore cannot
+        execute the command twice; the expired branch also immediately
+        unblocks a still-waiting agent with success=False (never executes).
+        """
+        async with self._pending_root_lock:
+            pending = self._pending_root_requests.pop(request_id, None)
+        if pending is None:
+            return None
+        if time.time() > float(pending.get("expires_at") or 0):
+            self.resolve_root_request(
+                request_id, success=False, message="Root permission request expired before approval.")
+            return None
+        return pending
+
+    def reject_root_request(self, request_id: str, message: str = "") -> bool:
+        """Reject a pending privilege request; releases any waiting agent with
+        success=False (never executes). Returns False for unknown, expired or
+        already-consumed request IDs — those are never re-resolved."""
+        pending = self._pending_root_requests.pop(request_id, None)
+        if pending is None:
+            return False
+        self.resolve_root_request(request_id, success=False, message=message or "rejected")
+        return True
 
     @staticmethod
     def _snapshot_dir(dir_path: str) -> dict:
@@ -663,70 +738,72 @@ class AutonomousOrchestrator:
                 )
 
                 if needs_root_elevation and not is_python_script:
-                    # Auto-elevate with sudo if challenge.requires_root is enabled
-                    if getattr(challenge, "requires_root", False):
-                        logger.info(f"Challenge has requires_root=True enabled. Auto-elevating command with sudo: {cmd_line}")
-                        sudo_cmd = cmd_line if cmd_line.startswith("sudo ") else f"sudo {cmd_line}"
-                        cmd_elev_start = time.time()
-                        tool_res = await tool_manager.execute_raw_command(
-                            command=sudo_cmd,
-                            cwd=challenge.working_directory,
-                            timeout_seconds=120
-                        )
-                        cmd_duration_ms += int((time.time() - cmd_elev_start) * 1000)
-                        stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
-                        stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
-                        log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Auto-elevated root execution completed."
-                    else:
-                        root_request_id = str(uuid.uuid4())
-                        root_reason = "This command requires elevated root / superuser privileges to execute."
-                        error_snippet = (stderr_text or stdout_text).strip()[-300:]
-                        logger.info(f"Command '{cmd_line}' requires root/sudo privileges. Requesting user approval [ID: {root_request_id}].")
+                    # requires_root=True is challenge metadata, NOT operator
+                    # authorization. It must never auto-elevate: every detected
+                    # root requirement is routed through the operator-approval
+                    # flow below (ROOT_PERMISSION_REQUEST / resolve_root_request).
+                    # Server-authoritative pending record (Fix 04B): the exact
+                    # command, challenge and working directory are stored
+                    # server-side; /privilege/approve executes this bound
+                    # command, no matter what any client submits.
+                    root_request_id = self.register_root_request(
+                        command=cmd_line,
+                        challenge_id=challenge_id,
+                        working_directory=challenge.working_directory,
+                    )
+                    root_reason = "This command requires elevated root / superuser privileges to execute."
+                    error_snippet = (stderr_text or stdout_text).strip()[-300:]
+                    logger.info(f"Command '{cmd_line}' requires root/sudo privileges. Requesting user approval [ID: {root_request_id}].")
 
-                        await ws_manager.broadcast({
-                            "event": "ROOT_PERMISSION_REQUEST",
-                            "request_id": root_request_id,
-                            "challenge_id": challenge_id,
-                            "challenge_name": challenge.name,
-                            "command": cmd_line,
-                            "reason": root_reason,
-                            "error_snippet": error_snippet,
-                            "timestamp": datetime.utcnow().strftime("%H:%M:%S")
-                        })
+                    await ws_manager.broadcast({
+                        "event": "ROOT_PERMISSION_REQUEST",
+                        "request_id": root_request_id,
+                        "challenge_id": challenge_id,
+                        "challenge_name": challenge.name,
+                        "command": cmd_line,
+                        "reason": root_reason,
+                        "error_snippet": error_snippet,
+                        "timestamp": datetime.utcnow().strftime("%H:%M:%S")
+                    })
 
-                        root_event = asyncio.Event()
-                        self._root_events[root_request_id] = root_event
-                        try:
-                            await asyncio.wait_for(root_event.wait(), timeout=120)
-                            res = self._root_results.get(root_request_id, {})
-                            if res.get("success"):
-                                logger.info(f"Root permission approved for '{cmd_line}'.")
-                                if res.get("tool_res"):
-                                    tool_res = res["tool_res"]
-                                else:
-                                    sudo_cmd = cmd_line if cmd_line.startswith("sudo ") else f"sudo {cmd_line}"
-                                    cmd_elev_start = time.time()
-                                    tool_res = await tool_manager.execute_raw_command(
-                                        command=sudo_cmd,
-                                        cwd=challenge.working_directory,
-                                        timeout_seconds=120
-                                    )
-                                    cmd_duration_ms += int((time.time() - cmd_elev_start) * 1000)
-                                stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
-                                stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
-                                log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Elevated execution completed."
+                    # Reuse the event that register_root_request already stored
+                    # for this request. The operator's resolve_root_request sets
+                    # THAT event, so an approval landing during the broadcast
+                    # yield above is observed instead of being overwritten by a
+                    # fresh (never-set) event and lost to a timeout.
+                    root_event = self._root_events[root_request_id]
+                    try:
+                        await asyncio.wait_for(root_event.wait(), timeout=120)
+                        res = self._root_results.get(root_request_id, {})
+                        if res.get("success"):
+                            logger.info(f"Root permission approved for '{cmd_line}'.")
+                            if res.get("tool_res"):
+                                tool_res = res["tool_res"]
                             else:
-                                logger.warning(f"Root permission was rejected/denied by operator for '{cmd_line}'.")
-                                stdout_text = ""
-                                stderr_text = f"[ACCESS DENIED] Root/sudo permission was rejected by the operator for: {cmd_line}. Please pivot to an unprivileged user-space alternative."
-                                log_output = stderr_text
-                        except asyncio.TimeoutError:
-                            logger.warning(f"Root approval request timed out for '{cmd_line}'.")
-                            stderr_text = f"[TIMEOUT] Root permission request timed out after 120s. Please pivot to an unprivileged user-space alternative."
+                                sudo_cmd = cmd_line if cmd_line.startswith("sudo ") else f"sudo {cmd_line}"
+                                cmd_elev_start = time.time()
+                                tool_res = await tool_manager.execute_raw_command(
+                                    command=sudo_cmd,
+                                    cwd=challenge.working_directory,
+                                    timeout_seconds=120
+                                )
+                                cmd_duration_ms += int((time.time() - cmd_elev_start) * 1000)
+                            stdout_text = tool_res.stdout[:3000] if tool_res.stdout else ""
+                            stderr_text = tool_res.stderr[:1000] if tool_res.stderr else ""
+                            log_output = stdout_text or stderr_text or f"[Return Code {tool_res.exit_code}] Elevated execution completed."
+                        else:
+                            logger.warning(f"Root permission was rejected/denied by operator for '{cmd_line}'.")
+                            stdout_text = ""
+                            stderr_text = f"[ACCESS DENIED] Root/sudo permission was rejected by the operator for: {cmd_line}. Please pivot to an unprivileged user-space alternative."
                             log_output = stderr_text
-                        finally:
-                            self._root_events.pop(root_request_id, None)
-                            self._root_results.pop(root_request_id, None)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Root approval request timed out for '{cmd_line}'.")
+                        stderr_text = f"[TIMEOUT] Root permission request timed out after 120s. Please pivot to an unprivileged user-space alternative."
+                        log_output = stderr_text
+                    finally:
+                        self._root_events.pop(root_request_id, None)
+                        self._root_results.pop(root_request_id, None)
+                        self._pending_root_requests.pop(root_request_id, None)
 
                 # Snapshot working directory after execution and compute filesystem deltas
                 dir_after = self._snapshot_dir(challenge.working_directory)

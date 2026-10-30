@@ -293,5 +293,363 @@ class _LoopHarness(unittest.TestCase):
             db.close()
 
 
+class RootElevationGateTests(_LoopHarness):
+    """Fix 04A: no unattended root elevation.
+
+    ``challenge.requires_root`` is challenge metadata, never operator
+    authorization. The loop must not execute a second ``sudo``-elevated
+    command on its own: every detected root requirement routes through the
+    existing operator-approval flow (ROOT_PERMISSION_REQUEST /
+    ``resolve_root_request``). The tool manager stays a recording stub; no
+    real (elevated) command is ever executed here.
+    """
+
+    # ------------------------------------------------------------------ #
+    # Fix 04A — no unattended root elevation                              #
+    # ------------------------------------------------------------------ #
+
+    def _seed_root_gate(self, *, requires_root=False):
+        import tempfile
+        db = SessionLocal()
+        try:
+            ch = ChallengeModel(
+                name="Root Gate Challenge", category="web",
+                requires_root=requires_root,
+                working_directory=tempfile.mkdtemp())
+            db.add(ch)
+            db.commit()
+            run = RunModel(challenge_id=ch.id, status="RUNNING",
+                           current_phase="recon", current_agent="orchestrator")
+            db.add(run)
+            db.commit()
+            return ch.id, run.id
+        finally:
+            db.close()
+
+    def _record_tool_manager(self, commands, results=None, default=None):
+        """Re-patch the loop's tool manager with a RECORDING stub (wins over
+        the fixed stub installed by ``_run_loop``; cleaned up before it).
+
+        Executed commands are appended to ``commands``; ``results`` are served
+        in order, then ``default`` (a blank success unless supplied).
+        """
+        queue = list(results or [])
+        fallback = default if default is not None else _tool_result()
+
+        async def execute_raw_command(*_a, **kwargs):
+            commands.append(kwargs.get("command"))
+            return queue.pop(0) if queue else fallback
+
+        stack = ExitStack()
+        stack.enter_context(patch(
+            "backend.agents.orchestrator_loop.tool_manager",
+            MagicMock(execute_raw_command=execute_raw_command)))
+        self.addCleanup(stack.close)
+
+    def _patch_operator(self, events, action):
+        """Replace the harness ws stub so a broadcast ROOT_PERMISSION_REQUEST
+        triggers a scripted operator action shortly after, emulating the
+        operator clicking Approve / Reject in the UI (which drives
+        POST /privilege/approve | /privilege/reject). ``action`` is 'approve',
+        'deny' or 'timeout' (never resolved)."""
+        ws = MagicMock()
+
+        async def broadcast(payload):
+            events.append(dict(payload))
+            if payload.get("event") == "ROOT_PERMISSION_REQUEST":
+                request_id = payload["request_id"]
+                loop = asyncio.get_running_loop()
+                if action == "approve":
+                    loop.call_later(0.02, lambda: orchestrator_loop.resolve_root_request(
+                        request_id, success=True,
+                        tool_res=_tool_result(stdout="elevated output\n")))
+                elif action == "deny":
+                    loop.call_later(0.02, lambda: orchestrator_loop.resolve_root_request(
+                        request_id, success=False, message="operator denied"))
+                # action == "timeout" → intentionally never resolved; the test
+                # patches asyncio.wait_for so no real 120s wait occurs.
+
+        ws.broadcast = broadcast
+        stack = ExitStack()
+        stack.enter_context(patch("backend.agents.orchestrator_loop.ws_manager", ws))
+        self.addCleanup(stack.close)
+
+    def _insta_timeout_run(self, run_id, challenge_id, target):
+        """Run the loop with asyncio.wait_for raising TimeoutError for the
+        root-approval wait (timeout=120); nothing is resolved meanwhile."""
+        real_wait_for = asyncio.wait_for
+
+        async def instant_timeout(fut, timeout=None):
+            if timeout == 120:
+                # The loop hands us the (never-scheduled) Event.wait coroutine;
+                # close it so it does not linger unawaited.
+                if hasattr(fut, "close"):
+                    fut.close()
+                raise asyncio.TimeoutError()
+            return await real_wait_for(fut, timeout)
+
+        with patch("asyncio.wait_for", instant_timeout):
+            asyncio.run(orchestrator_loop.run_autonomous_loop(
+                run_id, challenge_id, target))
+
+    def test_requires_root_never_auto_elevates(self):
+        """Fix 04A: requires_root=True must NOT re-execute the command with
+        sudo unattended; it must route through operator approval instead."""
+        challenge_id, run_id = self._seed_root_gate(requires_root=True)
+        events = []
+        self._run_loop(["sudo nmap -F http://target.ctf", "DONE"],
+                       _tool_result(), events)
+        self._patch_operator(events, "approve")
+        commands = []
+        self._record_tool_manager(commands)
+
+        asyncio.run(orchestrator_loop.run_autonomous_loop(
+            run_id, challenge_id, "http://target.ctf"))
+
+        self.assertEqual(len([e for e in events
+                              if e.get("event") == "ROOT_PERMISSION_REQUEST"]), 1)
+        # Exactly ONE loop-side execution (the model-issued command). The old
+        # bypass executed it AGAIN, elevated, without any approval.
+        self.assertEqual(len(commands), 1)
+        # The elevated execution surfaced via the approval flow's tool result.
+        self.assertTrue(any(
+            e.get("event") == "LOG_OUTPUT"
+            and "elevated output" in (e.get("output") or "")
+            for e in events))
+        self.assertEqual(orchestrator_loop._root_events, {})
+
+    def test_root_denial_does_not_execute_elevated_command(self):
+        challenge_id, run_id = self._seed_root_gate(requires_root=True)
+        events = []
+        self._run_loop(["sudo nmap -F http://target.ctf", "DONE"],
+                       _tool_result(), events)
+        self._patch_operator(events, "deny")
+        commands = []
+        self._record_tool_manager(commands)
+
+        asyncio.run(orchestrator_loop.run_autonomous_loop(
+            run_id, challenge_id, "http://target.ctf"))
+
+        self.assertEqual(len(commands), 1)  # never re-executed elevated
+        self.assertTrue(any(
+            e.get("event") == "LOG_OUTPUT"
+            and "[ACCESS DENIED]" in (e.get("output") or "")
+            for e in events))
+
+    def test_root_approval_timeout_does_not_execute_elevated_command(self):
+        challenge_id, run_id = self._seed_root_gate(requires_root=True)
+        events = []
+        self._run_loop(["sudo nmap -F http://target.ctf", "DONE"],
+                       _tool_result(), events)
+        commands = []
+        self._record_tool_manager(commands)
+
+        self._insta_timeout_run(run_id, challenge_id, "http://target.ctf")
+
+        self.assertEqual(len(commands), 1)  # never re-executed elevated
+        self.assertTrue(any(
+            e.get("event") == "ROOT_PERMISSION_REQUEST" for e in events))
+        self.assertTrue(any(
+            e.get("event") == "LOG_OUTPUT" and "[TIMEOUT]" in (e.get("output") or "")
+            for e in events))
+        self.assertEqual(orchestrator_loop._root_events, {})
+
+    def test_requires_root_metadata_alone_does_not_force_approval(self):
+        challenge_id, run_id = self._seed_root_gate(requires_root=True)
+        events = []
+        ok_scan = _tool_result(stdout="plain scan output\n")
+        self._run_loop(["nmap -F http://target.ctf", "DONE"], ok_scan, events)
+        commands = []
+        self._record_tool_manager(commands, default=ok_scan)
+
+        asyncio.run(orchestrator_loop.run_autonomous_loop(
+            run_id, challenge_id, "http://target.ctf"))
+
+        self.assertEqual(len(commands), 1)
+        self.assertFalse(any(
+            e.get("event") == "ROOT_PERMISSION_REQUEST" for e in events))
+        self.assertEqual(orchestrator_loop._root_events, {})
+
+    def test_non_root_command_keeps_existing_successful_path(self):
+        challenge_id, run_id = self._seed_root_gate(requires_root=False)
+        events = []
+        ok_curl = _tool_result(stdout="plain curl response\n")
+        self._run_loop(["curl -s http://target.ctf", "DONE"], ok_curl, events)
+        commands = []
+        self._record_tool_manager(commands, default=ok_curl)
+
+        asyncio.run(orchestrator_loop.run_autonomous_loop(
+            run_id, challenge_id, "http://target.ctf"))
+
+        self.assertEqual(commands, ["curl -s http://target.ctf"])
+        self.assertFalse(any(
+            e.get("event") == "ROOT_PERMISSION_REQUEST" for e in events))
+        self.assertTrue(any(
+            e.get("event") == "LOG_OUTPUT"
+            and "plain curl response" in (e.get("output") or "")
+            for e in events))
+
+
+class RootApprovalRaceTests(RootElevationGateTests):
+    """Fix 04B-F1: the event created by ``register_root_request`` must remain
+    the event the orchestrator awaits.
+
+    Regression: the loop created a fresh ``asyncio.Event()`` and overwrote
+    ``self._root_events[request_id]`` *after* broadcasting
+    ``ROOT_PERMISSION_REQUEST``. An approval that landed during that broadcast
+    yield set the original (now-discarded) event; the loop then waited on the
+    fresh, never-set event and timed out, dropping the operator's approval.
+    """
+
+    def _root_turn(self, events):
+        """Seed a sudo command turn and return (challenge_id, run_id, commands)."""
+        challenge_id, run_id = self._seed_root_gate(requires_root=True)
+        # Turn 1 issues sudo (always needs elevation); turn 2 ends the loop.
+        self._run_loop(["sudo nmap -F http://target.ctf", "DONE"],
+                       _tool_result(stdout="", stderr="Permission denied",
+                                    exit_code=1), events)
+        commands = []
+        self._record_tool_manager(commands)
+        return challenge_id, run_id, commands
+
+    def _resolve_during_broadcast(self, events, *, success, tool_res=None,
+                                  message="resolved during broadcast"):
+        """Patch ws_manager.broadcast so a ROOT_PERMISSION_REQUEST is resolved
+        synchronously *inside* the await (during the yield), before the loop
+        creates or awaits its own event. Reproduces the race deterministically
+        with no arbitrary sleeps."""
+        ws = MagicMock()
+
+        async def broadcast(payload):
+            events.append(dict(payload))
+            if payload.get("event") == "ROOT_PERMISSION_REQUEST":
+                rid = payload["request_id"]
+                orchestrator_loop.resolve_root_request(
+                    rid, success=success, tool_res=tool_res, message=message)
+
+        ws.broadcast = broadcast
+        stack = ExitStack()
+        stack.enter_context(patch("backend.agents.orchestrator_loop.ws_manager", ws))
+        self.addCleanup(stack.close)
+
+    def _run_root_race(self, events, *, success, tool_res=None,
+                       message="resolved during broadcast"):
+        """Run a root-approval turn where the operator resolves during the
+        ROOT_PERMISSION_REQUEST broadcast yield (before the loop awaits).
+
+        Installs spies to capture the registered vs awaited event and collapses
+        the 120s wait to 0.1s so the test is fast and deterministic. Restores
+        everything after the run."""
+        challenge_id, run_id, commands = self._root_turn(events)
+
+        # Capture the event register_root_request stores for this request.
+        registered = {}
+        real_register = orchestrator_loop.register_root_request
+
+        def _spy_register(command, challenge_id=None, working_directory=None,
+                            ttl_seconds=None):
+            rid = real_register(command=command, challenge_id=challenge_id,
+                                working_directory=working_directory,
+                                ttl_seconds=ttl_seconds)
+            registered[rid] = orchestrator_loop._root_events[rid]
+            return rid
+
+        # Capture whatever event the loop actually awaits.
+        awaited = []
+        real_wait = asyncio.Event.wait
+
+        async def _wait_spy(self, *a, **k):
+            awaited.append(self)
+            return await real_wait(self, *a, **k)
+
+        # Collapse the 120s approval wait: an already-set event (the fix)
+        # returns immediately; a never-set one (the bug) times out quickly
+        # instead of hanging for 120s.
+        real_wait_for = asyncio.wait_for
+
+        async def _short_wait_for(fut, timeout=None, *a, **k):
+            return await real_wait_for(fut, 0.1, *a, **k)
+
+        orchestrator_loop.register_root_request = _spy_register
+        asyncio.Event.wait = _wait_spy
+        asyncio.wait_for = _short_wait_for
+        self._resolve_during_broadcast(events, success=success,
+                                       tool_res=tool_res, message=message)
+        try:
+            asyncio.run(orchestrator_loop.run_autonomous_loop(
+                run_id, challenge_id, "http://target.ctf"))
+        finally:
+            orchestrator_loop.register_root_request = real_register
+            asyncio.Event.wait = real_wait
+            asyncio.wait_for = real_wait_for
+
+        return challenge_id, run_id, commands, registered, awaited
+
+    def test_approval_during_broadcast_is_observed_not_overwritten(self):
+        """Race: operator approves while the loop is inside the
+        ROOT_PERMISSION_REQUEST broadcast yield, before it awaits.
+
+        The registered event must still be the one awaited; the loop observes
+        the approval result instead of timing out; the command runs at most
+        once."""
+        events = []
+        challenge_id, run_id, commands, registered, awaited = \
+            self._run_root_race(events, success=True,
+                                tool_res=_tool_result(stdout="elevated output\n"))
+
+        # 1. The original registered event is the one awaited — not replaced.
+        self.assertEqual(len(awaited), 1)
+        self.assertTrue(
+            any(reg is aw for reg in registered.values() for aw in awaited),
+            "register_root_request's event was replaced by a fresh awaited event")
+
+        # 2. The loop observes the approval result rather than timing out.
+        self.assertTrue(any(
+            e.get("event") == "LOG_OUTPUT"
+            and "elevated output" in (e.get("output") or "")
+            for e in events))
+        self.assertFalse(any(
+            e.get("event") == "LOG_OUTPUT"
+            and "[TIMEOUT]" in (e.get("output") or "")
+            for e in events))
+
+        # 3. The approved command executes at most once: the loop reused the
+        #    approval's tool result and did not re-execute; only the initial
+        #    command ran.
+        self.assertEqual(commands, ["sudo nmap -F http://target.ctf"])
+
+        # Registry is cleaned up after the wait.
+        self.assertEqual(orchestrator_loop._root_events, {})
+        self.assertEqual(orchestrator_loop._root_results, {})
+
+    def test_denial_during_broadcast_is_observed(self):
+        """Operator denies during the broadcast yield; the loop observes the
+        denial (no elevated execution, no timeout) and never elevates."""
+        events = []
+        challenge_id, run_id, commands, registered, awaited = \
+            self._run_root_race(events, success=False,
+                                message="operator denied during broadcast")
+
+        # Denial also uses the registered event (not replaced).
+        self.assertEqual(len(awaited), 1)
+        self.assertTrue(
+            any(reg is aw for reg in registered.values() for aw in awaited))
+
+        # The loop observes the denial; no elevated execution, no timeout.
+        self.assertFalse(any(
+            e.get("event") == "LOG_OUTPUT"
+            and "elevated output" in (e.get("output") or "")
+            for e in events))
+        self.assertTrue(any(
+            e.get("event") == "LOG_OUTPUT"
+            and "[ACCESS DENIED]" in (e.get("output") or "")
+            for e in events))
+        self.assertFalse(any(
+            e.get("event") == "LOG_OUTPUT"
+            and "[TIMEOUT]" in (e.get("output") or "")
+            for e in events))
+        self.assertEqual(commands, ["sudo nmap -F http://target.ctf"])
+
+
 if __name__ == "__main__":
     unittest.main()
