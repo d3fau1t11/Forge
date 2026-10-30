@@ -53,11 +53,17 @@ hacktricks/
 # Report / audit markdown: one-off analysis artifacts, never committed.
 # Rule: any *report*.md or *audit*.md is ignored (both letter cases). This covers
 # e.g. ROOT_CAUSE_REPORT.md, SUMMARY_REPORT.md and GEMINI_VISION_AUDIT.md while
-# leaving README.md and forge_documentation.md tracked.
+# leaving README.md tracked. All documentation and reports now live under docs/,
+# which is fully excluded below.
 *AUDIT*.md
 *audit*.md
 *REPORT*.md
 *report*.md
+
+# Documentation (never published to GitHub).
+# All project documentation, reports, and analysis artifacts live under docs/
+# (incl. docs/reports/) and are excluded from version control.
+/docs/
 
 # Design Reference Assets
 Design/
@@ -74,4 +80,3 @@ frontend/.vite/
 .DS_Store
 Thumbs.db
 AGENTS.md
-/docs/forge
