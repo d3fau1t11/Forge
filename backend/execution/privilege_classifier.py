@@ -9,19 +9,23 @@ never on a caller-supplied ``privilege_level`` label.
 
 Classification is conservative:
 
-* SAFE        - only operations whose behaviour is bounded and verified by the
-                existing tool/capability definitions (a registered tool whose
-                ``privilege_requirement`` is ``SAFE``, executed either shell-free
-                via ``argv`` or as a simple command with no shell syntax, with a
-                verified executable-to-capability binding and no unvalidated
-                filesystem-write arguments).
+* SAFE        - operations that pass this classifier's limited checks: a
+                registered tool whose
+                ``privilege_requirement`` is ``SAFE`` and ``risk_level`` is
+                ``SAFE`` or ``LOW``, executed shell-free via ``argv`` or as a
+                supported simple POSIX command, with an absolute executable token
+                currently resolving to the same file as an absolute registered
+                binary path, no supplied env/cwd/stdin, and no argument risks or
+                ambiguous Curl option boundaries recognized by the checks below.
 * APPROVAL_REQUIRED - operations that may need elevation or whose behaviour
                 cannot be safely established: shell syntax (chaining, pipelines,
                 redirection, substitution, expansion), privileged tools,
-                interpreters, environment-variable assignments, argv without a
-                verified capability binding, supplied environment variables, or
-                arguments that cannot be validated against a verified constraint.
-* DENY        - definitively not safe: privilege wrappers (sudo/su/doas/...),
+                interpreters, environment-variable assignments, unverified
+                executable/capability bindings, supplied environment variables,
+                cwd or stdin, or recognized argument risks/unsupported Curl options.
+                Windows shell strings are not parsed as POSIX commands and can
+                never be SAFE; use argv for a verifiable shell-free operation.
+* DENY        - recognized outer privilege wrappers (sudo/su/doas/...),
                 empty or unparsable commands.
 * UNKNOWN     - no basis to classify (unknown executable); never SAFE.
 
@@ -29,16 +33,27 @@ Both DENY and UNKNOWN are conservative outcomes: neither is ever treated as
 SAFE, and a caller cannot make a dangerous operation SAFE by supplying a
 ``privilege_level="SAFE"`` label.
 
+SAFE is not comprehensive command safety. The argument checks are limited, not
+a complete per-tool security policy; capability templates do not constrain tool
+behaviour. Supported POSIX strings use literal words and balanced quotes without
+active shell constructs; unsupported grammar remains non-SAFE. Raw head
+recognition only detects risks, never authorizes execution. File identity is
+checked now, not atomically at launch (TOCTOU remains), and executable contents,
+dependencies, inherited environment and ambient filesystem trust are not verified.
+
 Nothing here executes a command, changes permissions, modifies the host, or
 performs database or audit-log writes.  Registry lookups are read-only.
 """
 
 from __future__ import annotations
 
+import ntpath
 import os
+import posixpath
 import re
 import shlex
 import shutil
+import sys
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -87,7 +102,9 @@ _INTERPRETERS = frozenset(
         "pwsh",
         "powershell",
         "powershell.exe",
+        "cmd",
         "cmd.exe",
+        "command",
         "command.com",
         # Scripting / bytecode interpreters that run arbitrary code.
         "python",
@@ -100,115 +117,121 @@ _INTERPRETERS = frozenset(
         "lua",
         "r",
         "rscript",
+        # POSIX names are case-sensitive; Windows normalization uses the entries above.
+        "R",
+        "Rscript",
     }
 )
 
 # A leading shell environment assignment, e.g. ``VAR=value cmd``.
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+_PLATFORM = sys.platform
+_IS_WINDOWS = _PLATFORM == "win32"
+
+# The shell-feature detector is not a full parser. Exclude additional expansion,
+# comments, grouping and escapes from the classifier's SAFE subset, even when
+# quoted. This is deliberately conservative, not a new shell grammar.
+_UNVERIFIED_POSIX_SYNTAX_RE = re.compile(r"[\\*?\[\]~#(){}]")
+
+# Retain raw quoting and token positions for leading-command recognition only.
+# This is not a shell parser: expansions, here-documents and compound commands
+# are not traversed, and these tokens never authorize a SAFE operation.
+# Keep backtick contents opaque, including escaped nested backticks and quotes.
+# An unclosed substitution consumes the remaining text rather than exposing its
+# fragments as outer command words. Shell-feature checks still reject it.
+# Matches must be contiguous complete words: never search past unmatched quotes.
+# Active $() is unsupported: stop before its boundary, including inside double
+# quotes. Single-quoted/escaped text and opaque backtick contents retain their
+# existing treatment; never interpret nested $() quotes as outer word boundaries.
+# POSIX removes backslash-LF pairs between '$' and '(' before token recognition.
+# Recognize that boundary directly in the original text; never rewrite commands.
+_POSIX_DOLLAR_SUBSTITUTION_RE = re.compile(r"\$(?:\\\n)*\(")
+_POSIX_BACKTICK_WORD = r"`(?:[^`\\]|\\[\s\S])*(?:`|$)"
+_POSIX_RAW_TOKEN_RE = re.compile(
+    rf"""(?:(?!{_POSIX_DOLLAR_SUBSTITUTION_RE.pattern})[^ \t\n'"\\`;&|<>()]|\\[\s\S]|'[^']*'|{_POSIX_BACKTICK_WORD}"""
+    rf"""|"(?:(?!{_POSIX_DOLLAR_SUBSTITUTION_RE.pattern})[^"\\`]|\\[\s\S]|{_POSIX_BACKTICK_WORD})*")+"""
+    r"|<<-?|>>|<>|>\||[<>]&|&&|\|\||[;&|<>()\n]"
+)
+_POSIX_REDIRECTIONS = frozenset({"<", ">", ">>", "<>", ">|", "<&", ">&"})
+
+# Recognition only, never an assertion that Windows shell syntax was parsed.
+_WINDOWS_HEAD_RE = re.compile(r'^(?:"([^"\r\n]+)"|([^\s"\'&|<>^()%!]+))(?=\s|[&|<>]|$)')
+_WINDOWS_PLAIN_COMMAND_RE = re.compile(r"[A-Za-z0-9_.:/\\ \t-]+")
+
 
 def _is_absolute_executable_path(path: str) -> bool:
-    """Check if *path* is an absolute executable path.
+    """Check if *path* is fully qualified on the classified platform.
 
     Handles Unix absolute paths (leading ``/``), Windows absolute paths
     (``C:\\...`` or ``\\\\...``), and rejects relative names.
     """
     if not path:
         return False
-    # Unix-style: leading / or \\
-    if path.startswith("/") or path.startswith("\\\\"):
-        return True
-    # Windows drive letter (e.g. C:\) or just C: (relative on some setups,
-    # but treated as absolute candidate for security)
-    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
-        return True
-    return False
+    if _IS_WINDOWS:
+        drive, tail = ntpath.splitdrive(path)
+        # Drive-relative and root-relative paths depend on cwd/current drive.
+        return bool(drive) and (drive.startswith("\\\\") or tail.startswith(("/", "\\")))
+    return posixpath.isabs(path)
 
 
 def _normalize_binary_basename(name: str) -> str:
-    """Normalize a binary name for cross-platform comparison.
-
-    Strips common Windows executable extensions (.exe, .com, .bat, .cmd)
-    and lowercases, so that ``"curl.exe"`` and ``"curl`` compare equal.
-    """
-    base = os.path.basename(name).lower()
-    for ext in (".exe", ".com", ".bat", ".cmd"):
-        if base.endswith(ext):
-            base = base[:-len(ext)]
+    """Candidate/risk lookup only: a basename is never executable identity."""
+    if not _IS_WINDOWS:
+        return posixpath.basename(name)
+    base = ntpath.basename(name).lower()
+    stem, ext = ntpath.splitext(base)
+    if ext in (".exe", ".com", ".bat", ".cmd"):
+        base = stem
     return base
 
 
 def _tool_by_binary(binary_name: str):
-    """Return the registered tool whose *binary* matches *binary_name*, else None."""
+    """Find a candidate definition; the caller must still verify file identity."""
     for tool in tool_registry.tools.values():
-        if tool.binary and os.path.basename(tool.binary).lower() == binary_name.lower():
+        if tool.binary and _normalize_binary_basename(tool.binary) == binary_name:
             return tool
     return None
 
 
-def _binary_matches_tool(binary_name: str, tool) -> bool:
-    """Verify executable identity matches the registered tool.
+def _binary_matches_tool(binary: str, tool) -> bool:
+    """Compare the resolved file with an authoritative absolute registry path.
 
-    Basename match is necessary but NOT sufficient.  Additional checks:
-
-    * Absolute paths: the full path must correspond to the registered tool's
-      binary (same normalized path), not just a same-basename substitute.
-      This prevents /tmp/evil/curl from matching a tool registered with
-      binary="curl".
-    * Relative/name paths: the executable must be resolvable via
-      ``shutil.which()`` and its normalized resolved basename must match the
-      tool's declared binary basename.  shutil.which() alone is not trusted
-      as proof of binary integrity, but it is used to prevent PATH-shadowing
-      attacks and relative-path substitution.  If shutil.which() cannot
-      resolve the executable (e.g. the tool is not installed in this
-      environment), the basename match from Step 1 is retained for
-      backward compatibility.
-
-    Neither basename equality nor shutil.which() resolution alone is proof
-    of binary integrity, but together they prevent the most common
-    substitution attacks without introducing fragile hardcoded paths.
+    A name-only entry cannot supply a trusted comparison target: resolving both
+    names through the same PATH would also accept a shadow executable. Keep the
+    original absolute token, require successful resolution and samefile, and
+    never fall back to basename or normalized-path-string equality. This verifies current
+    file identity, not content integrity or the executable at a future launch.
     """
     if not tool or not tool.binary:
         return False
-
-    # Step 1: Basename match - necessary but not sufficient.
-    if os.path.basename(binary_name).lower() != os.path.basename(tool.binary).lower():
+    if not _is_absolute_executable_path(tool.binary):
         return False
-
-    # Step 2: Identity verification based on how the binary is specified.
-    # First, reject relative-path executables (e.g. ./evil/curl, ../exploit/binary)
-    # These cannot be trusted as identity matches without full path verification.
-    if binary_name.startswith("./") or binary_name.startswith("../"):
-        # Relative-path executable substitution: do not inherit SAFE.
-        # The executable cannot be verified against the registered tool's binary.
+    if not _is_absolute_executable_path(binary):
+        # A bare name leaves PATH searching to the launcher, which may continue
+        # after a candidate that which() found fails to execute. Relative paths
+        # likewise have no authoritative cwd policy. Neither binds the launch.
         return False
-
-    if _is_absolute_executable_path(binary_name):
-        # Absolute-path executable substitution: only inherit SAFE if the
-        # full absolute path matches the registered tool's binary (normalised).
-        # This prevents /tmp/evil/curl from matching a tool registered with
-        # binary="curl".
-        if _is_absolute_executable_path(tool.binary):
-            return os.path.normpath(binary_name) == os.path.normpath(tool.binary)
-        # Registered binary is a name; an absolute-path argv[0] cannot be
-        # verified against a name-only registration without fragile look‑ups.
+    if _IS_WINDOWS and ntpath.splitext(binary)[1].lower() not in (".exe", ".com"):
+        # CreateProcess search order is not shutil.which's PATH/PATHEXT lookup.
+        # Require an explicit native file, not an inferred suffix/search result.
         return False
-    else:
-        # Relative or name-only argv[0]: optionally verify via shutil.which()
-        # if the executable is resolvable on PATH.  shutil.which() handles
-        # PATHEXT on Windows and PATH ordering on Linux, but is not accepted as
-        # proof of binary integrity on its own - it merely prevents
-        # trivial relative-path shadow attacks when the executable IS found.
-        # Normalize both basenames for comparison (handles .exe/.EXE on Windows).
-        resolved = shutil.which(binary_name)
-        if resolved:
-            return _normalize_binary_basename(resolved) == _normalize_binary_basename(
-                tool.binary
-            )
-        # shutil.which() could not locate the executable; fall back to the
-        # basename match from Step 1 for backward compatibility with test
-        # environments where the tool is not on PATH.
-        return True
+    try:
+        resolved = shutil.which(binary)
+        if not resolved or not _is_absolute_executable_path(resolved):
+            return False
+        # Windows may run batch files through a shell even with shell=False.
+        if _IS_WINDOWS and ntpath.splitext(resolved)[1].lower() not in (".exe", ".com"):
+            return False
+        for path in (tool.binary, resolved):
+            name = _normalize_binary_basename(path)
+            if name in _PRIVILEGE_WRAPPERS or name in _INTERPRETERS:
+                return False
+        if _IS_WINDOWS and not os.path.samefile(binary, resolved):
+            return False
+        return os.path.samefile(resolved, tool.binary)
+    except (OSError, ValueError):
+        return False
 
 
 # File-output / write flags that direct a tool to write to the filesystem.
@@ -229,6 +252,22 @@ _FILE_OUTPUT_FLAGS = frozenset(
     }
 )
 
+# Minimal Curl arity metadata, not a comprehensive parser or safety allowlist.
+# Established curl(1) semantics: --user-agent/-A <name>, --request/-X <method>,
+# --header/-H <header/@file>, and --data-binary <data> each consume one value,
+# even when it begins with '-'. Long options accept '=value'; short options
+# accept an immediately attached value (including a literal leading '=').
+# Header and binary-data values beginning with '@' can read files/stdin.
+# Verified offline in the bundled curl(1) 8.19.0 manual's OPTIONS and named
+# option entries; long-option '=' syntax is documented there since 8.16.0.
+_CURL_VALUE_OPTIONS = frozenset(
+    {"--user-agent", "-A", "--request", "-X", "--header", "-H", "--data-binary"}
+)
+# Only the existing simple probes/template flags and their curl(1) aliases.
+_CURL_NO_VALUE_OPTIONS = frozenset(
+    {"--version", "-V", "--include", "-i", "--silent", "-s"}
+)
+
 
 def _is_absolute_filesystem_path(token: str) -> bool:
     """True iff *token* is an absolute filesystem path rather than a URL.
@@ -247,45 +286,172 @@ def _is_absolute_filesystem_path(token: str) -> bool:
     return False
 
 
-def _arguments_require_approval(tokens: list) -> bool:
+def _arguments_require_approval(tokens: list, tool_name: str) -> bool:
     """True iff *tokens* (full argv; ``tokens[0]`` is the binary) carry
     filesystem-write or sensitive-filesystem-access risk that the classifier
     cannot validate against any verified constraint.
 
     The registry's ``args_template`` is a formatting template, not a security
-    policy, and the classifier maintains no argument allowlist, so operations
-    whose arguments touch the filesystem are conservatively routed to
-    APPROVAL_REQUIRED instead of SAFE.
+    policy, and the classifier maintains no comprehensive argument allowlist.
+    The known output, config, file-backed data and path forms below require
+    approval; absence of a match is not a proof of arbitrary argument safety.
+    Only Curl has literal-value exemptions, using explicit arity metadata.
+    Unknown Curl options (including short clusters/long abbreviations) require
+    approval rather than guessing what they consume. Other tools retain token
+    risk checks with no literal-payload exemption.
 
     Additional conservative checks:
 
     * Relative‑path arguments (``./...`` or ``../...``) are not trusted,
       because they can substitute an unregistered executable relative to the
       caller's cwd or PATH.
-    * ``--script`` flags with a path argument that is not a URL are not
-      trusted, because they enable arbitrary script execution (e.g. nmap
-      NSE scripts) whose behaviour cannot be verified against the tool's
-      definition.
+    * ``--script`` selection is not trusted: neither a URL substring nor a
+      Boolean expression establishes safe script execution (e.g. nmap NSE).
     """
-    for i, token in enumerate(tokens[1:], start=1):
-        if token in _FILE_OUTPUT_FLAGS:
+    i = 1
+    while i < len(tokens):
+        token = tokens[i]
+        option, separator, attached_value = token.partition("=")
+        if (token in _FILE_OUTPUT_FLAGS
+                or (separator and option in _FILE_OUTPUT_FLAGS)
+                or token.startswith("-o")):
+            # The existing -o/-oN/-oX/... output flags also accept attached paths.
             return True
+        if option == "--config":
+            # Loading options from a file is unverified, including a missing value.
+            return True
+        if option == "--script":
+            # No registered constraint verifies script selection, even for a
+            # URL-looking expression, an attached value, or a missing value.
+            return True
+        if tool_name == "curl" and not token.startswith("--") and token[:2] in _CURL_VALUE_OPTIONS:
+            option = token[:2]
+            separator = token[2:]
+            attached_value = token[2:]  # '-H=x' consumes '=x', not 'x'.
+        if tool_name == "curl" and option in _CURL_VALUE_OPTIONS:
+            value = attached_value if separator else (
+                tokens[i + 1] if i + 1 < len(tokens) else None)
+            if value is None:
+                return True  # Missing option values cannot establish SAFE.
+            if option in ("--data-binary", "--header", "-H") and value.startswith("@"):
+                return True
+            if option != "--data-binary" and (
+                    _is_absolute_filesystem_path(value) or value.startswith(("./", "../"))):
+                # Retain conservative path checks outside binary-data payloads.
+                return True
+            # A consumed value is never rescanned as an independent option.
+            # Advance only over this option/value, not the next genuine option.
+            i += 1 if separator else 2
+            continue
+        if option == "--data-binary":
+            return True  # Curl's payload semantics cannot be borrowed by other tools.
+        if tool_name == "curl" and token.startswith("-") and token not in _CURL_NO_VALUE_OPTIONS:
+            return True  # Unknown arity: no safe inference about subsequent tokens.
         if _is_absolute_filesystem_path(token):
             return True
         # Relative‑path arguments cannot be verified against any trustworthy
         # definition; conservatively require approval.
         if token.startswith("./") or token.startswith("../"):
             return True
-        # ``--script`` with a non‑URL path argument enables arbitrary script
-        # execution whose behaviour cannot be verified.
-        if token == "--script" and i + 1 < len(tokens):
-            next_token = tokens[i]
-            if next_token and "://" not in next_token:
-                return True
+        i += 1
     return False
 
 
-# ---- Remaining classifier code (truncated for brevity) continues below ----
+def _posix_command_head(command: str) -> tuple[str, Optional[str]]:
+    """Recognize the first simple-command word after assignments/redirections.
+
+    Inspect raw words so quoting the name or '=' prevents assignment recognition,
+    while quoting an assignment's value is permitted. Only an unquoted adjacent
+    numeric token is an IO descriptor. Backtick contents remain opaque. Stop at
+    unsupported operators or comments; never search later commands or mistake a
+    redirection's operand or substitution contents for an outer command.
+    shlex validates ordinary quotes, not quoting inside shell substitutions.
+    Match contiguously and reject incomplete words; never resume after a gap.
+    Active $() stops recognition without traversing its unsupported contents.
+    A recognized head before unsupported trailing text still establishes an
+    outer wrapper, but fragments of an unsupported leading word never do.
+    """
+    raw_tokens = []
+    position = 0
+    while position < len(command):
+        if command[position] in " \t":
+            position += 1
+            continue
+        match = _POSIX_RAW_TOKEN_RE.match(command, position)
+        if match is None:
+            break
+        if (match.group()[0] not in ";&|<>()\n" and match.end() < len(command)
+                and command[match.end()] not in " \t\n;&|<>()"):
+            # A prefix such as FOO= or su before an unmatched quote is not a
+            # complete shell word. Do not keep it or search inside the quote.
+            break
+        raw_tokens.append(match)
+        position = match.end()
+    index = 0
+    assignment = None
+    while index < len(raw_tokens):
+        raw = raw_tokens[index].group()
+        if raw.startswith("#"):
+            return "", assignment
+        if _ENV_ASSIGNMENT_RE.match(raw):
+            if assignment is None:
+                assignment = raw
+            index += 1
+            continue
+        if (re.fullmatch(r"[0-9]+", raw) and index + 1 < len(raw_tokens)
+                and raw_tokens[index].end() == raw_tokens[index + 1].start()
+                and raw_tokens[index + 1].group() in _POSIX_REDIRECTIONS):
+            index += 1
+            raw = raw_tokens[index].group()
+        if raw in _POSIX_REDIRECTIONS:
+            index += 1
+            if index >= len(raw_tokens):
+                return "", assignment
+            operand = raw_tokens[index].group()
+            if operand.startswith("#") or operand[0] in ";&|<>()\n":
+                return "", assignment
+            index += 1
+            continue
+        if raw[0] in ";&|<>()\n":
+            return "", assignment
+        # This is already one raw shell word. Decode its quotes/escapes without
+        # letting shlex's default whitespace discard literal carriage returns.
+        word = shlex.shlex(raw, posix=True)
+        word.whitespace = ""
+        word.whitespace_split = True
+        word.commenters = ""
+        return next(word, ""), assignment
+    return "", assignment
+
+
+def _posix_shell_feature(command: str) -> Optional[str]:
+    """Refine only a continued first dollar feature, without rewriting input.
+
+    The shared detector reports '$' followed by a backslash as variable expansion.
+    Mirror its quote state only to locate that first feature, not to parse $().
+    Keep earlier features and conservative escaped-dollar diagnostics unchanged.
+    """
+    feature = find_shell_syntax(command)
+    if feature != "variable_expansion" or "\\\n" not in command:
+        return feature
+    in_single = False
+    in_double = False
+    for position, ch in enumerate(command):
+        if in_single:
+            if ch == "'":
+                in_single = False
+        elif ch == '"':
+            in_double = not in_double
+        elif ch == "'" and not in_double:
+            in_single = True
+        elif ch == "$" and position + 1 < len(command):
+            escapes = 0
+            while position > escapes and command[position - escapes - 1] == "\\":
+                escapes += 1
+            if escapes % 2 == 0 and _POSIX_DOLLAR_SUBSTITUTION_RE.match(command, position):
+                return "command_substitution"
+            return feature
+    return feature
 
 
 def _base_details(request: ExecutionRequest) -> dict:
@@ -306,20 +472,14 @@ def classify_operation(request: ExecutionRequest) -> ClassificationResult:
     """
     details = _base_details(request)
 
-    # Environment variables can alter dynamic-library loading, interpreter
-    # behaviour, and privilege boundaries.  The classifier has no verified
-    # environment policy, so any supplied environment makes the operation
-    # non-SAFE (APPROVAL_REQUIRED) rather than SAFE.
-    if request.env:
-        return ClassificationResult(
-            OperationRisk.APPROVAL_REQUIRED,
-            "environment variables supplied - execution environment not verified",
-            {**details, "env": dict(request.env)},
-        )
-
-    argv = [str(a) for a in (request.argv or [])]
-    if argv:
-        return _classify_argv(request, argv, details)
+    # Match execution-mode selection: an empty argv falls back to command mode.
+    # Do not coerce malformed executable/argument values into legitimate strings.
+    if request.argv:
+        if not isinstance(request.argv, list) or any(
+            not isinstance(a, str) or "\x00" in a for a in request.argv
+        ) or not request.argv[0]:
+            return ClassificationResult(OperationRisk.DENY, "invalid argv", details)
+        return _classify_argv(request, request.argv, details)
     return _classify_command(request, details)
 
 
@@ -331,180 +491,207 @@ def _classify_argv(request, argv, details) -> ClassificationResult:
     """
     details["mode"] = "argv"
     binary = argv[0]
-    binary_name = os.path.basename(binary)
-    details["binary"] = binary_name
+    binary_name = _normalize_binary_basename(binary)
+    details["binary"] = binary
 
-    low = binary_name.lower()
-    if low in _PRIVILEGE_WRAPPERS:
+    if binary_name in _PRIVILEGE_WRAPPERS:
         return ClassificationResult(
             OperationRisk.DENY,
             "privilege wrapper executed directly",
             {**details, "wrapper": binary_name},
         )
-    if low in _INTERPRETERS:
+    if binary_name in _INTERPRETERS:
         return ClassificationResult(
             OperationRisk.APPROVAL_REQUIRED,
             "interpreter - arbitrary script execution",
             {**details, "interpreter": binary_name},
         )
 
-    capability = (request.capability or "").strip()
-    tool_name = (request.tool_name or "").strip()
-
-    if capability and tool_name:
-        tool = tool_registry.tools.get(tool_name)
-        details["capability"] = capability
-        details["tool"] = tool_name
-        if tool is not None and capability in tool.capabilities:
-            # Verify the executable actually matches the registered tool's
-            # declared binary before inheriting its classification.  A
-            # mismatched executable must never borrow another tool's SAFE
-            # rating (Issue A: capability-to-executable binding).
-            if not _binary_matches_tool(binary_name, tool):
-                return ClassificationResult(
-                    OperationRisk.APPROVAL_REQUIRED,
-                    "argv executable does not match bound capability binary",
-                    {**details, "capability": capability, "tool": tool_name},
-                )
-            # Arguments cannot be validated against any verified constraint:
-            # args_template is a formatting template, not a security policy,
-            # and the classifier maintains no argument allowlist (Issue B).
-            if _arguments_require_approval(argv):
-                return ClassificationResult(
-                    OperationRisk.APPROVAL_REQUIRED,
-                    "arguments carry unverified filesystem/write risk",
-                    {**details, "capability": capability, "tool": tool_name},
-                )
-            # Bounded, known capability operation: behaviour grounded in the
-            # registered tool definition.
-            priv = (tool.privilege_requirement or "SAFE").upper()
-            if priv == "SAFE":
-                return ClassificationResult(
-                    OperationRisk.SAFE,
-                    "bounded safe capability (shell-free argv)",
-                    {**details, "privilege": priv},
-                )
-            return ClassificationResult(
-                OperationRisk.APPROVAL_REQUIRED,
-                f"capability bound to {priv}-privilege tool",
-                {**details, "privilege": priv},
-            )
-        # Tool named but not bound to this capability: behaviour cannot be verified.
-        return ClassificationResult(
-            OperationRisk.APPROVAL_REQUIRED,
-            "argv execution without verified capability binding",
-            {**details},
-        )
-
-    # No capability binding: fall back to the registered tool definition.
-    tool = tool_registry.tools.get(binary_name) or _tool_by_binary(binary_name)
-    if tool is not None:
-        details["tool"] = tool.tool_name
-        # Arguments cannot be validated against any verified constraint
-        # (Issue B), even when the executable itself is registered.
-        if _arguments_require_approval(argv):
-            return ClassificationResult(
-                OperationRisk.APPROVAL_REQUIRED,
-                "arguments carry unverified filesystem/write risk",
-                {**details, "tool": tool.tool_name},
-            )
-        priv = (tool.privilege_requirement or "SAFE").upper()
-        if priv == "SAFE":
-            return ClassificationResult(
-                OperationRisk.SAFE,
-                "shell-free execution of registered safe tool",
-                {**details, "privilege": priv},
-            )
-        return ClassificationResult(
-            OperationRisk.APPROVAL_REQUIRED,
-            f"registered {priv}-privilege tool",
-            {**details, "privilege": priv},
-        )
-
-    return ClassificationResult(
-        OperationRisk.UNKNOWN,
-        "unknown argv executable - no basis to classify",
-        {**details},
-    )
+    return _classify_registered_operation(request, argv, details)
 
 
 def _classify_command(request, details) -> ClassificationResult:
     """Classify a shell-interpreted command-string request."""
     details["mode"] = "shell"
-    command = (request.command or "").strip()
-    if not command:
+    if request.command is not None and not isinstance(request.command, str):
+        return ClassificationResult(OperationRisk.DENY, "invalid command", details)
+    # Trim only shell blanks; str.strip() would also remove literal Unicode
+    # whitespace or carriage returns and could change the executable identity.
+    command = (request.command or "").strip(" \t")
+    if not command.strip():
         return ClassificationResult(OperationRisk.DENY, "empty command", details)
+    if "\x00" in command:
+        return ClassificationResult(OperationRisk.DENY, "invalid command (NUL)", details)
+    if _IS_WINDOWS:
+        return _classify_windows_command(request, command, details)
 
-    # Quote-aware shell-syntax detection; never a naive substring scan.
-    feature = find_shell_syntax(command)
+    # shlex checks ordinary quoting; raw recognition also refuses incomplete
+    # words in unsupported substitution contexts before wrapper detection.
+    try:
+        tokens = shlex.split(command)
+        first, assignment = _posix_command_head(command)
+    except ValueError:
+        return ClassificationResult(OperationRisk.DENY, "unparsable command", details)
+    if not tokens or not tokens[0]:
+        return ClassificationResult(OperationRisk.DENY, "empty command after parsing", details)
+
+    details["argv"] = tokens
+    binary_name = _normalize_binary_basename(first)
+    if binary_name in _PRIVILEGE_WRAPPERS:
+        return ClassificationResult(
+            OperationRisk.DENY, "privilege wrapper", {**details, "wrapper": binary_name},
+        )
+    feature = _posix_shell_feature(command)
     if feature is not None:
         return ClassificationResult(
             OperationRisk.APPROVAL_REQUIRED,
             f"shell syntax ({feature}) - behaviour not safely established",
             {**details, "shell_feature": feature},
         )
-
-    # No shell syntax: split into literal argv, preserving argument boundaries.
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return ClassificationResult(OperationRisk.DENY, "unparsable command", details)
-    if not tokens:
-        return ClassificationResult(OperationRisk.DENY, "empty command after parsing", details)
-
-    details["argv"] = tokens
-    first = tokens[0]
-
-    # A leading environment-variable assignment modifies the execution environment.
-    if _ENV_ASSIGNMENT_RE.match(first):
+    if not first:
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            "POSIX outer command boundary not established", details,
+        )
+    if _UNVERIFIED_POSIX_SYNTAX_RE.search(command):
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            "POSIX expansion, escaping or grouping context not verified",
+            details,
+        )
+    if assignment is not None:
         return ClassificationResult(
             OperationRisk.APPROVAL_REQUIRED,
             "environment-variable assignment modifies execution environment",
-            {**details, "assignment": first},
+            {**details, "assignment": assignment},
         )
-
-    binary_name = os.path.basename(first)
-    low = binary_name.lower()
-
-    if low in _PRIVILEGE_WRAPPERS:
-        return ClassificationResult(
-            OperationRisk.DENY,
-            "privilege wrapper",
-            {**details, "wrapper": binary_name},
-        )
-    if low in _INTERPRETERS:
+    if binary_name in _INTERPRETERS:
         return ClassificationResult(
             OperationRisk.APPROVAL_REQUIRED,
             "interpreter - arbitrary script execution",
             {**details, "interpreter": binary_name},
         )
 
-    tool = tool_registry.tools.get(binary_name) or _tool_by_binary(binary_name)
-    if tool is not None:
-        details["tool"] = tool.tool_name
-        # Arguments cannot be validated against any verified constraint
-        # (Issue B), even for a registered safe tool.
-        if _arguments_require_approval(tokens):
-            return ClassificationResult(
-                OperationRisk.APPROVAL_REQUIRED,
-                "arguments carry unverified filesystem/write risk",
-                {**details, "tool": tool.tool_name},
-            )
-        priv = (tool.privilege_requirement or "SAFE").upper()
-        if priv == "SAFE":
-            return ClassificationResult(
-                OperationRisk.SAFE,
-                "simple command of registered safe tool, no shell syntax",
-                {**details, "privilege": priv},
-            )
+    # LocalBackend._normalise_command() applies unrestricted str.strip() before
+    # launch. We already removed ordinary shell blanks, but any extra trimming
+    # could change a literal executable or argument. Reject, never rewrite it.
+    # Bare Python rewrites cannot reach SAFE (interpreter/absolute-path checks).
+    if command != command.strip():
         return ClassificationResult(
             OperationRisk.APPROVAL_REQUIRED,
-            f"registered {priv}-privilege tool",
-            {**details, "privilege": priv},
+            "backend command normalization could change verified command identity",
+            details,
+        )
+
+    return _classify_registered_operation(request, tokens, details)
+
+
+def _classify_windows_command(request, command, details) -> ClassificationResult:
+    """No POSIX parsing of Windows shell strings; recognize only obvious risks."""
+    # cmd.exe's unquoted leading @ suppresses echo; it is not part of the
+    # executable. Do not strip @ inside a quoted word or from argv mode.
+    head_command = command[1:].lstrip(" \t") if command.startswith("@") else command
+    head = _WINDOWS_HEAD_RE.match(head_command)
+    first = (head.group(1) or head.group(2)) if head else ""
+    name = _normalize_binary_basename(first)
+    if name in _PRIVILEGE_WRAPPERS:
+        return ClassificationResult(
+            OperationRisk.DENY, "privilege wrapper", {**details, "wrapper": name},
+        )
+    # Preserve UNKNOWN for a plainly unknown executable with no shell features
+    # or supplied context. Quoting, expansion, operators and registered commands
+    # remain unverified, irrespective of what shlex would do with the string.
+    if (head and _WINDOWS_PLAIN_COMMAND_RE.fullmatch(command)
+            and name not in _INTERPRETERS
+            and not (tool_registry.tools.get(name) or _tool_by_binary(name))
+            and not (request.env or request.cwd or request.stdin is not None
+                     or request.capability or request.tool_name)):
+        return ClassificationResult(
+            OperationRisk.UNKNOWN, "unknown command - no basis to classify",
+            {**details, "binary": first},
+        )
+    return ClassificationResult(
+        OperationRisk.APPROVAL_REQUIRED,
+        "Windows shell parsing/context not verified - use shell-free argv",
+        details,
+    )
+
+
+def _classify_registered_operation(request, tokens, details) -> ClassificationResult:
+    """Only SAFE route: metadata, current file identity and limited risk checks.
+
+    This does not verify executable contents, inherited context or launch-time
+    identity, nor does it prove comprehensive argument/command safety.
+    """
+    if request.env:
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            "environment variables supplied - execution environment not verified",
+            {**details, "env": dict(request.env)},
+        )
+    if request.cwd or request.stdin is not None:
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            "supplied working directory or stdin context not verified", details,
+        )
+
+    binary = tokens[0]  # Preserve the full executable token, not its basename.
+    details["binary"] = binary
+    capability = (request.capability or "").strip()
+    tool_name = (request.tool_name or "").strip()
+    if capability or tool_name:
+        tool = tool_registry.tools.get(tool_name)
+        details.update(capability=capability, tool=tool_name)
+        if not capability or tool is None or capability not in tool.capabilities:
+            return ClassificationResult(
+                OperationRisk.APPROVAL_REQUIRED,
+                "execution without verified capability binding", details,
+            )
+    else:
+        name = _normalize_binary_basename(binary)
+        tool = tool_registry.tools.get(name) or _tool_by_binary(name)
+    if tool is None:
+        return ClassificationResult(
+            OperationRisk.UNKNOWN, "unknown executable - no basis to classify", details,
+        )
+
+    priv = (tool.privilege_requirement or "").upper()
+    risk = (tool.risk_level or "").upper()
+    details.update(tool=tool.tool_name, privilege=priv, risk_level=risk)
+    if priv != "SAFE":
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            f"registered privilege requirement not SAFE ({priv or 'unspecified'})", details,
+        )
+    # SAFE and LOW are the existing low-risk metadata values, not new levels.
+    if risk not in ("SAFE", "LOW"):
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            f"registered tool risk not verified as low ({risk or 'unspecified'})", details,
+        )
+    platform = "windows" if _IS_WINDOWS else _PLATFORM
+    if platform not in tool.os_compatibility:
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            "registered tool is not verified for this platform", details,
+        )
+    if not _is_absolute_executable_path(binary):
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            f"{details['mode']} executable resolution not verified - require an absolute executable", details,
+        )
+    if not _binary_matches_tool(binary, tool):
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            "executable identity not verified against an absolute registered binary", details,
+        )
+    if _arguments_require_approval(tokens, tool.tool_name):
+        return ClassificationResult(
+            OperationRisk.APPROVAL_REQUIRED,
+            "arguments carry unverified filesystem/write risk or option boundaries", details,
         )
 
     return ClassificationResult(
-        OperationRisk.UNKNOWN,
-        "unknown command - no basis to classify",
-        {**details, "binary": binary_name},
+        OperationRisk.SAFE,
+        f"verified registered low-risk tool ({details['mode']})", details,
     )

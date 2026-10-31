@@ -6,7 +6,7 @@ from backend.database.models import Base
 
 _engine_cache = {}
 
-# Database engine initialization (Supports SQLite out-of-the-box and PostgreSQL)
+# Engine creation; schema upgrades below are SQLite-only.
 def get_engine():
     current_url = os.getenv("DATABASE_URL", settings.DATABASE_URL)
     if current_url in _engine_cache:
@@ -38,89 +38,36 @@ def init_db():
     current_url = os.getenv("DATABASE_URL", settings.DATABASE_URL)
     # Lightweight SQLite column migration
     if current_url.startswith("sqlite"):
-        with eng.connect() as conn:
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN progress INTEGER DEFAULT 0"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN flag_status VARCHAR DEFAULT 'UNFOUND'"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN working_directory VARCHAR DEFAULT ''"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN platform_name VARCHAR DEFAULT ''"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN difficulty VARCHAR DEFAULT 'MEDIUM'"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN started_at TIMESTAMP"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN completed_at TIMESTAMP"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN duration_seconds INTEGER DEFAULT 0"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN mission_plan JSON"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE challenges ADD COLUMN requires_root BOOLEAN DEFAULT 0"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE findings ADD COLUMN severity VARCHAR DEFAULT 'HIGH'"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE findings ADD COLUMN endpoint VARCHAR DEFAULT ''"))
-                conn.commit()
-            except Exception:
-                pass
-            # Phase 2: environment-aware skill columns on experiences.
-            for _ddl in (
-                "ALTER TABLE experiences ADD COLUMN required_os VARCHAR DEFAULT 'any'",
-                "ALTER TABLE experiences ADD COLUMN required_tools JSON",
-                "ALTER TABLE experiences ADD COLUMN required_python_libs JSON",
-            ):
-                try:
-                    conn.execute(text(_ddl))
-                    conn.commit()
-                except Exception:
-                    pass
-            # Phase 4.x hardening: persist swarm task coordination hints so the
-            # capability/target gates survive checkpoint/resume (§5/§6).
-            for _ddl in (
-                "ALTER TABLE swarm_tasks ADD COLUMN required_capabilities JSON",
-                "ALTER TABLE swarm_tasks ADD COLUMN target_type VARCHAR DEFAULT ''",
-            ):
-                try:
-                    conn.execute(text(_ddl))
-                    conn.commit()
-                except Exception:
-                    pass
+        # Preserve the existing additive upgrades, but inspect before ALTER so
+        # duplicate columns are safe and genuine migration failures propagate.
+        # The three independent workspace tables are added by create_all above;
+        # no legacy table or execution relationship needs a workspace migration.
+        upgrades = {
+            "challenges": {
+                "progress": "INTEGER DEFAULT 0",
+                "flag_status": "VARCHAR DEFAULT 'UNFOUND'",
+                "working_directory": "VARCHAR DEFAULT ''",
+                "platform_name": "VARCHAR DEFAULT ''",
+                "difficulty": "VARCHAR DEFAULT 'MEDIUM'",
+                "started_at": "TIMESTAMP",
+                "completed_at": "TIMESTAMP",
+                "duration_seconds": "INTEGER DEFAULT 0",
+                "mission_plan": "JSON",
+                "requires_root": "BOOLEAN DEFAULT 0",
+            },
+            "findings": {"severity": "VARCHAR DEFAULT 'HIGH'", "endpoint": "VARCHAR DEFAULT ''"},
+            "experiences": {
+                "required_os": "VARCHAR DEFAULT 'any'", "required_tools": "JSON", "required_python_libs": "JSON",
+            },
+            "swarm_tasks": {"required_capabilities": "JSON", "target_type": "VARCHAR DEFAULT ''"},
+        }
+        with eng.begin() as conn:
+            conn.execute(text("BEGIN IMMEDIATE"))
+            for table, columns in upgrades.items():
+                existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+                for column, definition in columns.items():
+                    if column not in existing:
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
 
     # Phase 2: warm the in-memory FTS indexes AFTER create_all + migration. The
     # experience/trajectory singletons build their indexes at import time, which in

@@ -9,6 +9,7 @@ from backend.config import settings
 from backend.api.auth import require_api_token
 from backend.database.session import init_db
 from backend.api.routes import router as api_router
+from backend.api.projects import router as projects_router
 from backend.websocket.manager import ws_manager
 from backend.environment.detector import environment_detector
 from backend.providers.router import model_router
@@ -142,6 +143,7 @@ app.include_router(
     prefix="/api",
     dependencies=[Depends(require_api_token)],
 )
+app.include_router(projects_router, prefix="/api")
 
 @app.websocket("/ws/events")
 async def websocket_endpoint(websocket: WebSocket):

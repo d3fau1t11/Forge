@@ -2,7 +2,8 @@ import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from sqlalchemy import (
-    Column, String, Text, Boolean, Float, Integer, DateTime, ForeignKey, JSON, Index
+    Column, String, Text, Boolean, Float, Integer, DateTime, ForeignKey, JSON, Index,
+    CheckConstraint, UniqueConstraint, text
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -10,6 +11,67 @@ Base = declarative_base()
 
 def generate_uuid():
     return str(uuid.uuid4())
+
+# User-facing workspace persistence is independent of CTF execution history.
+# No deletion cascades: the public lifecycle is archive-only.
+class ProjectModel(Base):
+    __tablename__ = "projects"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    name = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    instructions = Column(Text, nullable=False, default="")
+    context = Column(JSON, nullable=True)
+    workspace_path = Column(String, nullable=False, unique=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    archived_at = Column(DateTime, nullable=True)
+
+    sessions = relationship("WorkspaceSessionModel", back_populates="project", passive_deletes="all")
+
+
+class WorkspaceSessionModel(Base):
+    __tablename__ = "workspace_sessions"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    project_id = Column(String, ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    context = Column(JSON, nullable=True)
+    workspace_path = Column(String, nullable=False, unique=True)
+    last_sequence = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    archived_at = Column(DateTime, nullable=True)
+
+    project = relationship("ProjectModel", back_populates="sessions")
+    messages = relationship("ConversationMessageModel", back_populates="workspace_session", passive_deletes="all")
+
+    __table_args__ = (CheckConstraint("last_sequence >= 0", name="ck_workspace_session_sequence"),)
+
+
+class ConversationMessageModel(Base):
+    __tablename__ = "conversation_messages"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    workspace_session_id = Column(String, ForeignKey("workspace_sessions.id", ondelete="RESTRICT"), nullable=False)
+    role = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    sequence = Column(Integer, nullable=False)
+    client_message_id = Column(String(200), nullable=True)
+    # Traceability only; no execution relationship or evidence provenance implied.
+    source_trajectory_event_id = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    workspace_session = relationship("WorkspaceSessionModel", back_populates="messages")
+
+    __table_args__ = (
+        CheckConstraint("role IN ('user', 'assistant')", name="ck_conversation_message_role"),
+        CheckConstraint("sequence > 0", name="ck_conversation_message_sequence"),
+        UniqueConstraint("workspace_session_id", "sequence", name="uq_conversation_message_sequence"),
+        Index("uq_conversation_message_client_id", "workspace_session_id", "client_message_id",
+              unique=True, sqlite_where=text("client_message_id IS NOT NULL")),
+    )
+
 
 class ProviderConfigModel(Base):
     __tablename__ = "providers"

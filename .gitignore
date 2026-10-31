@@ -1,3 +1,6 @@
+# Tests (kept local only, never published to GitHub)
+/tests/
+
 # Temporary/test files (moved to tmp/ directory)
 tmp/
 
@@ -83,3 +86,5 @@ frontend/.vite/
 .DS_Store
 Thumbs.db
 AGENTS.md
+/tests
+/tests
