@@ -123,6 +123,7 @@ class SwarmCoordinator:
         self.verifier = verifier or FlagVerifier()
         self.workspace_root = workspace_root
         self.mission_id = mission_id or str(uuid.uuid4())
+        self._run_task: Optional[asyncio.Task] = None
         self._stopped = False
         self._stop_reason = ""
 
@@ -205,6 +206,7 @@ class SwarmCoordinator:
     # ================================================================== #
 
     async def run(self, *, resume: bool = False) -> MissionResult:
+        self._run_task = asyncio.current_task()
         active_missions[self.mission_id] = self
         if self.challenge_key:
             active_missions[self.challenge_key] = self
@@ -238,6 +240,7 @@ class SwarmCoordinator:
             active_missions.pop(self.mission_id, None)
             if self.challenge_key and active_missions.get(self.challenge_key) is self:
                 active_missions.pop(self.challenge_key, None)
+            self._run_task = None
 
     @classmethod
     async def resume_mission(cls, mission_id: str, **kwargs: Any) -> Optional[MissionResult]:
@@ -1046,6 +1049,15 @@ class SwarmCoordinator:
     # ================================================================== #
     # Small helpers
     # ================================================================== #
+
+    @property
+    def is_running(self) -> bool:
+        """Execution liveness, including worker shutdown after a stop or flag.
+
+        Mission status may become COMPLETED before workers finish unwinding.
+        Reuse the task executing run(), not another registry or status flag.
+        """
+        return self._run_task is not None and not self._run_task.done()
 
     @property
     def challenge_key(self) -> Optional[str]:

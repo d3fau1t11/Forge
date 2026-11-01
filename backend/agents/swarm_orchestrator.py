@@ -1190,6 +1190,7 @@ class SwarmOrchestrator:
 
                 # LEARN → STORE: distill this solve into generalized experience (§3, §19).
                 await self._learn_from_run(board, outcome="success")
+                final_status = "COMPLETED"
             elif board.pause_requested:
                 # Operator paused — persist a resume snapshot and finalize as PAUSED
                 # (resumable), never FAILED. Progress and blackboard state are kept.
@@ -1206,6 +1207,7 @@ class SwarmOrchestrator:
                     "challenge_id": challenge_id,
                     "run_id": run_id
                 })
+                final_status = "PAUSED"
             else:
                 stall_msg = board.stall_reason or "Swarm finished without a verified flag (task pool exhausted)"
                 if run_obj:
@@ -1231,12 +1233,17 @@ class SwarmOrchestrator:
                 # what was attempted and why it stalled so future missions avoid the same
                 # dead ends, and down-weight any retrieved memory that did not help.
                 await self._learn_from_run(board, outcome="failed")
+                final_status = "FAILED"
 
             # Generate structured report
             try:
                 report_generator.generate_final_report(challenge_id=challenge_id, run_id=run_id, db=db)
             except Exception as e:
                 logger.warning(f"[SwarmOrchestrator] Report generation skip: {e}")
+
+            # Return only AFTER reporting; the task remains live through report
+            # generation and the existing finally-block shutdown.
+            return final_status
 
         except Exception as e:
             logger.error(f"[SwarmOrchestrator] Swarm execution exception: {e}\n{traceback.format_exc()}")
@@ -1250,6 +1257,8 @@ class SwarmOrchestrator:
                     db.commit()
             except Exception:
                 pass
+            # Internal exception still ends the run (fail-closed terminal state).
+            return "ERROR"
         finally:
             db.close()
             self.active_swarms.pop(run_id, None)
