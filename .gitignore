@@ -1,4 +1,4 @@
-# Tests (kept local only, never published to GitHub)
+# Tests and all subdirectories (kept local only, never published to GitHub)
 /tests/
 
 # Temporary/test files (moved to tmp/ directory)
@@ -46,6 +46,7 @@ logs/
 scratch/
 .serena/
 .agents/
+.claude/
 CLAUDE.md
 backend/knowledge/playbooks/
 !backend/knowledge/playbooks/.gitkeep
@@ -55,6 +56,15 @@ hacktricks/
 # Environment variables
 .env
 .env.local
+
+# Private key files (kept local only)
+*.key
+*.pem
+*.p12
+*.pfx
+*.p8
+id_rsa
+id_ed25519
 
 # Report / audit markdown: one-off analysis artifacts, never committed.
 # Rule: any *report*.md or *audit*.md is ignored (both letter cases). This covers
@@ -88,3 +98,4 @@ Thumbs.db
 AGENTS.md
 /tests
 /tests
+tests/test_privilege_classifier.py
