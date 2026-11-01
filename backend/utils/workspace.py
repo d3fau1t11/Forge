@@ -35,6 +35,15 @@ Residual limitation:
     via open file descriptors at every step — a larger redesign outside this
     fix. Treat these endpoints as reachable only by a local, trusted frontend:
     they are currently unauthenticated and CORS is not authorization.
+
+PF02 note: challenge workspace ALLOCATION, ownership validation, execution
+resolution, and deletion authorization no longer live here. They moved to
+backend.utils.challenge_workspace, which keeps the low-level containment
+primitives from this module but separates the three decisions that used to
+collapse into is_deletable_working_dir / resolve_safe_working_dir.
+safe_working_dir_for and resolve_safe_working_dir were removed once their
+callers (challenge creation/run dispatch/report writing) were migrated to the
+challenge-UUID-based allocation and resolution in backend.utils.challenge_workspace.
 """
 
 import os
@@ -141,27 +150,8 @@ def is_deletable_working_dir(clean_path: str) -> bool:
     return True
 
 
-def safe_working_dir_for(challenge_id: str, category: str = "", name: str = "") -> str:
-    """Return a guaranteed-safe absolute working directory for a challenge.
-
-    Used as the fallback when a challenge's stored working_directory is missing,
-    empty, ".", or otherwise not safely inside CTF_WORKSPACE_ROOT. The path is
-    deterministic per challenge so repeated runs reuse the same directory.
-    """
-    safe_cat = "".join(c for c in (category or "misc") if c.isalnum() or c in ("-", "_")) or "misc"
-    safe_id = "".join(c for c in (challenge_id or "unknown") if c.isalnum() or c in ("-", "_")) or "unknown"
-    return os.path.join(CTF_WORKSPACE_ROOT, "_workspaces", safe_cat, safe_id)
-
-
-def resolve_safe_working_dir(stored: str, challenge_id: str, category: str = "", name: str = "") -> str:
-    """Resolve a challenge's working directory to a safe absolute path.
-
-    If `stored` resolves to a path strictly inside CTF_WORKSPACE_ROOT it is used
-    as-is; otherwise a safe per-challenge fallback is returned. Never returns the
-    project root, home, or a system root.
-    """
-    if stored and isinstance(stored, str) and stored.strip():
-        candidate = os.path.abspath(stored.strip())
-        if is_deletable_working_dir(candidate):
-            return candidate
-    return safe_working_dir_for(challenge_id, category, name)
+# PF02: safe_working_dir_for and resolve_safe_working_dir were removed here.
+# Challenge workspaces are now resolved exclusively by
+# backend.utils.challenge_workspace (validate_challenge_workspace), which
+# separates execution-path validation from deletion authorization and
+# allocates under CTF_WORKSPACE_ROOT/_challenges/<challenge UUID>/.

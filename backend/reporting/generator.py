@@ -32,7 +32,7 @@ from backend.database.models import (
     ChallengeModel, TargetProfileModel, EvidenceModel, FindingModel,
     RunModel, ToolExecutionModel, ExperienceModel, ReportModel,
 )
-from backend.utils.workspace import resolve_safe_working_dir
+from backend.utils.challenge_workspace import validate_challenge_workspace
 
 logger = logging.getLogger("forge.reporting")
 
@@ -455,9 +455,9 @@ class ReportGenerator:
         if output_dir:
             target_dir = os.path.abspath(output_dir)
         else:
-            # Safe path resolution — never the project root/home (see backend.utils.workspace).
-            target_dir = resolve_safe_working_dir(
-                challenge.working_directory, challenge_id, challenge.category or "", challenge.name or "")
+            # PF02 resolution — the challenge's own validated workspace only
+            # (see backend.utils.challenge_workspace).
+            target_dir = validate_challenge_workspace(challenge_id, challenge.working_directory)
         os.makedirs(target_dir, exist_ok=True)
 
         safe_name = "".join(c if (c.isalnum() or c in (" ", "-", "_")) else "_"

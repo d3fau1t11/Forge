@@ -10,12 +10,27 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 
 from backend.database.session import get_db
+from backend.utils import challenge_workspace
 from backend.database.models import (
     ChallengeModel, TargetProfileModel, RunModel, AgentStateModel,
     CheckpointModel, ToolExecutionModel, FindingModel, EvidenceModel,
     ReportModel, KnowledgeEntryModel, ProviderUsageModel, AuditLogModel,
-    ProviderConfigModel,
-    SwarmMissionModel, SwarmTaskModel, SwarmEvidenceModel,
+    ProviderConfigModel, SwarmMissionModel, SwarmTaskModel, SwarmEvidenceModel,
+    generate_uuid,
+)
+from backend.utils.challenge_workspace import (
+    ChallengeWorkspaceError,
+    cleanup_targets,
+    delete_challenge_workspace,
+    is_legacy_compatible_path,
+    is_missing_workspace_path,
+    is_owned_identity,
+    is_owned_workspace,
+)
+from backend.utils.workspace import (
+    CTF_WORKSPACE_ROOT,
+    is_valid_directory_name,
+    is_within_workspace,
 )
 from backend.environment.detector import environment_detector
 from backend.providers.router import model_router
@@ -27,40 +42,163 @@ from backend.api.runner import workflow_runner
 from backend.websocket.manager import ws_manager
 from backend.reporting.generator import report_generator
 from backend.privilege.manager import privilege_manager
-from backend.utils.workspace import (
-    CTF_WORKSPACE_ROOT,
-    is_deletable_working_dir,
-    is_valid_directory_name,
-    is_within_workspace,
-    resolve_safe_working_dir,
-)
 
 router = APIRouter()
 logger = logging.getLogger("forge.routes")
 
-def _safe_delete_working_dir(working_dir: str):
-    """Delete a challenge working directory ONLY if it is safely inside the CTF workspace root.
 
-    Historic bug: challenges created before the ~/Documents/CTF hierarchy stored
-    working_directory="." which resolved to the project root, so rmtree wiped the
-    whole project. Path safety now lives in backend.utils.workspace and uses a
-    strict allowlist instead of a blocklist.
+def _workspace_http_error(exc: ChallengeWorkspaceError):
+    """Map a ChallengeWorkspaceError to an HTTP error with a machine-readable code."""
+    status = 500 if getattr(exc, "code", "") == "workspace_cleanup_failed" else 409
+    return HTTPException(status_code=status, detail={"code": getattr(exc, "code", "workspace_error"),
+                                                     "message": str(exc)})
+
+
+def _runner_run_is_live(run_id: str, info: dict) -> bool:
+    """A pending task remains live even after a cancellation/pause request.
+
+    A done task is inactive even before its done callback updates RUNNING.
+    Without a task handle, retain the existing conservative RUNNING check.
     """
-    if not working_dir or not isinstance(working_dir, str):
-        return
-    clean_path = os.path.abspath(working_dir.strip())
-    if not is_deletable_working_dir(clean_path):
-        logger.warning(
-            f"Refused to delete working directory outside CTF workspace root: {clean_path} "
-            f"(workspace root: {CTF_WORKSPACE_ROOT})"
-        )
-        return
-    if os.path.exists(clean_path) and os.path.isdir(clean_path):
+    task = workflow_runner.tasks.get(run_id)
+    if task is not None:
+        return not task.done()
+    return info.get("status") == "RUNNING"
+
+
+def _assert_workspace_not_in_use(challenge_id: str):
+    """Refuse cleanup while a run (workflow runner or live swarm) is using the workspace.
+
+    Sources consulted (none of them duplicated — each is the registry that owns
+    that execution kind's lifecycle):
+
+    * workflow_runner.active_runs — run status, supplemented by task liveness
+      (``workflow_runner.tasks``) so done-task callback residue is not mistaken
+      for a live run (PF02 F-01);
+    * swarm_orchestrator.active_swarms — live legacy blackboard swarms;
+    * coordinator.active_missions — matching challenge identities and the task
+      executing each mission (PF02 F-04), including shutdown after a flag/stop.
+
+    MULTI-WORKER BOUNDARY (PF02 F-03 — deferred, NOT fixed here): all of these
+    registries are in-process memory. Startup and deletion are not synchronized,
+    even in one process; executions in other workers are also invisible here.
+    This is not a race-free guard or a multi-worker deployment safety guarantee.
+    Shared execution/deletion coordination is required before multi-worker use.
+    """
+    active = [rid for rid, info in workflow_runner.active_runs.items()
+              if info.get("challenge_id") == challenge_id
+              and _runner_run_is_live(rid, info)]
+    if not active:
         try:
-            shutil.rmtree(clean_path, ignore_errors=True)
-            logger.info(f"Successfully deleted challenge working directory: {clean_path}")
-        except Exception as e:
-            logger.warning(f"Error removing working directory {clean_path}: {e}")
+            from backend.agents.swarm_orchestrator import swarm_orchestrator
+            if any(getattr(board, "challenge_id", None) == challenge_id
+                   and not getattr(board, "is_stopped", False)
+                   for board in list(getattr(swarm_orchestrator, "active_swarms", {}).values())):
+                active.append("live_swarm")
+        except Exception:  # swarm subsystem unavailable — workflow_runner check still applies
+            pass
+    if not active:
+        # Check values rather than the challenge alias alone: several missions
+        # can share a challenge while each retains its own mission-id entry.
+        try:
+            from backend.swarm.coordinator import active_missions
+            if any(coord.challenge_key == challenge_id and coord.is_running
+                   for coord in list(active_missions.values())):
+                active.append("coordinated_mission")
+        except Exception:  # coordinator subsystem unavailable — other checks still apply
+            pass
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "workspace_in_use",
+                    "message": f"Challenge has an active run ({', '.join(active)}); "
+                               f"pause or wait for it to finish before deleting"})
+
+
+def _other_legacy_holders(db: Session, candidate: str, delete_ids: set) -> List[str]:
+    """Challenge ids OUTSIDE the delete set that record the same workspace path.
+
+    Ambiguous ownership guard for narrowly validated legacy layout paths: a
+    directory a different, still-kept challenge record claims is never adopted
+    and never cleaned up. New-style canonical slots are unique per UUID and are
+    not affected.
+    """
+    candidate_nc = os.path.normcase(candidate)
+    holders = []
+    for cid, wd in db.query(ChallengeModel.id, ChallengeModel.working_directory).all():
+        if cid in delete_ids or not (wd and wd.strip()):
+            continue
+        try:
+            holder_nc = os.path.normcase(os.path.abspath(wd.strip()))
+        except (OSError, ValueError, TypeError):
+            continue
+        if holder_nc == candidate_nc:
+            holders.append(cid)
+    return holders
+
+
+def _require_deletable_workspace(challenges, delete_ids: set, db: Session):
+    """Validate every cleanup target BEFORE anything is deleted (all-or-nothing).
+
+    Raises 409 when a recorded workspace is not owned by its challenge (project
+    workspace, another challenge's slot, a reserved namespace, a redirected
+    symlink path, outside the CTF root, the CTF/repo roots) or when a legacy
+    path is still claimed by a challenge that is not being deleted.
+
+    Exception (PF02 F-02): an absent recorded path generates no filesystem
+    cleanup target, so the record can be deleted without owning that path.
+    Dangling links and access errors do not count as absence; existing unowned
+    directories still receive the full refusal.
+    """
+    for challenge in challenges:
+        stored = challenge.working_directory or ""
+        if not stored.strip():
+            continue
+        candidate = os.path.abspath(stored.strip())
+        if is_missing_workspace_path(candidate):
+            # Database-only recovery; never adopt/recreate an absent directory.
+            continue
+        if is_owned_identity(challenge.id, stored):
+            # Owned by identity (the directory itself may already be gone after
+            # an interrupted cleanup); deletion no-ops for missing directories.
+            continue
+        if not is_legacy_compatible_path(candidate):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "workspace_not_owned",
+                        "message": f"Refused to delete: workspace {candidate!r} is not "
+                                   f"owned by challenge {challenge.id}"})
+        others = _other_legacy_holders(db, candidate, delete_ids)
+        if others:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "workspace_ownership_ambiguous",
+                        "message": f"Workspace {candidate!r} is also recorded by challenge(s) "
+                                   f"{', '.join(others)}; delete those first or accept keeping it"})
+
+
+def _cleanup_challenge_workspaces(challenges):
+    """Remove exactly the validated workspace directories of the given challenges.
+
+    Failures propagate as HTTPException(500, code=workspace_cleanup_failed) so a
+    partial cleanup is surfaced instead of silently reporting success; the
+    database rows are then untouched and a retry completes the lifecycle.
+    """
+    removed: List[str] = []
+    for challenge in challenges:
+        for target in cleanup_targets(challenge.id, challenge.working_directory or ""):
+            try:
+                path = delete_challenge_workspace(target)
+            except ChallengeWorkspaceError as exc:
+                logger.error(
+                    f"Failure removing challenge workspace: {exc} "
+                    f"(removed so far: {removed or 'none'})")
+                raise _workspace_http_error(exc)
+            if path:
+                removed.append(path)
+                logger.info(f"Deleted challenge workspace: {path}")
+    return removed
+
 
 def _delete_challenge_log(challenge_id: str):
     """Delete the dedicated challenge log file if it exists."""
@@ -210,26 +348,38 @@ def get_challenge_plan(challenge_id: str, db: Session = Depends(get_db)):
 
 @router.delete("/challenges/{challenge_id}")
 async def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
-    """Deletes a challenge from the database, cascading to runs/findings, and deletes its working directory on disk."""
+    """Deletes a challenge from the database, cascading to runs/findings, and deletes
+    ONLY its owned workspace on disk (PF02 lifecycle).
+
+    Ordering keeps cleanup recoverable: (1) ownership is validated against the
+    record and cross-checked against other records, (2) the filesystem cleanup
+    runs first and any failure is raised (HTTP 500, code workspace_cleanup_failed)
+    leaving the database untouched, (3) the database rows are deleted last — so a
+    failed attempt can be retried and a completed attempt cannot leave a
+    workspace whose record is already gone.
+    """
     challenge = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
-    
-    working_dir = challenge.working_directory
-    
-    # 1. Delete associated reports
+
+    # 1. Safety gates: no cleanup while a run is actively using the workspace and
+    #    only for a workspace this challenge owns.
+    _assert_workspace_not_in_use(challenge_id)
+    _require_deletable_workspace([challenge], {challenge_id}, db)
+
+    # 2. Filesystem cleanup first — failures surface, nothing is destroyed
+    #    beyond the challenge's own validated directories.
+    _cleanup_challenge_workspaces([challenge])
+
+    # 3. Database deletion (reports cascade to the challenge delete below)
     db.query(ReportModel).filter(ReportModel.challenge_id == challenge_id).delete()
-    
-    # 2. Delete challenge (SQLAlchemy relationship cascade deletes runs, targets, checkpoints, tool_executions, evidence, findings)
+    # SQLAlchemy relationship cascade deletes runs, targets, checkpoints, tool_executions, evidence, findings
     db.delete(challenge)
     db.commit()
-    
-    # 3. Clean up challenge working directory on disk safely
-    _safe_delete_working_dir(working_dir)
-    
+
     # 4. Clean up challenge dedicated log file
     _delete_challenge_log(challenge_id)
-    
+
     # 5. Broadcast real-time WebSocket event
     try:
         await ws_manager.broadcast({
@@ -238,27 +388,36 @@ async def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
         })
     except Exception:
         pass
-        
+
     return {
         "status": "SUCCESS",
-        "message": f"Challenge '{challenge_id}' and associated working directory deleted successfully.",
+        "message": f"Challenge '{challenge_id}' and owned workspace deleted successfully.",
         "challenge_id": challenge_id
     }
 
 @router.delete("/challenges")
 async def delete_all_challenges(db: Session = Depends(get_db)):
-    """Deletes all challenges from the database and deletes all associated working directories on disk."""
+    """Deletes all challenges from the database and their owned workspaces on disk.
+
+    All workspaces are validated first (including cross-record legacy ambiguity);
+    only then are the directories and database rows removed.
+    """
     challenges = db.query(ChallengeModel).all()
+    delete_ids = {ch.id for ch in challenges}
+    for ch in challenges:
+        _assert_workspace_not_in_use(ch.id)
+    _require_deletable_workspace(challenges, delete_ids, db)
+
     deleted_count = 0
     for ch in challenges:
-        working_dir = ch.working_directory
+        # Filesystem first, then the row, so interruptions are retryable.
+        _cleanup_challenge_workspaces([ch])
         ch_id = ch.id
         db.query(ReportModel).filter(ReportModel.challenge_id == ch_id).delete()
         db.delete(ch)
-        _safe_delete_working_dir(working_dir)
         _delete_challenge_log(ch_id)
         deleted_count += 1
-    
+
     db.commit()
     
     try:
@@ -282,10 +441,17 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
     difficulty = req.difficulty.strip().upper() if req.difficulty else "MEDIUM"
     name = req.name.strip() if (req.name and req.name.strip()) else "Challenge_Target"
 
-    # Enforce structured hierarchy: ~/Documents/CTF/<Platform>/<Category>/<Difficulty>/<Name>
-    ctf_root_dir = os.path.expanduser(os.path.join("~", "Documents", "CTF"))
-    working_dir = os.path.abspath(os.path.join(ctf_root_dir, platform, category, difficulty, name))
-    os.makedirs(working_dir, exist_ok=True)
+    # PF02: the workspace identity is the challenge UUID only — generated before
+    # allocation, independent of platform/category/difficulty/name metadata.
+    # Allocation is collision-refusing (never adopts an existing directory) and
+    # lives in the dedicated _challenges namespace, so project workspaces
+    # (_projects) and legacy layout directories can never be adopted.
+    challenge_id = generate_uuid()
+    try:
+        working_dir = challenge_workspace.allocate_challenge_directory(challenge_id)
+    except ChallengeWorkspaceError as exc:
+        logger.error(f"Challenge workspace allocation refused for {challenge_id}: {exc}")
+        raise _workspace_http_error(exc)
 
     # Move any operator-uploaded artifacts (staged by POST /challenges/upload) into
     # the challenge workspace byte-for-byte, and collect their final paths.
@@ -301,6 +467,7 @@ async def create_challenge(req: CreateChallengeRequest, db: Session = Depends(ge
             logger.warning(f"Could not stage uploaded artifact '{_src}': {_move_err}")
 
     challenge = ChallengeModel(
+        id=challenge_id,
         name=name,
         category=category,
         difficulty=difficulty,
@@ -477,7 +644,9 @@ def get_checkpoint(challenge_id: str, db: Session = Depends(get_db)):
 # delete_all_challenges near the top). Duplicate unguarded definitions that
 # called shutil.rmtree(working_directory) with no path validation used to live
 # here and were removed — they were the destructive path that could wipe the
-# project root. Do not reintroduce disk deletion without _safe_delete_working_dir.
+# project root. Do not reintroduce disk deletion: challenge workspace cleanup
+# goes through backend.utils.challenge_workspace (ownership + namespace checks,
+# filesystem-before-database order) via _cleanup_challenge_workspaces.
 
 @router.post("/challenges/{challenge_id}/pause")
 async def pause_challenge(challenge_id: str, db: Session = Depends(get_db)):

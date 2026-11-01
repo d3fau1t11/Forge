@@ -6,8 +6,38 @@ from typing import Dict, Any, Optional
 
 logger = logging.getLogger("forge.runner")
 
+# Terminal statuses a run entry may hold once its underlying task has ended.
+# Matches existing engine outcomes, plus CANCELLED for cancelled tasks.
+# Registry bookkeeping only; the engines' database writes remain unchanged.
+TERMINAL_RUN_STATUSES = ("COMPLETED", "PAUSED", "FAILED", "ERROR", "CANCELLED")
+
+
+def _terminal_status_for_result(result: Any) -> str:
+    """Map a finished engine task's result to a terminal run status.
+
+    Legacy swarm runs return a final status string (COMPLETED/PAUSED/FAILED/
+    ERROR) that run_swarm already wrote to the RunModel row; coordinated
+    missions return a MissionResult whose ``status`` uses the same vocabulary.
+    An unrecognized result still maps to COMPLETED — the task itself completed
+    normally — so an entry can never be left RUNNING by a mapped result.
+    """
+    status = result.strip() if isinstance(result, str) else getattr(result, "status", None)
+    if isinstance(status, str):
+        status = status.strip().upper()
+        if status in TERMINAL_RUN_STATUSES:
+            return status
+    return "COMPLETED"
+
+
 class WorkflowRunner:
-    """Manages execution state, kill switch, and active autonomous run loops."""
+    """Manages execution state, kill switch, and active autonomous run loops.
+
+    Lifecycle note (PF02 F-03 boundary): the registries maintained here are
+    in-process memory. They are consumed by challenge-deletion authorization
+    (_assert_workspace_not_in_use). Startup/deletion synchronization (PF02
+    F-03) is still deferred, including within a single process; multi-worker
+    deployment additionally needs shared execution/deletion coordination.
+    """
 
     def __init__(self):
         self.active_runs: Dict[str, Dict[str, Any]] = {}
@@ -31,7 +61,7 @@ class WorkflowRunner:
         model: Optional[str] = None,
         resume: bool = False
     ):
-        self.active_runs[run_id] = {
+        run_info = {
             "run_id": run_id,
             "challenge_id": challenge_id,
             "target": target,
@@ -39,6 +69,7 @@ class WorkflowRunner:
             "current_phase": "recon",
             "current_agent": engine_type or "auto"
         }
+        self.active_runs[run_id] = run_info
         self.kill_switches[run_id] = False
 
         # Engine selection. The legacy blackboard swarm remains the DEFAULT so all
@@ -53,7 +84,11 @@ class WorkflowRunner:
 
             from backend.database.session import SessionLocal
             from backend.database.models import ChallengeModel
-            from backend.utils.workspace import resolve_safe_working_dir
+            # PF02: execution-path validation lives in challenge_workspace, separate
+            # from deletion authorization. Resolution returns the challenge's own
+            # canonical slot (_challenges/<UUID>) or a narrowly validated legacy
+            # path; unrelated/redirected/project paths are never returned.
+            from backend.utils.challenge_workspace import validate_challenge_workspace
 
             db = SessionLocal()
             ch = db.query(ChallengeModel).filter(ChallengeModel.id == challenge_id).first()
@@ -66,12 +101,10 @@ class WorkflowRunner:
             # timer) is stashed in mission_plan.run_config at creation time.
             run_config = (ch.mission_plan or {}).get("run_config", {}) if ch else {}
             # Never let a missing/"." working_directory resolve to the project root —
-            # resolve to a safe path strictly inside the CTF workspace.
-            workdir = resolve_safe_working_dir(
-                ch.working_directory if ch else "",
+            # resolve to the challenge's own validated workspace.
+            workdir = validate_challenge_workspace(
                 challenge_id,
-                category,
-                ch.name if ch else "",
+                ch.working_directory if ch else "",
             )
             os.makedirs(workdir, exist_ok=True)
             db.close()
@@ -120,21 +153,39 @@ class WorkflowRunner:
                 )
                 selected_engine = "swarm"
 
-            # Attach error callback so unhandled exceptions surface in logs
+            # Attach done callback so the workflow-runner registry reflects the
+            # ACTUAL task lifecycle (PF02 F-01): a finished, failed, cancelled,
+            # or paused task must never remain marked RUNNING, or completed
+            # challenges can no longer be deleted (409 workspace_in_use).
             def _on_task_done(t: asyncio.Task):
-                if t.cancelled():
-                    logger.info(f"Run task {run_id} was cancelled.")
-                    return
-                exc = t.exception()
-                if exc:
-                    import traceback as tb
-                    logger.error(f"Run task {run_id} crashed with unhandled exception: {exc}\n{''.join(tb.format_exception(type(exc), exc, exc.__traceback__))}")
-                    # Write to challenge log file for visibility
-                    try:
-                        from backend.agents.swarm_orchestrator import _append_to_challenge_log
-                        _append_to_challenge_log(challenge_id, "runner", f"FATAL: {exc}")
-                    except Exception:
-                        pass
+                terminal = "FAILED"
+                try:
+                    if t.cancelled():
+                        terminal = "CANCELLED"
+                        logger.info(f"Run task {run_id} was cancelled.")
+                    else:
+                        exc = t.exception()
+                        if exc is not None:
+                            terminal = "FAILED"
+                            import traceback as tb
+                            logger.error(f"Run task {run_id} crashed with unhandled exception: {exc}\n{''.join(tb.format_exception(type(exc), exc, exc.__traceback__))}")
+                            # Write to challenge log file for visibility
+                            try:
+                                from backend.agents.swarm_orchestrator import _append_to_challenge_log
+                                _append_to_challenge_log(challenge_id, "runner", f"FATAL: {exc}")
+                            except Exception:
+                                pass
+                        else:
+                            terminal = _terminal_status_for_result(t.result())
+                            logger.info(f"Run task {run_id} finished with terminal status {terminal}.")
+                finally:
+                    # Unconditional, exception-safe transition: whatever happened
+                    # inside this callback, the entry must not stay RUNNING.
+                    # A delayed callback from an earlier dispatch must not
+                    # finalize a newer task registered under the same run id.
+                    if (self.active_runs.get(run_id) is run_info
+                            and self.tasks.get(run_id) is t):
+                        run_info["status"] = terminal
 
             task.add_done_callback(_on_task_done)
             self.tasks[run_id] = task
@@ -142,9 +193,11 @@ class WorkflowRunner:
 
         except RuntimeError as e:
             import traceback as tb
+            run_info["status"] = "FAILED"
             logger.error(f"Failed to create run task for run {run_id}: {e}\n{tb.format_exc()}")
         except Exception as e:
             import traceback as tb
+            run_info["status"] = "FAILED"
             logger.error(f"Unexpected error starting run task for run {run_id}: {e}\n{tb.format_exc()}")
 
     def activate_kill_switch(self, run_id: Optional[str] = None):
