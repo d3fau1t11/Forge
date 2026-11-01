@@ -28,6 +28,7 @@ MAX_CONTEXT_BYTES = 16_384
 MAX_REQUEST_BYTES = 262_144
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200, strict=True)]
 Content = Annotated[str, StringConstraints(min_length=1, max_length=MAX_CONTENT_BYTES, strict=True)]
+ClientMessageId = Annotated[str, StringConstraints(min_length=1, max_length=200, strict=True)]
 
 
 def _error(status, code, message, headers=None):
@@ -106,7 +107,14 @@ class UpdateSessionRequest(WorkspaceRequest):
 
 class AppendMessageRequest(WorkspaceRequest):
     content: Content
-    client_message_id: Optional[Name] = None
+    client_message_id: Optional[ClientMessageId] = None
+
+    @field_validator("client_message_id")
+    @classmethod
+    def meaningful_client_id(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError("Client message ID must not be blank")
+        return value
 
     @field_validator("content")
     @classmethod
