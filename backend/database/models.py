@@ -622,3 +622,38 @@ class SwarmEvidenceModel(Base):
     __table_args__ = (
         Index("ix_swarm_evidence_mission_type", "mission_id", "evidence_type"),
     )
+
+
+class SessionExecutionBindingModel(Base):
+    """Accepted execution identity and launch context; not an execution engine.
+
+    The snapshot lives in the binding row so acceptance is one atomic insert.
+    Workspace parents use the existing archive-only, restrictive lifecycle.
+    Challenge/run identities follow AgentSessionModel's retained provenance
+    pattern: plain strings, validated by the persistence service at creation,
+    so deleting a challenge and its runs does not delete conversation history.
+    """
+    __tablename__ = "session_execution_bindings"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    project_id = Column(String, ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True)
+    workspace_session_id = Column(String, ForeignKey("workspace_sessions.id", ondelete="RESTRICT"), nullable=False)
+    initiating_message_id = Column(String, ForeignKey("conversation_messages.id", ondelete="RESTRICT"), nullable=True)
+    challenge_id = Column(String, nullable=False, index=True)
+    run_id = Column(String, nullable=False)
+    idempotency_key = Column(String(200), nullable=False)
+    message_cutoff_sequence = Column(Integer, nullable=False)
+    # A serialized value, never a mutable JSON object linked to live context.
+    snapshot_json = Column(Text, nullable=False)
+    snapshot_sha256 = Column(String(64), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_session_execution_idempotency_key"),
+        # An execution run has one owning conversation session and one acceptance.
+        UniqueConstraint("run_id", name="uq_session_execution_run"),
+        CheckConstraint("message_cutoff_sequence >= 0", name="ck_session_execution_cutoff"),
+        CheckConstraint("length(idempotency_key) BETWEEN 1 AND 200", name="ck_session_execution_key_length"),
+        CheckConstraint("length(snapshot_sha256) = 64", name="ck_session_execution_snapshot_digest"),
+        Index("ix_session_execution_session_created", "workspace_session_id", "created_at", "id"),
+    )
