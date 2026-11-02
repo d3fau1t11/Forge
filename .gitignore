@@ -1,4 +1,5 @@
-# Tests and all subdirectories (kept local only, never published to GitHub)
+# Root-layout rule: all test and verification source belongs under tests/.
+# Tests and all subdirectories are kept local only and never published to GitHub.
 /tests/
 
 # Temporary/test files (moved to tmp/ directory)
@@ -76,9 +77,10 @@ id_ed25519
 *REPORT*.md
 *report*.md
 
-# Documentation (never published to GitHub).
-# All project documentation, reports, and analysis artifacts live under docs/
-# (incl. docs/reports/) and are excluded from version control.
+# Documentation (never published to GitHub). AGENTS.md and README.md are the only
+# project documents permitted in the repository root; every other project document,
+# report, plan, summary, audit, specification, or analysis artifact belongs under
+# docs/ (including docs/reports/) and is excluded from version control.
 /docs/
 
 # Design Reference Assets
@@ -96,6 +98,3 @@ frontend/.vite/
 .DS_Store
 Thumbs.db
 AGENTS.md
-/tests
-/tests
-tests/test_privilege_classifier.py

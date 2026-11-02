@@ -15,7 +15,8 @@ from sqlalchemy.orm import Session
 
 from backend.api.auth import require_api_token
 from backend.database.models import (
-    ProjectModel, WorkspaceSessionModel, ConversationMessageModel, generate_uuid,
+    ProjectModel, WorkspaceSessionModel, ConversationMessageModel,
+    SessionExecutionBindingModel, generate_uuid,
 )
 from backend.database.session import get_db
 from backend.utils.project_workspace import (
@@ -26,6 +27,8 @@ from backend.utils.project_workspace import (
 MAX_CONTENT_BYTES = 64_000
 MAX_CONTEXT_BYTES = 16_384
 MAX_REQUEST_BYTES = 262_144
+# SQLite binds execution-history OFFSET values as signed 64-bit integers.
+MAX_EXECUTION_HISTORY_OFFSET = 2**63 - 1
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200, strict=True)]
 Content = Annotated[str, StringConstraints(min_length=1, max_length=MAX_CONTENT_BYTES, strict=True)]
 ClientMessageId = Annotated[str, StringConstraints(min_length=1, max_length=200, strict=True)]
@@ -159,6 +162,17 @@ class MessageResponse(PersistedResponse):
     sequence: int
     client_message_id: Optional[str]
     source_trajectory_event_id: Optional[str]
+
+
+class SessionExecutionBindingResponse(PersistedResponse):
+    project_id: UUID
+    workspace_session_id: UUID
+    initiating_message_id: Optional[str]
+    challenge_id: str
+    run_id: str
+    message_cutoff_sequence: int
+    snapshot_json: str
+    snapshot_sha256: str
 
 
 @contextmanager
@@ -323,6 +337,26 @@ def list_messages(project_id: UUID, session_id: UUID, limit: int = Query(50, ge=
     return db.scalars(select(ConversationMessageModel).where(
         ConversationMessageModel.workspace_session_id == str(session_id),
     ).order_by(ConversationMessageModel.sequence).offset(offset).limit(limit)).all()
+
+
+@router.get("/{project_id}/sessions/{session_id}/execution-bindings",
+            response_model=list[SessionExecutionBindingResponse])
+def list_execution_bindings(project_id: UUID, session_id: UUID, limit: int = Query(50, ge=1, le=200),
+                            offset: int = Query(0, ge=0, le=MAX_EXECUTION_HISTORY_OFFSET),
+                            db: Session = Depends(get_db)):
+    project, session = _session(db, project_id, session_id)
+    rows = db.scalars(select(SessionExecutionBindingModel).where(
+        SessionExecutionBindingModel.project_id == project.id,
+        SessionExecutionBindingModel.workspace_session_id == session.id,
+    ).order_by(SessionExecutionBindingModel.created_at, SessionExecutionBindingModel.id)
+      .offset(offset).limit(limit)).all()
+    # Return the stored canonical JSON verbatim; never rebuild launch context.
+    return [SessionExecutionBindingResponse(
+        id=row.id, project_id=row.project_id, workspace_session_id=row.workspace_session_id,
+        initiating_message_id=row.initiating_message_id, challenge_id=row.challenge_id, run_id=row.run_id,
+        created_at=row.created_at, message_cutoff_sequence=row.message_cutoff_sequence,
+        snapshot_json=row.snapshot_json, snapshot_sha256=row.snapshot_sha256,
+    ) for row in rows]
 
 
 @router.post("/{project_id}/sessions/{session_id}/messages", response_model=MessageResponse, status_code=201,

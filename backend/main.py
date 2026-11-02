@@ -111,6 +111,11 @@ async def on_shutdown():
             logger.info(f"[Shutdown] Closed {closed} tracked interactive session(s).")
     except Exception as e:
         logger.warning(f"[Shutdown] Interactive session cleanup failed: {e}")
+    try:
+        from backend.execution.process_manager import process_manager
+        await process_manager.retry_taskkill_helpers(timeout_seconds=3.0)
+    except Exception as e:
+        logger.warning(f"[Shutdown] Retained taskkill helper cleanup failed: {e}")
 
 # Public, unauthenticated readiness probe. /health exposes no application data
 # (only OS/tool/budget summary) and is intentionally separated from the

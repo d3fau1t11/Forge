@@ -1,6 +1,6 @@
-"""Durable launch acceptance only. No dispatch, execution or filesystem access.
+"""Durable launch acceptance and verified historical reads. No execution.
 
-Call with a clean, engine-bound SQLAlchemy Session. Like existing workspace
+Creation requires a clean, engine-bound SQLAlchemy Session. Like workspace
 writes, this service supports SQLite and reserves its writer with BEGIN IMMEDIATE
 before reading any ownership, context or retry state. It owns one commit/rollback;
 it must not be nested in a caller's transaction.
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,7 +41,7 @@ from typing import Any
 
 from sqlalchemy import event, select, text
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Mapper, Session
 
 from backend.database.models import (
@@ -241,3 +242,151 @@ def create_session_execution_binding(db: Session, request: CreateSessionExecutio
     except BaseException:
         db.rollback()
         raise
+
+
+def _require_snapshot(condition: bool) -> None:
+    if not condition:
+        raise SessionBindingError("corrupt_binding", "Persisted launch snapshot is invalid")
+
+
+def _snapshot_object(value: Any, required: tuple[str, ...]) -> dict[str, Any]:
+    _require_snapshot(isinstance(value, dict) and all(key in value for key in required))
+    return value
+
+
+def _snapshot_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_loaded_snapshot(binding: SessionExecutionBinding) -> None:
+    """Validate stored content only; never reconstruct it from live records."""
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("Duplicate JSON member")
+            value[key] = item
+        return value
+
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("Nonfinite JSON number")
+        return number
+
+    def reject_constant(value):
+        raise ValueError("Nonfinite JSON constant")
+
+    _require_snapshot(isinstance(binding.snapshot_json, str) and isinstance(binding.snapshot_sha256, str))
+    try:
+        digest = hashlib.sha256(binding.snapshot_json.encode("utf-8")).hexdigest()
+    except UnicodeError:
+        raise SessionBindingError("corrupt_binding", "Persisted launch snapshot is invalid") from None
+    _require_snapshot(digest == binding.snapshot_sha256)
+    try:
+        data = json.loads(binding.snapshot_json, object_pairs_hook=unique_object,
+                          parse_float=finite_float, parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        raise SessionBindingError("corrupt_binding", "Persisted launch snapshot is invalid") from None
+    data = _snapshot_object(data, ("schema_version", "created_at", "project", "workspace_session",
+                                   "execution", "conversation"))
+    _require_snapshot(type(data["schema_version"]) is int)
+    if data["schema_version"] != 1:
+        raise SessionBindingError("unsupported_snapshot", "Persisted launch snapshot version is unsupported")
+    _require_snapshot(all(_snapshot_string(getattr(binding, field)) for field in (
+        "id", "project_id", "workspace_session_id", "challenge_id", "run_id", "idempotency_key")))
+    _require_snapshot(len(binding.idempotency_key) <= 200)
+    _require_snapshot(isinstance(binding.created_at, datetime) and binding.created_at.tzinfo is None)
+    _require_snapshot(data["created_at"] == binding.created_at.isoformat(timespec="microseconds"))
+    project = _snapshot_object(data["project"], ("id", "instructions", "context"))
+    session = _snapshot_object(data["workspace_session"], ("id", "project_id", "context"))
+    execution = _snapshot_object(data["execution"], ("challenge_id", "run_id", "initiating_message_id"))
+    conversation = _snapshot_object(data["conversation"], ("cutoff_sequence", "messages"))
+    _require_snapshot(project["id"] == binding.project_id and isinstance(project["instructions"], str))
+    _require_snapshot(session["id"] == binding.workspace_session_id and session["project_id"] == binding.project_id)
+    _require_snapshot(execution["challenge_id"] == binding.challenge_id and execution["run_id"] == binding.run_id)
+    _require_snapshot(execution["initiating_message_id"] == binding.initiating_message_id)
+    _require_snapshot(binding.initiating_message_id is None or _snapshot_string(binding.initiating_message_id))
+    cutoff = binding.message_cutoff_sequence
+    _require_snapshot(type(cutoff) is int and cutoff >= 0)
+    _require_snapshot(type(conversation["cutoff_sequence"]) is int and conversation["cutoff_sequence"] == cutoff)
+    _require_snapshot(isinstance(conversation["messages"], list))
+    previous = 0
+    message_ids = set()
+    client_ids = set()
+    for item in conversation["messages"]:
+        message = _snapshot_object(item, ("id", "workspace_session_id", "role", "content", "sequence",
+                                          "client_message_id", "source_trajectory_event_id", "created_at"))
+        _require_snapshot(_snapshot_string(message["id"]) and message["id"] not in message_ids)
+        _require_snapshot(message["workspace_session_id"] == binding.workspace_session_id)
+        _require_snapshot(message["role"] in ("user", "assistant") and isinstance(message["content"], str))
+        _require_snapshot(type(message["sequence"]) is int and previous < message["sequence"] <= cutoff)
+        for field in ("client_message_id", "source_trajectory_event_id"):
+            _require_snapshot(message[field] is None or isinstance(message[field], str))
+        if message["client_message_id"] is not None:
+            _require_snapshot(message["client_message_id"] not in client_ids)
+            client_ids.add(message["client_message_id"])
+        _require_snapshot(isinstance(message["created_at"], str))
+        try:
+            timestamp = datetime.fromisoformat(message["created_at"])
+        except ValueError:
+            raise SessionBindingError("corrupt_binding", "Persisted launch snapshot is invalid") from None
+        _require_snapshot(timestamp.tzinfo is None and timestamp.isoformat(timespec="microseconds") == message["created_at"])
+        previous = message["sequence"]
+        message_ids.add(message["id"])
+    _require_snapshot(previous == cutoff)
+    _require_snapshot(binding.initiating_message_id is None or binding.initiating_message_id in message_ids)
+
+
+def load_session_execution_binding(
+    db: Session, *, project_id: str, workspace_session_id: str, run_id: str,
+    challenge_id: str | None = None, binding_id: str | None = None,
+) -> SessionExecutionBinding:
+    """Read one exact historical acceptance; this is not execution authorization.
+
+    Returns a frozen value with created=False and the exact stored JSON/digest.
+    Required workspace/initiator ownership is checked using scalar columns only;
+    live challenge/run rows, context, message content and counters are not read.
+    The caller owns the read transaction. No autoflush, commit, rollback, identity
+    map refresh, or ORM mutation occurs, including with pending caller edits.
+
+    Errors: invalid_request, binding_not_found (including expected-ID mismatch),
+    binding_ownership_mismatch, corrupt_binding, unsupported_snapshot, or a
+    sanitized persistence_failed for SQLAlchemy database-access errors.
+    """
+    for value in (project_id, workspace_session_id, run_id):
+        if not _snapshot_string(value):
+            raise SessionBindingError("invalid_request", "Expected binding identities must be nonblank strings")
+    for value in (challenge_id, binding_id):
+        if value is not None and not _snapshot_string(value):
+            raise SessionBindingError("invalid_request", "Optional binding identities must be nonblank strings")
+    table = SessionExecutionBindingModel.__table__
+    query = select(table).where(table.c.project_id == project_id,
+                                table.c.workspace_session_id == workspace_session_id, table.c.run_id == run_id)
+    if challenge_id is not None:
+        query = query.where(table.c.challenge_id == challenge_id)
+    if binding_id is not None:
+        query = query.where(table.c.id == binding_id)
+    try:
+        with db.no_autoflush:
+            row = db.execute(query).mappings().one_or_none()
+            if row is None:
+                raise SessionBindingError("binding_not_found", "Execution binding not found for expected identity")
+            project = ProjectModel.__table__
+            session = WorkspaceSessionModel.__table__
+            owner = db.execute(select(session.c.id).select_from(session.join(
+                project, session.c.project_id == project.c.id)).where(
+                session.c.id == workspace_session_id, project.c.id == project_id)).scalar_one_or_none()
+            if owner is None:
+                raise SessionBindingError("binding_ownership_mismatch", "Execution binding ownership is invalid")
+            if row["initiating_message_id"] is not None:
+                message = ConversationMessageModel.__table__
+                initiator_owner = db.execute(select(message.c.workspace_session_id).where(
+                    message.c.id == row["initiating_message_id"])).scalar_one_or_none()
+                if initiator_owner != workspace_session_id:
+                    raise SessionBindingError("binding_ownership_mismatch", "Execution binding ownership is invalid")
+    except SQLAlchemyError:
+        raise SessionBindingError("persistence_failed", "Could not read execution binding") from None
+    result = SessionExecutionBinding(**row, created=False)
+    _validate_loaded_snapshot(result)
+    return result
